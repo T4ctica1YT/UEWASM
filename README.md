@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/logo.png" alt="UEWASM" width="200">
+  <img src="uewasm/assets/logo.png" alt="UEWASM" width="200">
 </a>
 
   <br>
