@@ -64,7 +64,7 @@ This project is in its early stages, meaning not all games work. Here are the ga
 
 | Game | Status | FPS |
 |---|---|---|
-| Hello Neighbor | ✅ Works | 30=60 FPS Depending on the Area|
+| Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area|
 | Dispatch | ✅ Works | 60 FPS |
 
 ## Building Options
