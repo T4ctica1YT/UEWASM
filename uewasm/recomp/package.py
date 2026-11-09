@@ -10,11 +10,18 @@ import zlib
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+from . import resources
+
 BLOCK = 1 << 20
 STUB = re.compile(r"\.(exe|dll|pdb|sym|lib|exp|bat|cmd|sh|command)$", re.I)
 SKIP = re.compile(r"(^|/)(Saved|Intermediate|DerivedDataCache)/|(^|/)steam_appid\.txt$|\.(log|dmp)$", re.I)
 AUDIO = re.compile(r"\.(ogg|wav|mp3|wem|bnk|opus|flac|xwb|xsb|fsb|bank|m4a|aac|wma)$", re.I)
 
+
+
+def _worker_init(mode):
+    resources.set_mode(mode)
+    resources.lower_this_process()
 
 def _create(path):
     """open for writing without writing through a hard link into the game install"""
@@ -143,7 +150,7 @@ def package(game_root, web, extra=None, part_mb=16, compress=False, log=print, p
         rows[i][4] = blocks
         written += w
     if any(z for _, _, z, _ in jobs):
-        with ProcessPoolExecutor(min(4, os.cpu_count() or 4)) as ex:
+        with ProcessPoolExecutor(resources.plan()["package_workers"], initializer=_worker_init, initargs=(resources.mode(),)) as ex:
             futs = [(i, sig, ex.submit(_deflated if z else _raw, job)) for i, sig, z, job in jobs]
             for i, sig, fut in futs:
                 done(i, sig, fut.result())
