@@ -1,0 +1,17 @@
+# build outputs
+builds/
+build/
+dist/
+tests/bin/
+
+# local toolchains and environments
+.toolchain/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# logs and scratch
+*.log

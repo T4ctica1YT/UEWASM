@@ -1,0 +1,14 @@
+# recompiler
+iced-x86>=1.21
+psutil>=5.9
+
+# optional: video re-encoding and Unreal pak rewriting (--video-height)
+imageio-ffmpeg>=0.5
+pycryptodome>=3.20
+pyooz>=0.0.8
+
+# optional: browser tests (uewasm test, tests/*)
+playwright>=1.40
+
+# optional: building UEWASM.exe (build_exe.py)
+pyinstaller>=6.0
