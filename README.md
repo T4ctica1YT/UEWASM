@@ -65,7 +65,16 @@ This project is in its early stages, meaning not all games work. Here are the ga
 | Game | Status | FPS |
 |---|---|---|
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area|
-| Dispatch | ✅ Works | 60 FPS |
+| Dispatch | ✅ Works | >60 FPS |
+
+ <td align="center">
+      <strong>Hello Neighbor</strong><br>
+      <img src="uewasm/assets/ss/hn.png" width="500" alt="Hello Neighbor Running in a Web browser">
+    </td>
+    <td align="center">
+      <strong>Dispatch</strong><br>
+      <img src="uewasm/assets/ss/dispatch.png" width="500" alt="Dispatch Running in a Web browser">
+    </td>
 
 ## Building Options
 
