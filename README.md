@@ -69,11 +69,11 @@ This project is in its early stages, meaning not all games work. Here are the ga
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
-      <img src="uewasm/assets/ss/hn.png" width="300" alt="Hello Neighbor Running in a Web browser">
+      <img src="uewasm/assets/ss/hn.png" width="500" alt="Hello Neighbor Running in a Web browser">
     </td>
     <td align="center">
       <strong>Dispatch</strong><br>
-      <img src="uewasm/assets/ss/dispatch.png" width="300" alt="Dispatch Running in a Web browser">
+      <img src="uewasm/assets/ss/dispatch.png" width="500" alt="Dispatch Running in a Web browser">
     </td>
 
 ## Building Options
