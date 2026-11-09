@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from . import pe as pemod
+from . import resources
 from .lift import Func, Program
 from .link import THUNK_BASE, Linker
 
@@ -60,7 +61,9 @@ def regs_local(body):
     return [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
 
 
-def _init_worker(all_roots, comments):
+def _init_worker(all_roots, comments, mode="high"):
+    resources.set_mode(mode)
+    resources.lower_this_process()
     _W["roots"] = all_roots
     _W["comments"] = comments
     _W["progs"] = {}
@@ -163,9 +166,9 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
     bad = 0
     for _, prog in progs:
         prog.cache.clear()
-    workers = jobs or max(1, min(os.cpu_count() or 4, 6))
+    workers = jobs or resources.plan()["lift_workers"]
     progress("analyze", 1, 1)
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(all_roots, comments)) as ex:
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(all_roots, comments, resources.mode())) as ex:
         try:
             results = list(_lifted(ex, tasks, progress))
         except BaseException:
@@ -253,7 +256,7 @@ def emsdk_env():
 
 def jspi_flag(node):
     """newer Node ships JSPI enabled and rejects the old flag"""
-    r = subprocess.run([node, "-e", "process.exit(typeof WebAssembly.Suspending == 'function' ? 0 : 1)"])
+    r = resources.run([node, "-e", "process.exit(typeof WebAssembly.Suspending == 'function' ? 0 : 1)"])
     return [] if r.returncode == 0 else ["--experimental-wasm-jspi"]
 
 
@@ -392,14 +395,8 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
 
 
 def mem_budget_mb():
-    """RAM the compile jobs may share: UEW_BUILD_MB (default 6 GB) or 80% of what's free, whichever is less"""
-    cap = int(os.environ.get("UEW_BUILD_MB", 6144))
-    try:
-        import psutil
-        cap = min(cap, int(psutil.virtual_memory().available / 1048576 * 0.8))
-    except ImportError:
-        pass
-    return max(cap, 1024)
+    """RAM the compile jobs may share (see resources.plan; UEW_BUILD_MB overrides)"""
+    return resources.plan()["budget_mb"]
 
 
 def run_jobs(jobs, what, progress=nop_progress):
@@ -407,7 +404,7 @@ def run_jobs(jobs, what, progress=nop_progress):
     Progress is reported by estimated size, which tracks compile time."""
     import tempfile
     pending = sorted(jobs, key=lambda j: -j[3])
-    workers = max(1, (os.cpu_count() or 4) - 1)
+    workers = resources.plan()["compile_jobs"]
     budget = mem_budget_mb()
     running, used = [], 0
     total = sum(j[3] for j in jobs) or 1
@@ -418,7 +415,7 @@ def run_jobs(jobs, what, progress=nop_progress):
             while pending and len(running) < workers and (not running or used + pending[0][3] <= budget):
                 name, cmd, env, mb = pending.pop(0)
                 log_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-                running.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT), name, mb, log_f))
+                running.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT, **resources.proc_flags()), name, mb, log_f))
                 used += mb
             time.sleep(0.05)
             for job in running[:]:
@@ -483,7 +480,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     # generated files go straight to clang with emcc's own flags, skipping emcc's per-file startup
     clang = Path(emcc).parents[1] / "bin" / ("clang.exe" if os.name == "nt" else "clang")
     import shlex
-    em = shlex.split(subprocess.run([emcc, "--cflags", *cflags], env=env, capture_output=True, text=True).stdout)
+    em = shlex.split(resources.run([emcc, "--cflags", *cflags], env=env, capture_output=True, text=True).stdout)
     direct = clang.exists() and em
     # the debug panel and what it drives (UE console enabler, game speed, call tracing) are only built in when wanted, so
     # a build without them carries none of that code (nothing for a game's anti-cheat to find)
@@ -492,7 +489,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     jobs = []
     for src in srcs:
         o = str(obj / (src.stem + ".o"))
-        mb = 300 + 80 * src.stat().st_size / 1048576
+        # peak clang memory measured on generated files: ~175 MB plus ~60 MB per MB of source
+        mb = 190 + 62 * src.stat().st_size / 1048576
         if direct and src in gen_srcs:
             jobs.append((src.name, [str(clang), *em, *(f for f in cflags if not f.startswith("-s")), "-c", str(src), "-o", o], env, mb))
         else:
@@ -520,7 +518,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         link.remove("-sENVIRONMENT=web,node")
     elif embed:
         link += ["--embed-file", f"{out / 'image.bin'}@image.bin"]
-    r = subprocess.run(link, env=env, capture_output=True, text=True)
+    r = resources.run(link, env=env, capture_output=True, text=True)
     progress("link", 1, 1)
     if r.returncode:
         errs = [l for l in r.stderr.splitlines() if "error" in l.lower() and len(l) < 600]
@@ -546,11 +544,11 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
 
 def msvc_env():
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
-    path = subprocess.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    path = resources.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                            "-property", "installationPath"], capture_output=True, text=True).stdout.strip().splitlines()[0]
     bat = Path(path) / "VC/Auxiliary/Build/vcvars64.bat"
     comspec = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
-    out = subprocess.run(f'"{comspec}" /d /s /c "call "{bat}" >nul && set"', capture_output=True, text=True).stdout
+    out = resources.run(f'"{comspec}" /d /s /c "call "{bat}" >nul && set"', capture_output=True, text=True).stdout
     env = {}
     for line in out.splitlines():
         if "=" in line:
@@ -593,7 +591,7 @@ def build_native(out, log=print, debug=False, progress=nop_progress):
     exe = out / "native.exe"
     lrsp = out / "link.rsp"
     lrsp.write_text("\n".join(f'"{p}"' for p in obj.glob("*.obj")), encoding="utf-8")
-    r = subprocess.run([tool(env, "link"), "/nologo", f"/OUT:{exe}", "/STACK:268435456", f"/MAP:{out / 'native.map'}", f"@{lrsp}"],
+    r = resources.run([tool(env, "link"), "/nologo", f"/OUT:{exe}", "/STACK:268435456", f"/MAP:{out / 'native.map'}", f"@{lrsp}"],
                        env=env, capture_output=True, text=True)
     progress("native link", 1, 1)
     if r.returncode:

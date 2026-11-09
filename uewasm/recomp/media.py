@@ -10,6 +10,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from . import resources
+
 VIDEO = re.compile(r"\.(webm|mp4|mkv|mov|m4v)$", re.I)
 MODES = {
     # name: encoder arguments; "fast" uses the real-time encoder (about 10x faster, about 1.5x larger)
@@ -27,7 +29,7 @@ def ffmpeg():
 
 def probe(path):
     """(codec, height) of the first video stream"""
-    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, errors="replace")
+    r = resources.run([ffmpeg(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, errors="replace")
     m = re.search(r"Video: (\w+).*?, (\d+)x(\d+)", r.stderr)
     return (m.group(1), int(m.group(3))) if m else (None, 0)
 
@@ -44,7 +46,7 @@ def encode(src, dst, height, mode, threads=4):
     tmp = str(dst) + ".part"
     cmd = [ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-vf", f"scale=-2:{height}", *enc, *MODES[mode][family],
            "-threads", str(threads), "-c:a", "copy", "-f", fmt, tmp]
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    r = resources.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode or not os.path.exists(tmp):
         raise RuntimeError(f"ffmpeg failed on {src}:\n{r.stderr[-1500:]}")
     if os.path.getsize(tmp) >= os.path.getsize(src):
@@ -96,7 +98,7 @@ def shrink(game_root, exe, out, height=720, mode="fast", log=print, progress=lam
     total = sum(j[2].size if j[0] == "pak" else j[2].stat().st_size for j in jobs)
     log(f"{len(jobs)} videos ({total / 2**30:.1f} GiB): re-encoding to {height}p ({mode})")
     done_bytes = 0
-    workers = max(1, (os.cpu_count() or 4) // 4)
+    workers = resources.plan()["media_workers"]
 
     def run(job):
         kind, rel, src, c = job
@@ -113,7 +115,7 @@ def shrink(game_root, exe, out, height=720, mode="fast", log=print, progress=lam
         else:
             path = src
         try:
-            ok = encode(path, c, height, mode)
+            ok = encode(path, c, height, mode, resources.plan()["media_threads"])
         finally:
             if tmp_src and tmp_src.exists():
                 tmp_src.unlink()

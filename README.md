@@ -73,6 +73,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 
 | Option | Choices | Notes |
 | --- | --- | --- |
+| `--priority` | `high` (default), `low` | How much of the PC the build uses; the result is identical. `high` is tuned to the PC (cores and free memory) for speed while running below normal priority; `low` uses about half the cores and a fifth of the memory at idle priority, so the PC stays usable. |
 | `--renderer` | `webgpu` (default), `webgl2` | WebGPU is faster and supports compute shaders. `webgl2` builds only the WebGL path. |
 | `--threads` | `coop` | Game threads run as green threads on one browser thread. (`real`, Web Workers, is not implemented yet.) |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
