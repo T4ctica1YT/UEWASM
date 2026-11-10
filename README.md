@@ -149,6 +149,8 @@ Edge/Chrome).
 
 ## Extra Credits
 
+- **[IdiotOnline](https://github.com/anIdiotonline)** - Tester
+
 - **[teaser.lua](https://github.com/teaserlua)** - Tester
 
 - **[NotRexed](https://github.com/notrexed)** - Kept his tool (Rexedcomp) private / Inspired the making of UEWASM
