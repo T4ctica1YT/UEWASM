@@ -24,6 +24,8 @@ HLE(CreateEventA) { hle_CreateEventW(c); }
 HLE(CreateEventExW) { hle_set_error(0); uint64_t h = new_obj(O_EVENT); Obj* o = handle_obj(h); o->manual = (A3 & 1) != 0; o->signaled = (A3 & 2) != 0; RET(h); }
 HLE(OpenEventW) { RET(0); }
 HLE(SetEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 1; RET(o != NULL); }
+/* completed overlapped I/O signals the OVERLAPPED's event */
+void hle_event_signal(uint64_t h) { Obj* o = handle_obj(h); if (o && o->type == O_EVENT) o->signaled = 1; }
 void sync_set_event(uint64_t h) { Obj* o = handle_obj(h); if (o && o->type == O_EVENT) o->signaled = 1; }
 HLE(ResetEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 0; RET(o != NULL); }
 HLE(PulseEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 0; RET(o != NULL); }
@@ -115,7 +117,7 @@ static void wait_desc(GThread* t, char* out, int cap)
 static int cv_check(GThread* t);
 static int addr_differs(GThread* t);
 static void cv_desc(GThread* t, char* out, int cap) { snprintf(out, cap, " %llx", (unsigned long long)t->block_a); }
-__attribute__((constructor)) static void sync_names(void)
+INIT_FN(sync_names)
 {
     sched_name_check(wait_check, "wait", wait_desc);
     sched_name_check(cv_check, "condition variable", cv_desc);

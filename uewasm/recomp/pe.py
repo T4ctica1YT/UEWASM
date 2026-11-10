@@ -38,6 +38,7 @@ class PE:
     unwind: dict = field(default_factory=dict)
     exports: dict = field(default_factory=dict)
     exports_ord: dict = field(default_factory=dict)
+    ord_names: dict = field(default_factory=dict)
     family: dict = field(default_factory=dict)
     tls_callbacks: list = field(default_factory=list)
     tls: dict = field(default_factory=dict)
@@ -154,6 +155,7 @@ def load(path):
         for i in range(nnames):
             nm = pe.cstr(pe.u32(anames + 4 * i))
             ordi = struct.unpack_from("<H", data, pe.off(aords + 2 * i))[0]
+            pe.ord_names[ordbase + ordi] = nm
             if funcs[ordi]:
                 pe.exports[nm] = target(funcs[ordi])
 

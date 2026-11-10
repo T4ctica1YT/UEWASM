@@ -19,6 +19,8 @@ RENDERERS = {"WebGPU (recommended)": "webgpu", "WebGL 2 (works everywhere)": "we
 THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (needs COOP/COEP headers)": "real"}
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
 RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540"]
+BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
+PRIORITIES = {"High (fastest, tuned to this PC)": "high", "Low (keeps the PC usable while it builds)": "low"}
 VIDEOS = {"Keep original videos": (0, "fast"), "Shrink to render height, fast encode": (-1, "fast"),
           "Shrink to render height, smallest files (slow)": (-1, "small"), "Shrink to 1080p, fast encode": (1080, "fast")}
 
@@ -232,6 +234,16 @@ class App:
                         variable=self.async_shaders).grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(s, text="UEWASM debug toggle (\\ or Insert opens the debug panel in game)",
                         variable=self.debug_panel).grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(s, text="Build priority").grid(row=9, column=0, sticky="w", pady=(6, 0))
+        self.priority = tk.StringVar(value=prefs.get("priority") if prefs.get("priority") in PRIORITIES else next(iter(PRIORITIES)))
+        ttk.Combobox(s, textvariable=self.priority, values=list(PRIORITIES), state="readonly", width=34).grid(row=9, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
+        ttk.Label(s, text="Same result either way; Low uses far less CPU and memory", style="Sub.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(s, text="Online services").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        self.backend = tk.StringVar(value=prefs.get("backend") if prefs.get("backend") in BACKENDS else next(iter(BACKENDS)))
+        ttk.Combobox(s, textvariable=self.backend, values=list(BACKENDS), state="readonly", width=34).grid(row=10, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
+        self.placeholders = tk.BooleanVar(value=prefs.get("placeholders", False))
+        ttk.Checkbutton(s, text="Stand-in files for what the servers would send (images, data)", variable=self.placeholders).grid(
+            row=10, column=2, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(s, text="Videos").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.videos = tk.StringVar(value=prefs.get("videos") if prefs.get("videos") in VIDEOS else "Keep original videos")
         ttk.Combobox(s, textvariable=self.videos, values=list(VIDEOS), state="readonly", width=34).grid(row=5, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
@@ -339,7 +351,8 @@ class App:
         save_json("settings.json", {"game": self.game.get(), "out": self.out.get(), "renderer": self.renderer.get(), "threads": self.threads.get(),
                                     "opt": self.opt.get(), "res": self.res.get(), "mem": self.mem.get(), "part": self.part.get(),
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
-                                    "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get()})
+                                    "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
+                                    "backend": self.backend.get(), "placeholders": self.placeholders.get()})
 
     def start(self):
         exe = self.find_exe()
@@ -357,7 +370,8 @@ class App:
         self.save_prefs()
         opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=(w, h), mem=int(self.mem.get()),
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
-                    compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get())
+                    compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
+                    backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get())
         self.cancel.clear()
         self.clear_log()
         self.start_btn["state"] = "disabled"
@@ -375,10 +389,13 @@ class App:
         self.q.put(("progress", stage, done, total))
 
     def build(self, o):
-        from .recomp import build
+        from .recomp import build, resources
         from .recomp.link import game_dlls
         log = lambda m: self.q.put(("log", str(m)))
         try:
+            resources.set_mode(o["priority"])
+            resources.lower_this_process()
+            log(resources.describe())
             root, found = game_dlls(o["exe"])
             extra = found if o["game_dlls"] else []
             input_mb = (o["exe"].stat().st_size + sum(p.stat().st_size for p in extra)) / 1048576
@@ -394,7 +411,8 @@ class App:
             web = build.build_wasm(o["out"], opt=o["opt"], renderer=o["renderer"], game_root=root, exe_rel=o["exe"].relative_to(root).as_posix(),
                                    size=o["size"], part_mb=o["part"], compress=o["compress"], log=log, progress=self.progress,
                                    video_height=o["size"][1] if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
-                                   wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"])
+                                   wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
+                                   backend=o.get("backend"), placeholders=o.get("placeholders", False))
             self.est.remember()
             self.q.put(("done", str(web)))
         except Cancelled:

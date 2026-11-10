@@ -22,7 +22,7 @@ is implemented yet.
 <br>
 
 > [!IMPORTANT]
-> This repository **does not contain any games or built recomplilations**.
+> This repository **does not contain any games or built recomplilations, this project is also not affiliated with Epic Games or any Publishers (or else) of games mentioned**.
 > You need your own copy of any game you would like to recompile. Everything this tool creates 
 > comes from your game and stays on your PC. Never share the generated files publicly.
 
@@ -60,19 +60,35 @@ To build the desktop app: `pip install pyinstaller`, then `python build_exe.py` 
 
 ## UEWASM Status and Support
 
-This project is in its early stages, meaning not all games work. Here are the games used for Testing and some screenshots of the working
+This project is in its early stages, meaning not all games work. Here are the games used for Testing and some screenshots of the tool working
 
-| Game | Status | FPS |
+| Game | Status | FPS | UE Version |
 |---|---|---|
-| Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area|
-| Dispatch | ✅ Works | 60 FPS |
+| Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 |
+| Dispatch | ✅ Perfect | >60 FPS | UE 4.27 |
+| Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? |
+|Dead as Disco|✅ Works | 30-50 FPS| UE 5.7.4 |
 
+ <td align="center">
+      <strong>Hello Neighbor</strong><br>
+      <img src="uewasm/assets/ss/hn.png" width="500" alt="Hello Neighbor Running in a Web browser">
+    </td>
+    <td align="center">
+      <strong>Dispatch</strong><br>
+      <img src="uewasm/assets/ss/dispatch.png" width="500" alt="Dispatch Running in a Web browser">
+    </td>
+    <td align="center">
+      <strong>Dead As Disco</strong><br>
+      <img src="uewasm/assets/ss/DaD.png" width="500" alt="Dead as Disco Running in a Web browser">
+    </td>
+    
 ## Building Options
 
 When building a game with UEWASM, the tool give you many choices on how the game can be built such as the following:
 
 | Option | Choices | Notes |
 | --- | --- | --- |
+| `--priority` | `high` (default), `low` | How much of the PC the build uses; the result is identical. `high` is tuned to the PC (cores and free memory) for speed while running below normal priority; `low` uses about half the cores and a fifth of the memory at idle priority, so the PC stays usable. |
 | `--renderer` | `webgpu` (default), `webgl2` | WebGPU is faster and supports compute shaders. `webgl2` builds only the WebGL path. |
 | `--threads` | `coop` | Game threads run as green threads on one browser thread. (`real`, Web Workers, is not implemented yet.) |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
@@ -89,6 +105,8 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--game-dlls` | `auto`, `none` | Also recompile DLLs shipped with the game (PhysX, codecs, middleware). |
 | `--no-system-dlls` |N/A| Use the built-in CRT instead of recompiling Microsoft's runtime DLLs. |
 | `--native` |N/A| Also build a native Windows binary of the recompiled code, for verification. |
+| `--backend` | `none` (default), `epic` | Serve the game's online services from the page itself: `epic` answers Epic account, entitlement and content requests offline so games that require a login can start. |
+| `--placeholders` |N/A| With `--backend`, answer requests for downloadable content the build lacks with empty stand-in files. |
 
 ## In the game
 
@@ -101,6 +119,8 @@ When building a game with UEWASM, the tool give you many choices on how the game
   
 - Builds made with `--no-debug-panel` (or with the desktop app's *UEWASM debug toggle* unticked) contain none of
   this: the panel script, the console enabler and the debug hooks are not compiled in.
+
+Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1` and `?tracering=1` log file access, network traffic and the last engine calls before a crash.
 
 ## Hosting
 
@@ -133,8 +153,19 @@ Edge/Chrome).
 - Shaders compile the first time an effect appears, which can cause short stutters on a first run; browsers cache
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
+- Unreal Engine 5 support is early: UE5 games boot and reach their menus, but some 3D scenes still render dark or
+  without their background, and they run slower than UE4 titles.
+- Executables encrypted or packed by anti-tamper protection can't be recompiled.
 - Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call
   (`coverage` lists what a build still misses).
+
+## Extra Credits
+
+- **[IdiotOnline](https://github.com/anIdiotonline)** - Tester
+
+- **[teaser.lua](https://github.com/teaserlua)** - Tester
+
+- **[NotRexed](https://github.com/notrexed)** - Kept his tool (Rexedcomp) private / Inspired the making of UEWASM
 
 > [AI Use Disclosure]
 > This project was made mostly by AI, but WAS overlooked and corrected by a human.

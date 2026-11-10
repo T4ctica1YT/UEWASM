@@ -6,10 +6,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <strings.h>
 
 int uewg_init(int w, int h, void* ring, int ring_size);
 int uewg_max_dynamic_ubo(void);
+int uewg_max_storage(void);
 int uewg_buffer_create(int size, int usage);
 void uewg_buffer_write(int id, int offset, const void* p, int size);
 void uewg_buffer_copy_ring(int ring_off, int dst, int dst_off, int size, int ring_used);
@@ -41,7 +43,7 @@ int uewg_readback_latest(int kind, int id, int mip, int layer, int w, int h, int
 void uewg_readback_finish(int n);
 #include "sched.h"
 static int rb_done(GThread* t) { return uewg_readback_done((int)t->block_a); }
-__attribute__((constructor)) static void rb_names(void) { sched_name_check(rb_done, "GPU readback", NULL); }
+INIT_FN(rb_names) { sched_name_check(rb_done, "GPU readback", NULL); }
 static int pipe_ready(GThread* t) { return uewg_pipe_ready((int)t->block_a); }
 /* a pipeline still compiling in the browser: only this thread waits for it, and no draw is dropped */
 static void wait_pipe(int id)
@@ -50,7 +52,7 @@ static void wait_pipe(int id)
     sched_current()->block_a = (uint64_t)id;
     sched_block_ext(sched_current_cpu(), pipe_ready, ~0ull);
 }
-__attribute__((constructor)) static void pipe_names(void) { sched_name_check(pipe_ready, "shader compile", NULL); }
+INIT_FN(pipe_names) { sched_name_check(pipe_ready, "shader compile", NULL); }
 /* waits for the GPU copy on this thread only */
 static void uewg_readback(int kind, int id, int mip, int layer, int w, int h, int d, void* dst, int pitch, int slice, int rowbytes, int rows)
 {
@@ -84,7 +86,7 @@ static void breset(Buf* b) { b->n = 0; if (b->p) b->p[0] = 0; }
 
 enum { FF_DEPTH = 1, FF_STENCIL = 2, FF_UINT = 4, FF_SINT = 8, FF_SRGB_PAIR = 16, FF_NORENDER = 32, FF_STORAGE = 64, FF_NOBLEND = 128 };
 /* 16-bit norm formats aren't filterable in WebGPU, so they are stored as half floats (CV_UN16/CV_SN16) */
-enum { CV_NONE, CV_RGB32, CV_565, CV_5551, CV_4444, CV_X8, CV_UN16, CV_SN16 };
+enum { CV_NONE, CV_RGB32, CV_565, CV_5551, CV_4444, CV_X8, CV_UN16, CV_SN16, CV_SUBST };
 
 typedef struct { const char* name; uint8_t bpb, block, flags, conv; const char* view_pair; } TexFmt;
 
@@ -228,7 +230,7 @@ typedef struct Memo { int valid, layout, group, bg; uint32_t pass_gen, bg_epoch;
 typedef struct Variant {
     struct Variant* next;
     Memo memo;
-    uint32_t depth[4];
+    uint32_t depth[8];   /* depth-compared SRVs, then integer SRVs on 32-bit float textures */
     uint64_t sig;
     char uav_key[64];
     uint64_t vkey;   /* variant_ex: UAV formats + interpolation, hashed */
@@ -237,6 +239,7 @@ typedef struct Variant {
     /* slots the shader uses, so per-draw binding walks only those */
     int slots_ready, nsrv, nsamp, nuav;
     uint8_t srv_ix[128], samp_ix[16], uav_ix[8];
+    int mbuf, mbuf_size;    /* overflow buffer for read-only buffers past the storage-buffer limit */
 } Variant;
 
 static void variant_slots(Variant* v)
@@ -303,6 +306,9 @@ void uewg_ring_used_at(uint32_t* p);
 int uewg_timestamp(void);
 int uewg_timestamp_get(int ticket, double* ms);
 void uewg_ring_reset(void);
+void uewg_texture_copy_ring(int ring_off, int id, int mip, int x, int y, int z, int w, int h, int d, int bpr, int rows);
+void uewg_expand_typed(int src, int dst, int first, int n, int fmt, int bpe);
+void uewg_buffer_copy(int src, int src_off, int dst, int dst_off, int size);
 /* uploads what is new in the ring and submits the pending work */
 static void ring_submit(void)
 {
@@ -389,9 +395,57 @@ static void tex_conv(TexFmt* f, const uint8_t* src, uint8_t* dst, uint32_t texel
 
 static uint32_t src_bpb(uint32_t f) { uint32_t blk; return dxgi_format_bytes(f, &blk); }
 
+static float half_to_float(uint16_t h);
+static float small_float(uint32_t v, int mbits)
+{
+    uint32_t e = v >> mbits, m = v & ((1u << mbits) - 1);
+    if (!e) return m ? ldexpf((float)m, -14 - mbits) : 0.0f;
+    if (e == 31) return m ? NAN : INFINITY;
+    return ldexpf(1.0f + (float)m / (float)(1u << mbits), (int)e - 15);
+}
+/* texels of a DXGI format as floats, for textures stored in a substitute storage format (CV_SUBST) */
+static int decode_texels(uint32_t f, const uint8_t* s, float* out, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        float* o = out + 4 * i;
+        o[0] = o[1] = o[2] = 0; o[3] = 1;
+        switch (f) {
+        case 61: case 60: case 62: o[0] = s[i] / 255.0f; break;                                  /* R8 */
+        case 63: case 64: o[0] = (int8_t)s[i] < -127 ? -1.0f : (int8_t)s[i] / 127.0f; break;
+        case 49: case 48: case 50: o[0] = s[2 * i] / 255.0f; o[1] = s[2 * i + 1] / 255.0f; break; /* R8G8 */
+        case 51: case 52: o[0] = (int8_t)s[2 * i] / 127.0f; o[1] = (int8_t)s[2 * i + 1] / 127.0f; break;
+        case 28: case 29: case 27: case 30: for (int k = 0; k < 4; k++) o[k] = s[4 * i + k] / 255.0f; break;
+        case 31: case 32: for (int k = 0; k < 4; k++) o[k] = (int8_t)s[4 * i + k] / 127.0f; break;
+        case 87: case 90: case 91: case 88: case 92: case 93: o[0] = s[4 * i + 2] / 255.0f; o[1] = s[4 * i + 1] / 255.0f; o[2] = s[4 * i] / 255.0f; o[3] = f == 88 || f == 92 || f == 93 ? 1.0f : s[4 * i + 3] / 255.0f; break;
+        case 54: case 53: { uint16_t v; memcpy(&v, s + 2 * i, 2); o[0] = half_to_float(v); break; }   /* R16 float */
+        case 34: case 33: for (int k = 0; k < 2; k++) { uint16_t v; memcpy(&v, s + 4 * i + 2 * k, 2); o[k] = half_to_float(v); } break;
+        case 56: case 55: { uint16_t v; memcpy(&v, s + 2 * i, 2); o[0] = v / 65535.0f; break; }       /* R16 unorm */
+        case 35: for (int k = 0; k < 2; k++) { uint16_t v; memcpy(&v, s + 4 * i + 2 * k, 2); o[k] = v / 65535.0f; } break;
+        case 11: case 9: for (int k = 0; k < 4; k++) { uint16_t v; memcpy(&v, s + 8 * i + 2 * k, 2); o[k] = v / 65535.0f; } break;
+        case 26: { uint32_t v; memcpy(&v, s + 4 * i, 4); o[0] = small_float(v & 0x7FF, 6); o[1] = small_float((v >> 11) & 0x7FF, 6); o[2] = small_float(v >> 22, 5); break; }
+        case 24: case 23: { uint32_t v; memcpy(&v, s + 4 * i, 4); o[0] = (v & 1023) / 1023.0f; o[1] = ((v >> 10) & 1023) / 1023.0f; o[2] = ((v >> 20) & 1023) / 1023.0f; o[3] = (v >> 30) / 3.0f; break; }
+        default: return 0;
+        }
+    }
+    return 1;
+}
+
+static void bg_dead(int id);
+
+/* GPU buffers of freed buffers, kept for a while: a game that makes a same-size buffer every frame gets the same GPU
+   buffer back, so bind groups naming it are found in the cache instead of made anew each frame */
+static struct { int id, usage; uint32_t width, used, serial; } bpool[256];
+static int nbpool;
+
+static void bpool_age(uint32_t serial)
+{
+    for (int i = 0; i < nbpool;)
+        if (serial - bpool[i].serial > 60) { uewg_retire(bpool[i].id); bg_dead(bpool[i].id); bpool[i] = bpool[--nbpool]; }
+        else i++;
+}
+
 static void res_create(GpuRes* r, uint64_t init)
 {
-    (void)init;
     WTex* t = calloc(1, sizeof *t);
     r->backend = t;
     if (!g_ok) return;
@@ -405,6 +459,17 @@ static void res_create(GpuRes* r, uint64_t init)
         t->buf_usage = u;
         t->kind = 1;
         if (r->bind == 0x4) return;
+        if (!init)
+            for (int i = nbpool - 1; i >= 0; i--)
+                if (bpool[i].width == r->width && bpool[i].usage == u) {
+                    t->id = bpool[i].id;
+                    t->used = g_serial;
+                    bpool[i] = bpool[--nbpool];
+                    /* on the encoder, after the old owner's commands */
+                    uewg_clear_buffer(t->id, 0, (int)r->width);
+                    pass_open = 0;
+                    return;
+                }
         t->id = uewg_buffer_create((int)r->width, u);
         return;
     }
@@ -414,9 +479,16 @@ static void res_create(GpuRes* r, uint64_t init)
     if ((r->bind & 0x80) && !(t->fmt.flags & (FF_STORAGE | FF_DEPTH)) && t->fmt.block == 1) {
         /* compute shaders write this texture: switch to a float format WebGPU can store to, same channel count */
         const char* n = t->fmt.name;
-        int ch = n[0] == 'r' && n[1] >= '0' && n[1] <= '9' ? 1 : n[0] == 'r' && n[1] == 'g' && n[2] >= '0' && n[2] <= '9' ? 2 : 4;
-        t->fmt = ch == 1 ? (TexFmt){ "r32float", 4, 1, FF_STORAGE | FF_NOBLEND } : ch == 2 ? (TexFmt){ "rg32float", 8, 1, FF_STORAGE | FF_NOBLEND }
-                         : (TexFmt){ "rgba16float", 8, 1, FF_STORAGE };
+        /* channels: the letters before the type suffix (r16float 1, rg8unorm 2, rg11b10ufloat 3, rgb10a2unorm and bgra8unorm 4) */
+        int ch = 0;
+        {
+            size_t cut = strlen(n);
+            static const char* sfx[] = { "unorm", "snorm", "ufloat", "float", "uint", "sint", 0 };
+            for (int k = 0; sfx[k]; k++) { const char* q = strstr(n, sfx[k]); if (q && (size_t)(q - n) < cut) cut = (size_t)(q - n); }
+            for (size_t k = 0; k < cut; k++) ch += n[k] == 'r' || n[k] == 'g' || n[k] == 'b' || n[k] == 'a';
+        }
+        t->fmt = ch <= 1 ? (TexFmt){ "r32float", 4, 1, FF_STORAGE | FF_NOBLEND, CV_SUBST } : ch == 2 ? (TexFmt){ "rg32float", 8, 1, FF_STORAGE | FF_NOBLEND, CV_SUBST }
+                         : (TexFmt){ "rgba16float", 8, 1, FF_STORAGE, CV_SUBST };
     }
     uint32_t blk = t->fmt.block;
     t->w = (r->width + blk - 1) / blk * blk;
@@ -440,8 +512,12 @@ static void res_destroy(GpuRes* r)
 {
     WTex* t = T(r);
     if (!t) return;
-    /* retired, not recycled: cached bind groups may still name these ids */
-    if (t->id) uewg_retire(t->id);
+    if (t->id && r->type == RES_BUFFER && nbpool < 256) {
+        bpool[nbpool].id = t->id; bpool[nbpool].usage = t->buf_usage; bpool[nbpool].width = r->width;
+        bpool[nbpool].used = t->used; bpool[nbpool].serial = g_serial; nbpool++;
+        t->id = 0;
+    }
+    if (t->id) { uewg_retire(t->id); bg_dead(t->id); }
     if (t->view_all) uewg_retire(t->view_all);
     free(t->shadow);
     free(t);
@@ -457,6 +533,24 @@ static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint3
         pass_open = 0;
     } else uewg_buffer_write(t->id, (int)(off & ~3u), p, (int)n);
     (void)r;
+}
+
+/* a texture already used by this frame's unsubmitted commands is written through the ring, in order with them:
+   queue writes land before those commands (staging textures refilled between copies would hand the copies the new data) */
+static void tex_write(WTex* t, int mip, int x, int y, int z, int w, int h, int d, const uint8_t* p, int pitch, int rows, int size)
+{
+    uint32_t blocks = (uint32_t)(w + t->fmt.block - 1) / t->fmt.block, row = blocks * t->fmt.bpb, bpr = (row + 255) & ~255u;
+    uint64_t need = (uint64_t)bpr * (uint32_t)rows * (uint32_t)d;
+    if (t->used != g_serial || need > ring_size / 4) { uewg_texture_write(t->id, mip, x, y, z, w, h, d, p, pitch, rows, size); return; }
+    uint32_t off = ring_put(NULL, 0, 0);
+    if (off + need > ring_size) { ring_flush(); off = 0; }
+    for (int k = 0; k < d; k++)
+        for (int r = 0; r < rows; r++)
+            memcpy(ring + off + ((uint64_t)k * rows + r) * bpr, p + ((uint64_t)k * rows + r) * (uint32_t)pitch, row);
+    ring_used = off + (uint32_t)need;
+    st_ring_bytes += need;
+    uewg_texture_copy_ring((int)off, t->id, mip, x, y, z, w, h, d, (int)bpr, rows);
+    pass_open = 0;
 }
 
 static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src, uint32_t pitch, uint32_t slice)
@@ -506,20 +600,35 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
     if (!w || !h || !d) return;
     uint32_t rows = (h + blk - 1) / blk;
     if (!pitch) pitch = (w + blk - 1) / blk * src_bpb(r->format);
+    if (pitch < (w + blk - 1) / blk * src_bpb(r->format)) { static int said; if (said++ < 8) host_log("[webgpu] upload pitch %u < row %u: format %u (%s conv %d) %ux%ux%u type %d box %d sub %u", pitch, (w + blk - 1) / blk * src_bpb(r->format), r->format, t->fmt.name, t->fmt.conv, w, h, d, r->type, box != NULL, sub); }
     if (!slice) slice = pitch * rows;
     if (r->type != RES_TEX3D) z = layer;
     if (t->fmt.conv) {
         uint32_t dp = w * t->fmt.bpb;
         uint8_t* tmp = malloc((size_t)dp * rows * d);
+        float* fl = t->fmt.conv == CV_SUBST ? malloc(sizeof(float) * 4 * w) : NULL;
         for (uint32_t k = 0; k < d; k++)
-            for (uint32_t row = 0; row < rows; row++)
-                tex_conv(&t->fmt, G2H(src + (uint64_t)k * slice + (uint64_t)row * pitch), tmp + ((size_t)k * rows + row) * dp, w);
-        uewg_texture_write(t->id, (int)mip, (int)x, (int)y, (int)z, (int)w, (int)h, (int)d, tmp, (int)dp, (int)rows, (int)(dp * rows * d));
+            for (uint32_t row = 0; row < rows; row++) {
+                const uint8_t* sp = G2H(src + (uint64_t)k * slice + (uint64_t)row * pitch);
+                uint8_t* dpp = tmp + ((size_t)k * rows + row) * dp;
+                if (!fl) { tex_conv(&t->fmt, sp, dpp, w); continue; }
+                if (!decode_texels(r->format, sp, fl, w)) {
+                    static int said;
+                    if (!said++) host_log("[webgpu] no conversion from format %u to %s", r->format, t->fmt.name);
+                    memset(fl, 0, sizeof(float) * 4 * w);
+                }
+                /* one or two channels go to float32, four to half floats */
+                if (t->fmt.bpb == 4) for (uint32_t i = 0; i < w; i++) memcpy(dpp + 4 * i, &fl[4 * i], 4);
+                else if (!strcmp(t->fmt.name, "rg32float")) for (uint32_t i = 0; i < w; i++) memcpy(dpp + 8 * i, &fl[4 * i], 8);
+                else for (uint32_t i = 0; i < w; i++) for (int ch = 0; ch < 4; ch++) { uint16_t hv = float_to_half(fl[4 * i + ch]); memcpy(dpp + 8 * i + 2 * ch, &hv, 2); }
+            }
+        free(fl);
+        tex_write(t, (int)mip, (int)x, (int)y, (int)z, (int)w, (int)h, (int)d, tmp, (int)dp, (int)rows, (int)(dp * rows * d));
         free(tmp);
         return;
     }
     uint32_t size = slice * (d - 1) + pitch * (rows - 1) + (w + blk - 1) / blk * t->fmt.bpb;
-    uewg_texture_write(t->id, (int)mip, (int)x, (int)y, (int)z, (int)w, (int)h, (int)d, G2H(src), (int)pitch, (int)rows, (int)size);
+    tex_write(t, (int)mip, (int)x, (int)y, (int)z, (int)w, (int)h, (int)d, G2H(src), (int)pitch, (int)rows, (int)size);
 }
 
 /* ---- views ---- */
@@ -641,7 +750,7 @@ static uint64_t sig_hash(const DxSig* s)
 }
 
 /* interp: for a vertex shader, the output interpolation its pixel shader asked for */
-static Variant* variant_ex(GpuShader* s, const uint32_t depth[4], const DxSig* vs_out, const char* const* uav_fmt, const char* interp, int use_interp)
+static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* vs_out, const char* const* uav_fmt, const char* interp, int use_interp)
 {
     WShader* w = s ? s->backend : NULL;
     if (!w || !w->refl_ok) return NULL;
@@ -650,18 +759,20 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[4], const DxSig* v
     if (uav_fmt) for (int i = 0; i < 8; i++) if (uav_fmt[i]) key = (key ^ (uint64_t)(uintptr_t)uav_fmt[i] ^ (uint64_t)i << 56) * 0x100000001B3ull;
     if (interp) for (int i = 0; i < 32; i++) if (interp[i]) key = (key ^ (uint64_t)(i << 8 | interp[i])) * 0x100000001B3ull;
     for (Variant* v = w->vars; v; v = v->next)
-        if (v->vkey == key && v->sig == sh && !memcmp(v->depth, depth, 16)) return v->failed ? NULL : v;
+        if (v->vkey == key && v->sig == sh && !memcmp(v->depth, depth, 32)) return v->failed ? NULL : v;
     Variant* v = calloc(1, sizeof *v);
-    memcpy(v->depth, depth, 16);
+    memcpy(v->depth, depth, 32);
     v->sig = sh;
     v->vkey = key;
     v->next = w->vars;
     w->vars = v;
     DxWgslOpts o = { 0 };
+    { static int ms; if (!ms) ms = uewg_max_storage(); o.max_storage = ms; }
     o.vs_out = vs_out;
     o.out_interp = interp;
     o.use_interp = use_interp;
     memcpy(o.depth_srv, depth, 16);
+    memcpy(o.float_srv, depth + 4, 16);
     if (uav_fmt) memcpy(o.uav_format, uav_fmt, sizeof o.uav_format);
     if (!dxbc_to_wgsl_ex(s->code, s->size, &o, &v->w) || !v->w.wgsl) {
         static int skipped;
@@ -675,7 +786,7 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[4], const DxSig* v
     return v;
 }
 
-static Variant* variant(GpuShader* s, const uint32_t depth[4], const DxSig* vs_out, const char* const* uav_fmt)
+static Variant* variant(GpuShader* s, const uint32_t depth[8], const DxSig* vs_out, const char* const* uav_fmt)
 {
     return variant_ex(s, depth, vs_out, uav_fmt, NULL, 0);
 }
@@ -701,7 +812,7 @@ static void layout_entries(Buf* b, Variant* v, int stage, int res, uint32_t* sta
     }
     for (int i = 0; i < 128; i++) {
         DxSlot* s = &w->srv[i];
-        if (!s->used) continue;
+        if (!s->used || s->merged) continue;
         if (s->buffer) bp(b, "%s{\"binding\":%d,\"visibility\":%d,\"buffer\":{\"type\":\"read-only-storage\"}}", first ? "" : ",", 16 + i, vis);
         else {
             const char* st = s->compare ? "depth" : s->ret == 1 ? "sint" : s->ret == 2 ? "uint" : "float";
@@ -710,6 +821,7 @@ static void layout_entries(Buf* b, Variant* v, int stage, int res, uint32_t* sta
         }
         first = 0;
     }
+    if (w->nmerged) { bp(b, "%s{\"binding\":176,\"visibility\":%d,\"buffer\":{\"type\":\"read-only-storage\"}}", first ? "" : ",", vis); first = 0; }
     for (int i = 0; i < 16; i++)
         if (w->samp[i].used) { bp(b, "%s{\"binding\":%d,\"visibility\":%d,\"sampler\":{\"type\":\"%s\"}}", first ? "" : ",", 160 + i, vis, w->samp[i].compare ? "comparison" : w->samp[i].nofilter ? "non-filtering" : "filtering"); first = 0; }
     for (int i = 0; i < 8; i++) {
@@ -953,6 +1065,13 @@ static int typed_buffer(GpuView* v, uint32_t* size)
         w->typed_buf_size = (int)bytes;
         w->typed_version = t->version - 1;
     }
+    if (w->typed_version != t->version && t->id && (r->bind & 0x80)) {
+        /* compute shaders may write this buffer: expand from the GPU copy, which also holds every CPU upload */
+        uewg_expand_typed(t->id, w->typed_buf, (int)w->first_elem, (int)n, (int)v->format, (int)bpe);
+        pass_open = 0;
+        t->used = g_serial;
+        w->typed_version = t->version;
+    }
     if (w->typed_version != t->version) {
         uint32_t* tmp = malloc(bytes);
         const uint8_t* s = G2H(r->backing) + (uint64_t)w->first_elem * bpe;
@@ -966,11 +1085,74 @@ static int typed_buffer(GpuView* v, uint32_t* size)
     return w->typed_buf;
 }
 
+static int srv_buffer(GpuView* view, const DxSlot* s, uint32_t* off, uint32_t* size)
+{
+    WTex* t = view ? T(view->res) : NULL;
+    *off = *size = 0;
+    if (!t || view->res->type != RES_BUFFER) return 0;
+    if (!s->raw && !s->structured) return typed_buffer(view, size);
+    WView* vw = V(view);
+    uint32_t stride = s->raw ? 4 : (view->res->stride ? view->res->stride : 4);
+    *off = vw->first_elem * stride;
+    *size = vw->num_elem * stride;
+    if (*off & 255) { *off = 0; *size = 0; }
+    if (!*size || *off + *size > view->res->width) *size = view->res->width - *off;
+    *size &= ~3u;
+    t->used = g_serial;
+    return t->id;
+}
+
+static int conflicts(GpuView* v);
+
+/* the buffers past the storage-buffer limit, copied one after another behind a header of (word offset, length) pairs */
+static int merged_buffer(GpuCtx* c, Variant* v, int stage, uint32_t* total)
+{
+    DxWgsl* w = &v->w;
+    uint32_t hdr[256] = { 0 };
+    struct { int id; uint32_t off, size, dst; } cp[128];
+    int ncp = 0;
+    uint32_t pos = ((uint32_t)w->nmerged * 8 + 15) & ~15u;
+    for (int i = 0; i < 128; i++) {
+        DxSlot* s = &w->srv[i];
+        if (!s->used || !s->merged) continue;
+        GpuView* view = c->srv[stage][i];
+        if (view && conflicts(view)) view = NULL;
+        uint32_t off, size;
+        int id = srv_buffer(view, s, &off, &size);
+        if (!id || !size) continue;
+        int h = (s->merged - 1) * 2;
+        hdr[h] = pos / 4;
+        hdr[h + 1] = s->raw || s->structured ? size / 4 : size / 16;
+        cp[ncp].id = id; cp[ncp].off = off; cp[ncp].size = size; cp[ncp].dst = pos; ncp++;
+        pos += (size + 15) & ~15u;
+    }
+    if (!v->mbuf || v->mbuf_size < (int)pos) {
+        if (v->mbuf) uewg_release(v->mbuf);
+        v->mbuf = uewg_buffer_create((int)pos, 8);
+        v->mbuf_size = v->mbuf ? (int)pos : 0;
+    }
+    if (!v->mbuf) return 0;
+    WTex tt = { .id = v->mbuf, .used = g_serial };
+    buffer_put(NULL, &tt, 0, (const uint8_t*)hdr, (uint32_t)w->nmerged * 8);
+    for (int k = 0; k < ncp; k++) uewg_buffer_copy(cp[k].id, (int)cp[k].off, v->mbuf, (int)cp[k].dst, (int)cp[k].size);
+    if (ncp) pass_open = 0;
+    *total = pos;
+    return v->mbuf;
+}
+
 /* ---- bind groups ---- */
 
-typedef struct BgEnt { struct BgEnt* next; uint64_t h; int id; } BgEnt;
+typedef struct BgEnt { struct BgEnt* next; uint64_t h; int id; int nids; int ids[]; } BgEnt;
+/* ids of resources and views destroyed this frame: groups naming them can never be used again and are freed after the frame,
+   since games that make a buffer per frame (feedback buffers) would otherwise fill the browser's descriptor heaps */
+static int dead_ids[4096], ndead, dead_over;
+static void bg_dead(int id) { if (!id) return; if (ndead < 4096) dead_ids[ndead++] = id; else dead_over = 1; }
 static BgEnt* bg_cache[4096];
 static int bg_count, bg_full;
+
+static int cmp_int(const void* a, const void* b) { int x = *(const int*)a, y = *(const int*)b; return x < y ? -1 : x > y; }
+
+static void bg_sweep(void);
 
 static void bg_clear(void)
 {
@@ -978,6 +1160,25 @@ static void bg_clear(void)
     for (int i = 0; i < 4096; i++)
         while (bg_cache[i]) { BgEnt* e = bg_cache[i]; bg_cache[i] = e->next; uewg_release(e->id); free(e); }
     bg_count = 0;
+}
+
+static void bg_sweep(void)
+{
+    if (dead_over) { bg_clear(); ndead = 0; dead_over = 0; return; }
+    if (!ndead) return;
+    qsort(dead_ids, (size_t)ndead, sizeof *dead_ids, cmp_int);
+    int freed = 0;
+    for (int i = 0; i < 4096; i++)
+        for (BgEnt** pe = &bg_cache[i]; *pe;) {
+            BgEnt* e = *pe;
+            int hit = 0;
+            for (int k = 0; k < e->nids && !hit; k++) hit = bsearch(&e->ids[k], dead_ids, (size_t)ndead, sizeof *dead_ids, cmp_int) != NULL;
+            if (hit) { *pe = e->next; uewg_release(e->id); free(e); bg_count--; freed++; }
+            else pe = &e->next;
+        }
+    ndead = 0;
+    /* memos may name the freed groups */
+    if (freed) bg_epoch++;
 }
 
 /* a view read while the same subresources are a render target; other mips or layers of it are fine */
@@ -1035,7 +1236,7 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
     Memo* mo = &v->memo;
     variant_slots(v);
     void* refs[160];
-    int nr = 0, memo_ok = !extra && !v->nuav;
+    int nr = 0, memo_ok = !extra && !v->nuav && !w->nmerged;
     for (int k = 0; k < v->nsrv && memo_ok; k++) {
         int i = v->srv_ix[k];
         GpuView* vw = c->srv[stage][i];
@@ -1077,22 +1278,10 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
         GpuView* view = c->srv[stage][i];
         if (view && conflicts(view)) view = NULL;
         WTex* t = view ? T(view->res) : NULL;
+        if (s->merged) continue;
         if (s->buffer) {
-            int id = 0;
             uint32_t off = 0, size = 0;
-            if (t && view->res->type == RES_BUFFER) {
-                if (s->raw || s->structured) {
-                    WView* vw = V(view);
-                    uint32_t stride = s->raw ? 4 : (view->res->stride ? view->res->stride : 4);
-                    id = t->id;
-                    off = vw->first_elem * stride;
-                    size = vw->num_elem * stride;
-                    if (off & 255) { off = 0; size = 0; }
-                    if (!size || off + size > view->res->width) size = view->res->width - off;
-                    size &= ~3u;
-                    t->used = g_serial;
-                } else id = typed_buffer(view, &size);
-            }
+            int id = srv_buffer(view, s, &off, &size);
             if (id && size) ENT(16 + i, E_BUF, id, off, size);
             else ENT(16 + i, E_DUMMY_BUF);
         } else {
@@ -1104,8 +1293,28 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
                 t->used = g_serial;
             }
             if (id) ENT(16 + i, E_ID, id);
-            else ENT(16 + i, E_DUMMY_TEX, 0, 0, 0, s->dim, s->compare ? 3 : s->ret);
+            else {
+                /* why a placeholder is bound instead of the game's texture (once per reason and slot) */
+                static int said, dbg = -1;
+                if (dbg < 0) dbg = host_query_flag("texdebug");
+                if (dbg && said < 60) {
+                    GpuView* orig = c->srv[stage][i];
+                    WView* ov = V(orig);
+                    const char* why = !orig ? "nothing bound" : !orig->res ? "no resource" : conflicts(orig) ? "also a render target"
+                                    : !T(orig->res) ? "no texture" : !ov ? "no view" : ov->depth_aspect != (s->compare != 0) ? "depth aspect" : "view_for failed";
+                    host_log("[tex] stage %d slot %d: placeholder (%s) shader dim %d view dim %u fmt %u res type %d", stage, i, why, s->dim,
+                             orig ? orig->dim : 0, orig ? orig->format : 0, orig && orig->res ? orig->res->type : -1);
+                    said++;
+                }
+                ENT(16 + i, E_DUMMY_TEX, 0, 0, 0, s->dim, s->compare ? 3 : s->ret);
+            }
         }
+    }
+    if (w->nmerged) {
+        uint32_t size = 0;
+        int id = merged_buffer(c, v, stage, &size);
+        if (id) ENT(176, E_BUF, id, 0, size);
+        else ENT(176, E_DUMMY_BUF);
     }
     for (int k = 0; k < v->nsamp; k++) {
         int i = v->samp_ix[k];
@@ -1114,7 +1323,7 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
     for (int k = 0; k < v->nuav; k++) {
         int i = v->uav_ix[k];
         DxSlot* u = &w->uav[i];
-        GpuView* view = c->uav[i];
+        GpuView* view = stage == SH_PS ? c->ps_uav[i] : c->uav[i];
         WTex* t = view ? T(view->res) : NULL;
         int id = 0;
         if (t && t->id) {
@@ -1168,14 +1377,22 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
 #define RC_PUT(id) do { if (rc && mo->valid) { rc->h = rh; rc->v = v; rc->epoch = bg_epoch; rc->bg = (id); rc->nbufs = mo->nbufs; memcpy(rc->bufs, mo->bufs, sizeof *mo->bufs * (size_t)mo->nbufs); } } while (0)
     if (found) { st_bg_hash++; if (memo_ok && mo->valid) { mo->bg = found; mo->bg_epoch = bg_epoch; } RC_PUT(found); return found; }
     st_bg_new++;
+    { static int dbg = -1, said; static uint64_t first; if (dbg < 0) dbg = host_query_flag("bgdebug");
+      if (!first) first = host_ticks_ns();
+      if (dbg && said < 400 && host_ticks_ns() - first > 45000000000ull) { said++; char line[600]; int o = snprintf(line, sizeof line, "[bg] new v=%p g=%d:", (void*)v, group);
+        for (int k = 0; k < n && o < 560; k++) o += snprintf(line + o, sizeof line - o, " %d:%d/%d/%u", ents[k].b, ents[k].kind, ents[k].id, ents[k].off);
+        host_log("%s", line); } }
     /* a full cache is emptied after the frame: groups already handed to this draw must stay alive */
-    if (bg_count > 32768) bg_full = 1;
+    /* every live bind group holds descriptors in the browser's D3D12 heaps; too many and the device is lost */
+    if (bg_count > 8192) bg_full = 1;
     breset(&rb);
     bp(&rb, "[");
     ent_json(&rb, ents, n);
     bp(&rb, "]");
-    BgEnt* e = malloc(sizeof *e);
+    BgEnt* e = malloc(sizeof *e + sizeof(int) * (size_t)n);
     e->h = h;
+    e->nids = 0;
+    for (int k = 0; k < n; k++) if ((ents[k].kind == E_ID && ents[k].b < 160) || ents[k].kind == E_BUF || ents[k].b >= 176) if (ents[k].id) e->ids[e->nids++] = ents[k].id;
     e->id = uewg_bindgroup_create(p->layout, group, rb.p);
     e->next = *slot;
     *slot = e;
@@ -1324,6 +1541,8 @@ static void depth_state(Buf* b, GpuCtx* c, const char* fmt, int has_stencil, int
     const uint32_t* d = c->depth ? (const uint32_t*)c->depth->desc : def;
     int en = (int)d[0];
     int write = en && d[1] && !(ro & 1);
+    static int depth_always = -1;
+    if (dbg_flag("depthalways", &depth_always) && !write) en = 0;
     bp(b, ",\"depth\":{\"format\":\"%s\",\"depthWriteEnabled\":%s,\"depthCompare\":\"%s\"", fmt, write ? "true" : "false", en ? cmp_name(d[2]) : "always");
     if (has_stencil && d[3]) {
         uint8_t rm = (uint8_t)(d[4] & 0xFF), wm = (uint8_t)((d[4] >> 8) & 0xFF);
@@ -1419,6 +1638,8 @@ static int render_pipeline(GpuCtx* c, Program* p, PipeKey* k)
     const char* tp = k->topology < 6 ? topo[k->topology] : "triangle-list";
     const uint32_t* r = k->raster ? (const uint32_t*)k->raster->desc : NULL;
     uint32_t cull = r ? r[1] : 3;
+    static int no_cull = -1;
+    if (dbg_flag("nocull", &no_cull)) cull = 1;
     bp(&b, ",\"primitive\":{\"topology\":\"%s\",\"cullMode\":\"%s\",\"frontFace\":\"%s\"", tp, cull == 2 ? "front" : cull == 3 ? "back" : "none", r && r[2] ? "ccw" : "cw");
     if (!strcmp(tp, "triangle-strip") || !strcmp(tp, "line-strip")) bp(&b, ",\"stripIndexFormat\":\"%s\"", k->strip32 ? "uint32" : "uint16");
     if (r && !r[6]) bp(&b, ",\"unclippedDepth\":true");
@@ -1440,9 +1661,9 @@ static int render_pipeline(GpuCtx* c, Program* p, PipeKey* k)
 }
 
 /* which bound shader resources are depth textures: only the slots the stage's shader reads matter */
-static void depth_mask(GpuCtx* c, int stage, uint32_t m[4])
+static void depth_mask(GpuCtx* c, int stage, uint32_t m[8])
 {
-    memset(m, 0, 16);
+    memset(m, 0, 32);
     WShader* ws = c->sh[stage] ? c->sh[stage]->backend : NULL;
     int all = !ws || !ws->refl_ok || dbg_flag("fulldepthmask", &full_dmask), n = all ? 128 : ws->nsrv;
     for (int k = 0; k < n; k++) {
@@ -1450,6 +1671,10 @@ static void depth_mask(GpuCtx* c, int stage, uint32_t m[4])
         GpuView* v = c->srv[stage][i];
         WView* w = V(v);
         if (w && w->depth_aspect && v->res && v->res->type != RES_BUFFER) m[i >> 5] |= 1u << (i & 31);
+        /* an integer view of a 32-bit float texture (R32_TYPELESS read as R32_UINT): the shader declares it f32 */
+        WTex* t = v && v->res && v->res->type != RES_BUFFER ? T(v->res) : NULL;
+        if (t && t->fmt.name && !(t->fmt.flags & FF_DEPTH) && strstr(t->fmt.name, "32float") && ws && ws->refl_ok && ws->refl.srv[i].ret && !ws->refl.srv[i].compare)
+            m[4 + (i >> 5)] |= 1u << (i & 31);
     }
 }
 
@@ -1533,21 +1758,22 @@ static int put_fixed(GpuCtx* c, uint32_t w, uint32_t h, int n)
    sorts the emitted triangles into one bucket per layer; each layer is then drawn indirectly with a
    passthrough vertex shader and the original pixel shader. */
 
-static Variant* lib_variant(GpuShader* s, const uint32_t depth[4], const char* prefix, int group)
+static Variant* lib_variant(GpuShader* s, const uint32_t depth[8], const char* prefix, int group)
 {
     WShader* w = s ? s->backend : NULL;
     if (!w || !w->refl_ok) return NULL;
     char uk[64];
     snprintf(uk, sizeof uk, "lib:%s%d", prefix, group);
     for (Variant* v = w->vars; v; v = v->next)
-        if (!memcmp(v->depth, depth, 16) && !strcmp(v->uav_key, uk)) return v->failed ? NULL : v;
+        if (!memcmp(v->depth, depth, 32) && !strcmp(v->uav_key, uk)) return v->failed ? NULL : v;
     Variant* v = calloc(1, sizeof *v);
-    memcpy(v->depth, depth, 16);
+    memcpy(v->depth, depth, 32);
     snprintf(v->uav_key, sizeof v->uav_key, "%s", uk);
     v->next = w->vars;
     w->vars = v;
     DxWgslOpts o = { 0 };
     memcpy(o.depth_srv, depth, 16);
+    memcpy(o.float_srv, depth + 4, 16);
     o.lib = 1;
     o.prefix = prefix;
     o.group = group;
@@ -1834,7 +2060,7 @@ static void gs_grow(int* id, int* size, int want, int usage)
 
 static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance, int indexed)
 {
-    uint32_t dm[4];
+    uint32_t dm[8];
     depth_mask(c, SH_VS, dm);
     Variant* vs = lib_variant(c->sh[SH_VS], dm, "a_", 0);
     depth_mask(c, SH_GS, dm);
@@ -1955,13 +2181,13 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     if (indirect && (!it || !it->id || c->sh[SH_GS])) DROP(0);
     if (c->sh[SH_GS]) { st_gs++; gs_draw(c, count, first, base_vertex, instances, first_instance, indexed); return; }
     if (c->topology > 5) DROP(1);
-    uint32_t dm[4] = { 0 }, vdm[4];
+    uint32_t dm[8] = { 0 }, vdm[8];
     depth_mask(c, SH_VS, vdm);
     if (c->sh[SH_PS]) depth_mask(c, SH_PS, dm);
     /* everything the variants, program and pipeline depend on; most draws repeat the previous draw's */
     static struct DrawKey {
         GpuShader *vs, *ps;
-        uint32_t vdm[4], dm[4];
+        uint32_t vdm[8], dm[8];
         GpuLayout* layout;
         GpuState *blend, *depth, *raster;
         GpuView* rtv[8];
@@ -1974,7 +2200,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     static struct { int valid; Variant *vs, *ps; Program* p; int pipe; } dmemo;
     memset(&dk, 0, sizeof dk);
     dk.vs = c->sh[SH_VS]; dk.ps = c->sh[SH_PS];
-    memcpy(dk.vdm, vdm, 16); memcpy(dk.dm, dm, 16);
+    memcpy(dk.vdm, vdm, 32); memcpy(dk.dm, dm, 32);
     dk.layout = c->layout; dk.blend = c->blend; dk.depth = c->depth; dk.raster = c->raster;
     for (int i = 0; i < 8; i++) {
         GpuView* r = c->rtv[i];
@@ -2034,6 +2260,12 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     uint32_t shift = indirect ? 0 : first_instance;
     for (int i = 0; i < 16 && shift; i++)
         if (inst_step[i] && c->vb[i] && (uint64_t)c->vb_offset[i] + (uint64_t)(shift / inst_step[i]) * c->vb_stride[i] >= c->vb[i]->width) shift = 0;
+    /* likewise SV_VertexID of an indexed draw is the index alone, without the base vertex (Unreal's manual vertex fetch
+       adds that itself), while WebGPU's vertex_index includes it: move the per-vertex buffers instead */
+    WShader* vsw = c->sh[SH_VS] ? (WShader*)c->sh[SH_VS]->backend : NULL;
+    uint32_t vshift = !indirect && indexed && base_vertex > 0 && vsw && vsw->refl_ok && vsw->refl.uses_vertex_id ? (uint32_t)base_vertex : 0;
+    for (int i = 0; i < 16 && vshift; i++)
+        if (!inst_step[i] && c->vb[i] && dk.stride[i] && ((uint64_t)c->vb_offset[i] + (uint64_t)vshift * c->vb_stride[i] >= c->vb[i]->width || (vshift * c->vb_stride[i]) & 3)) vshift = 0;
     for (int i = 0; i < 16; i++) {
         WTex* t = T(c->vb[i]);
         if (!t || !t->id || !dk.stride[i]) {
@@ -2042,7 +2274,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
             continue;
         }
         t->used = g_serial;
-        pk[n++] = i; pk[n++] = t->id; pk[n++] = (int32_t)((c->vb_offset[i] + (inst_step[i] ? shift / inst_step[i] * c->vb_stride[i] : 0)) & ~3u);
+        pk[n++] = i; pk[n++] = t->id; pk[n++] = (int32_t)((c->vb_offset[i] + (inst_step[i] ? shift / inst_step[i] * c->vb_stride[i] : vshift * c->vb_stride[i])) & ~3u);
         nvb++;
     }
     pk[at] = nvb;
@@ -2050,7 +2282,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     if (m < 0) DROP(5);
     n = m;
     if (indirect) { it->used = g_serial; pk[n++] = indexed; pk[n++] = -1; pk[n++] = it->id; pk[n++] = (int32_t)c->indirect_off; pk[n++] = 0; pk[n++] = 0; }
-    else { pk[n++] = indexed; pk[n++] = (int32_t)count; pk[n++] = (int32_t)instances; pk[n++] = (int32_t)first; pk[n++] = base_vertex; pk[n++] = (int32_t)(first_instance - shift); }
+    else { pk[n++] = indexed; pk[n++] = (int32_t)count; pk[n++] = (int32_t)instances; pk[n++] = (int32_t)first; pk[n++] = base_vertex - (int32_t)vshift; pk[n++] = (int32_t)(first_instance - shift); }
     if (indexed) {
         WTex* t = T(c->ib);
         if (!t || !t->id) DROP(6);
@@ -2064,7 +2296,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
 static void dispatch(GpuCtx* c, uint32_t x, uint32_t y, uint32_t z)
 {
     if (!g_ok || !c->sh[SH_CS] || !x || !y || !z) return;
-    uint32_t dm[4];
+    uint32_t dm[8];
     depth_mask(c, SH_CS, dm);
     const char* uf[8] = { 0 };
     WShader* ws = c->sh[SH_CS]->backend;
@@ -2193,9 +2425,9 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
         int o = snprintf(m, sizeof m, "%u drawn", drawn), dropped = 0;
         for (int i = 0; i < 7; i++) if (drops[i]) { o += snprintf(m + o, sizeof m - o, ", %u dropped (%s)", drops[i], drop_why[i]); dropped = 1; }
         if (dropped) host_log("[webgpu] last 600 frames: %s", m);
-        host_log("[webgpu] per frame: %u draws, %u GS draws, CB ring %.0f KB (%llu hits, %llu unchanged, %llu copies), %llu per-draw CB groups, res groups %llu memo / %llu cached / %llu hashed / %llu new",
+        host_log("[webgpu] per frame: %u draws, %u GS draws, CB ring %.0f KB (%llu hits, %llu unchanged, %llu copies), %llu per-draw CB groups, res groups %llu memo / %llu cached / %llu hashed / %llu new, %d live",
                  drawn / 600, (unsigned)(st_gs / 600), st_ring_bytes / 600 / 1024.0, (unsigned long long)(st_cb_hit / 600), (unsigned long long)(st_cb_same / 600), (unsigned long long)(st_cb_miss / 600),
-                 (unsigned long long)(st_static / 600), (unsigned long long)(st_bg_memo / 600), (unsigned long long)(st_bg_rc / 600), (unsigned long long)(st_bg_hash / 600), (unsigned long long)(st_bg_new / 600));
+                 (unsigned long long)(st_static / 600), (unsigned long long)(st_bg_memo / 600), (unsigned long long)(st_bg_rc / 600), (unsigned long long)(st_bg_hash / 600), (unsigned long long)(st_bg_new / 600), bg_count);
         st_bg_rc = st_ring_bytes = st_cb_hit = st_cb_same = st_cb_miss = st_gs = st_static = st_bg_memo = st_bg_hash = st_bg_new = 0;
         memset(drops, 0, sizeof drops);
         drawn = 0;
@@ -2204,7 +2436,9 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
     if (dbg_flag("ringreset", &ring_reset)) { ring_used = 0; ring_gen++; uewg_ring_reset(); }
     for (int i = 0; i < ntemp; i++) uewg_release(temp_bg[i]);
     ntemp = 0;
-    if (bg_full) { bg_clear(); bg_full = 0; }
+    if (bg_full) { bg_clear(); bg_full = 0; ndead = 0; dead_over = 0; }
+    bpool_age(g_serial);
+    if (!bg_full) bg_sweep();
     for (int i = 0; i < ngs_old; i++) uewg_release(gs_old[i]);
     for (int i = 0; i < ntemp_views; i++) uewg_release(temp_views[i]);
     ntemp_views = 0;
@@ -2283,8 +2517,8 @@ static void view_destroy(GpuView* v)
     WView* w = V(v);
     if (!w) return;
     if (w->rt_view) uewg_retire(w->rt_view);
-    for (int i = 0; i < w->nv; i++) if (w->v[i].id) uewg_retire(w->v[i].id);
-    if (w->typed_buf) uewg_retire(w->typed_buf);
+    for (int i = 0; i < w->nv; i++) if (w->v[i].id) { uewg_retire(w->v[i].id); bg_dead(w->v[i].id); }
+    if (w->typed_buf) { uewg_retire(w->typed_buf); bg_dead(w->typed_buf); }
     free(w);
     v->backend = NULL;
 }

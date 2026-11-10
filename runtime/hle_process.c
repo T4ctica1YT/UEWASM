@@ -16,7 +16,7 @@ void process_init(int argc, char** argv)
     for (char* p = g_cmdline; *p; p++) if (*p == '/') *p = '\\';
     for (int i = 1; i < argc; i++) {
         if (skip_arg(argv[i])) { i++; continue; }
-        o += (size_t)snprintf(g_cmdline + o, sizeof g_cmdline - o, strchr(argv[i], ' ') ? " \"%s\"" : " %s", argv[i]);
+        o += (size_t)snprintf(g_cmdline + o, sizeof g_cmdline - o, strchr(argv[i], ' ') && !strchr(argv[i], '"') ? " \"%s\"" : " %s", argv[i]);
     }
     cmd_a = g_strdup(g_cmdline);
     cmd_w = g_alloc(2 * strlen(g_cmdline) + 2);
@@ -159,7 +159,6 @@ HLE(GetComputerNameA) { snprintf((char*)G2H(A1), 16, "WEB"); ST32(A2, 3); RET(1)
 HLE(GetUserNameW) { utf8_to_wstr("Player", A1, 32); ST32(A2, 7); RET(1); }
 HLE(GetUserNameA) { snprintf((char*)G2H(A1), 32, "Player"); ST32(A2, 7); RET(1); }
 HLE(OutputDebugStringW) { char s[2048]; wstr_to_utf8(A1, s, sizeof s); host_log("[debug] %s", s); RET(0); }
-HLE(IsThreadAFiber) { RET(0); }
 HLE(Beep) { RET(1); }
 HLE(GetExitCodeProcess) { ST32(A2, 259); RET(1); }
 HLE(CreateProcessW) { ST32(g_teb + 0x68, 2); RET(0); }

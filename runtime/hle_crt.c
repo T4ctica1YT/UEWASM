@@ -1,3 +1,4 @@
+#include <string.h>
 #include "host.h"
 
 #include <ctype.h>
@@ -33,6 +34,7 @@ void hle_init(int argc, char** argv)
 }
 
 GuestFn hle_by_ordinal(const char* dll, const char* name);
+void hle_set_error(uint32_t e);
 void hle_missing(CPU* c, const Thunk* e)
 {
     GuestFn f = hle_by_ordinal(e->dll, e->name);
@@ -45,6 +47,18 @@ void hle_missing(CPU* c, const Thunk* e)
         seen[nseen++] = e->name;
         host_log("[hle] unimplemented %s!%s", e->dll, e->name);
     }
+    /* answer the way a missing feature would: COM-style libraries return an HRESULT (E_NOTIMPL, so callers don't
+       mistake 0 for S_OK and use a null object), XInput reports no pad, everything else FALSE/NULL with the error set */
+    static const char* com_dlls[] = { "mfplat", "mfreadwrite", "mf.dll", "ole32", "combase", "oleaut32", "d2d1", "dwrite", "windowscodecs",
+                                      "d3d9", "d3d10", "d3d12", "dxgi", "d3dcompiler", "dsound", "xaudio2", "mmdevapi", "propsys",
+                                      "uiautomationcore", "api-ms-win-core-winrt", "dcomp", "dxva2", "evr", "dxcore", 0 };
+    char dll[64];
+    size_t n = 0;
+    for (; e->dll[n] && n + 1 < sizeof dll; n++) dll[n] = (char)(e->dll[n] >= 'A' && e->dll[n] <= 'Z' ? e->dll[n] + 32 : e->dll[n]);
+    dll[n] = 0;
+    for (int i = 0; com_dlls[i]; i++) if (strstr(dll, com_dlls[i])) { RET(0x80004001); return; }
+    if (strstr(dll, "xinput")) { RET(1167); return; }   /* ERROR_DEVICE_NOT_CONNECTED */
+    hle_set_error(120);   /* ERROR_CALL_NOT_IMPLEMENTED */
     RET(0);
 }
 

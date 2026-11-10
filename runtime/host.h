@@ -99,6 +99,7 @@ uint64_t host_time_100ns(void);
 
 uint64_t rt_dyn_thunk(GuestFn fn, const char* name);
 int host_query_flag(const char* name);
+int host_query_int(const char* name);
 uint64_t g_alloc_zero_aligned(uint64_t n, uint64_t align);
 uint64_t g_pages(uint64_t size);
 uint64_t g_pages_at(uint64_t a, uint64_t size);

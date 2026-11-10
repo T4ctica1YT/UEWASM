@@ -23,6 +23,10 @@ static int screen_dim(int i) { int w, h; host_canvas_size(&w, &h); return i ? h 
 static int quit_posted;
 static uint64_t raw_pending_dx, raw_pending_dy;
 static int raw_x, raw_y, raw_buttons;
+/* DirectInput reads key states and its own mouse motion (relative, consumed per read) */
+static int di_dx, di_dy, di_dz;
+int user32_key(int vk) { return keys[vk & 255] & 0x80; }
+void user32_di_mouse(int* dx, int* dy, int* dz) { *dx = di_dx; *dy = di_dy; *dz = di_dz; di_dx = di_dy = di_dz = 0; }
 
 #define HWND_BASE 0x20000ull
 #define WM_SIZE 0x0005
@@ -46,6 +50,8 @@ static void post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp)
 
 /* input goes to the window the game last showed or focused (UE makes helper windows first) */
 static uint64_t focus_hwnd;
+/* for other modules (winmm callbacks): a message to a window, or to the main one */
+void user32_post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
 static uint64_t main_hwnd(void) { return focus_hwnd ? focus_hwnd : nwins ? wins[0].hwnd : 0; }
 
 void user32_event(int type, int a, int b, int d1, int d2)
@@ -59,7 +65,7 @@ void user32_event(int type, int a, int b, int d1, int d2)
     case HOST_EV_MOUSE_MOVE:
         mouse_x = a; mouse_y = b;
         post(h, 0x200, (uint64_t)raw_buttons, (uint64_t)(uint16_t)a | ((uint64_t)(uint16_t)b << 16));
-        if (d1 || d2) { raw_x += d1; raw_y += d2; post(h, WM_INPUT, 0, 0x1); }
+        if (d1 || d2) { raw_x += d1; raw_y += d2; di_dx += d1; di_dy += d2; post(h, WM_INPUT, 0, 0x1); }
         break;
     case HOST_EV_MOUSE_BUTTON: {
         static const uint32_t down[] = { 0x201, 0x204, 0x207, 0x20B, 0x20B }, up[] = { 0x202, 0x205, 0x208, 0x20C, 0x20C };
@@ -71,7 +77,7 @@ void user32_event(int type, int a, int b, int d1, int d2)
         post(h, b ? down[btn] : up[btn], wp, (uint64_t)(uint16_t)mouse_x | ((uint64_t)(uint16_t)mouse_y << 16));
         break;
     }
-    case HOST_EV_WHEEL: post(h, 0x20A, (uint64_t)(uint16_t)(int16_t)(a * 120) << 16, (uint64_t)(uint16_t)mouse_x | ((uint64_t)(uint16_t)mouse_y << 16)); break;
+    case HOST_EV_WHEEL: di_dz += a * 120; post(h, 0x20A, (uint64_t)(uint16_t)(int16_t)(a * 120) << 16, (uint64_t)(uint16_t)mouse_x | ((uint64_t)(uint16_t)mouse_y << 16)); break;
     case HOST_EV_RESIZE: {
         Wnd* w = wnd(h);
         w->w = a; w->h = b;
@@ -90,6 +96,7 @@ static uint64_t call_wndproc(CPU* c, Wnd* w, uint32_t msg, uint64_t wp, uint64_t
     return rt_invoke(c, w->proc, 4, a);
 }
 
+void hle_CreateWindowExW(CPU*);
 static void wcopy_name(uint64_t p, char* out, size_t cap)
 {
     if (p < 0x10000) snprintf(out, cap, "#%llu", (unsigned long long)p);
@@ -114,7 +121,42 @@ HLE(RegisterClassExW)
     k->atom = 0xC000 + (uint64_t)nclasses;
     RET(k->atom);
 }
+static void acopy_name(uint64_t p, char* out, size_t cap)
+{
+    if (p < 0x10000) { snprintf(out, cap, "#%llu", (unsigned long long)p); return; }
+    size_t i = 0;
+    for (; i + 1 < cap; i++) { out[i] = (char)LD8(p + i); if (!out[i]) return; }
+    out[i] = 0;
+}
+static void register_class_a(CPU* c)
+{
+    if (nclasses == 64) { RET(0); return; }
+    WClass* k = &classes[nclasses++];
+    k->proc = LD64(A1 + 8);
+    acopy_name(LD64(A1 + 64), k->name, sizeof k->name);
+    k->atom = 0xC000 + (uint64_t)nclasses;
+    RET(k->atom);
+}
+HLE(RegisterClassA) { register_class_a(c); }
+HLE(RegisterClassExA) { register_class_a(c); }
 STUB(UnregisterClassW, 1)
+STUB(UnregisterClassA, 1)
+/* the class name and title as wide copies, then the wide version */
+HLE(CreateWindowExA)
+{
+    char cls[128], title[512];
+    acopy_name(A2, cls, sizeof cls);
+    acopy_name(A3, title, sizeof title);
+    uint64_t wc = A2, wt = 0;
+    if (A2 >= 0x10000) { wc = g_alloc(2 * strlen(cls) + 2); utf8_to_wstr(cls, wc, strlen(cls) + 1); }
+    if (A3) { wt = g_alloc(2 * strlen(title) + 2); utf8_to_wstr(title, wt, strlen(title) + 1); }
+    uint64_t oc = A2;
+    R(2) = wc;
+    R(8) = wt;
+    hle_CreateWindowExW(c);
+    if (oc >= 0x10000) g_free(wc);
+    if (wt) g_free(wt);
+}
 
 HLE(CreateWindowExW)
 {
@@ -373,8 +415,85 @@ HLE(MapVirtualKeyW)
 }
 HLE(MapVirtualKeyA) { hle_MapVirtualKeyW(c); }
 STUB(GetKeyboardLayout, 0x04090409)
-HLE(GetKeyNameTextW) { RET(0); }
-HLE(ToUnicode) { RET(0); }
+/* GetKeyNameText(lParam, buffer, chars): the key's name from its scan code (bits 16-23) and extended bit (24) */
+static const char* key_name(uint32_t lp)
+{
+    uint32_t sc = (lp >> 16) & 0xFF, ext = (lp >> 24) & 1;
+    static const char* base[0x59] = {
+        0, "Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "Backspace", "Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P",
+        "[", "]", "Enter", "Ctrl", "A", "S", "D", "F", "G", "H", "J", "K", "L", ";", "'", "`", "Shift", "\\", "Z", "X", "C", "V", "B", "N", "M",
+        ",", ".", "/", "Right Shift", "Num *", "Alt", "Space", "Caps Lock", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+        "Pause", "Scroll Lock", "Num 7", "Num 8", "Num 9", "Num -", "Num 4", "Num 5", "Num 6", "Num +", "Num 1", "Num 2", "Num 3", "Num 0",
+        "Num Del", "Sys Req", 0, 0, "F11", "F12" };
+    if (ext) {
+        switch (sc) {
+        case 0x1C: return "Num Enter"; case 0x1D: return "Right Ctrl"; case 0x35: return "Num /"; case 0x37: return "Prnt Scrn";
+        case 0x38: return "Right Alt"; case 0x45: return "Num Lock"; case 0x47: return "Home"; case 0x48: return "Up"; case 0x49: return "Page Up";
+        case 0x4B: return "Left"; case 0x4D: return "Right"; case 0x4F: return "End"; case 0x50: return "Down"; case 0x51: return "Page Down";
+        case 0x52: return "Insert"; case 0x53: return "Delete"; case 0x5B: return "Left Windows"; case 0x5C: return "Right Windows"; case 0x5D: return "Application";
+        }
+    }
+    return sc < 0x59 ? base[sc] : 0;
+}
+HLE(GetKeyNameTextW)
+{
+    const char* n = key_name((uint32_t)A1);
+    int cap = (int)A3;
+    if (!n || cap < 1) { RET(0); return; }
+    int len = (int)strlen(n);
+    if (len > cap - 1) len = cap - 1;
+    for (int i = 0; i < len; i++) ST16(A2 + 2 * i, (uint8_t)n[i]);
+    ST16(A2 + 2 * len, 0);
+    RET(len);
+}
+HLE(GetKeyNameTextA)
+{
+    const char* n = key_name((uint32_t)A1);
+    int cap = (int)A3;
+    if (!n || cap < 1) { RET(0); return; }
+    int len = (int)strlen(n);
+    if (len > cap - 1) len = cap - 1;
+    memcpy(G2H(A2), n, (size_t)len);
+    ST8(A2 + len, 0);
+    RET(len);
+}
+/* ToUnicode(vk, scan, key state[256], buffer, chars, flags): the US layout, with Shift and Caps Lock from the key state */
+static uint32_t us_char(uint32_t vk, uint64_t ks)
+{
+    int shift = ks && ((LD8(ks + 0x10) | LD8(ks + 0xA0) | LD8(ks + 0xA1)) & 0x80), caps = ks && (LD8(ks + 0x14) & 1);
+    int ctrl = ks && ((LD8(ks + 0x11) | LD8(ks + 0xA2)) & 0x80);
+    uint32_t ch = 0;
+    static const char punct[][3] = { { 0xBA, ';', ':' }, { 0xBB, '=', '+' }, { 0xBC, ',', '<' }, { 0xBD, '-', '_' }, { 0xBE, '.', '>' }, { 0xBF, '/', '?' },
+                                     { 0xC0, '`', '~' }, { 0xDB, '[', '{' }, { 0xDC, 92, '|' }, { 0xDD, ']', '}' }, { 0xDE, 39, '"' } };
+    static const char shifted_digits[] = ")!@#$%^&*(";
+    if (vk >= 'A' && vk <= 'Z') ch = (shift ^ caps) ? vk : vk + 32;
+    else if (vk >= '0' && vk <= '9') ch = shift ? (uint8_t)shifted_digits[vk - '0'] : vk;
+    else if (vk >= 0x60 && vk <= 0x69) ch = '0' + (vk - 0x60);
+    else if (vk == 0x6A) ch = '*'; else if (vk == 0x6B) ch = '+'; else if (vk == 0x6D) ch = '-'; else if (vk == 0x6E) ch = '.'; else if (vk == 0x6F) ch = '/';
+    else if (vk == 0x20 || vk == 0x0D || vk == 0x08 || vk == 0x09 || vk == 0x1B) ch = vk;
+    else for (size_t i = 0; i < sizeof punct / sizeof punct[0]; i++) if ((uint8_t)punct[i][0] == vk) ch = (uint8_t)punct[i][shift ? 2 : 1];
+    if (ctrl && ch >= 'a' && ch <= 'z') ch -= 96;
+    else if (ctrl && ch >= 'A' && ch <= 'Z') ch -= 64;
+    return ch;
+}
+HLE(ToUnicode)
+{
+    uint64_t buf = A4;
+    int cap = (int)ARG(5);
+    uint32_t ch = ((uint32_t)A2 & 0x8000) ? 0 : us_char((uint32_t)A1 & 0xFF, A3);   /* nothing on key release */
+    if (!ch || cap < 1 || !buf) { RET(0); return; }
+    ST16(buf, (uint16_t)ch);
+    if (cap > 1) ST16(buf + 2, 0);
+    RET(1);
+}
+/* ToAscii(vk, scan, key state, WORD* out, flags) */
+HLE(ToAscii)
+{
+    uint32_t ch = ((uint32_t)A2 & 0x8000) ? 0 : us_char((uint32_t)A1 & 0xFF, A3);
+    if (!ch || !A4) { RET(0); return; }
+    ST16(A4, (uint16_t)ch);
+    RET(1);
+}
 HLE(VkKeyScanW) { RET(A1 >= 'a' && A1 <= 'z' ? A1 - 32 : A1); }
 
 STUB(RegisterRawInputDevices, 1)
@@ -470,7 +589,6 @@ STUB(RegisterHotKey, 1)
 STUB(UnregisterHotKey, 1)
 STUB(DisableProcessWindowsGhosting, 0)
 STUB(GetProcessWindowStation, 0x80001)
-STUB(GetUserObjectInformationW, 0)
 STUB(SendInput, 0)
 STUB(GetTouchInputInfo, 0)
 STUB(CloseTouchInputHandle, 1)
@@ -507,3 +625,5 @@ STUB(FlashWindowEx, 1)
 STUB(TrackMouseEvent, 1)
 STUB(BringWindowToTop, 1)
 STUB(RedrawWindow, 1)
+
+void user32_post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp) { post(hwnd ? hwnd : main_hwnd(), msg, wp, lp); }

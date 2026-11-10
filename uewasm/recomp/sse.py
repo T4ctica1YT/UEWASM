@@ -167,6 +167,25 @@ def ptest(f, ins, m):
     f.emit(f"rt_ptest(&F, c->x[{f.xmm(0)}], {f.xsrc(1, 16)});")
 
 
+@sse("PCMPESTRI", "PCMPISTRI", "PCMPESTRM", "PCMPISTRM", "PCMPESTRI64", "PCMPISTRI64", "PCMPESTRM64", "PCMPISTRM64", "VPCMPESTRI64", "VPCMPESTRM64", "VPCMPESTRI", "VPCMPISTRI", "VPCMPESTRM", "VPCMPISTRM")
+def pcmpstr(f, ins, m):
+    expl = int("ESTR" in m)
+    mask = int(m.endswith("M"))
+    w = ins.op_code().operand_size == 64
+    la, lb = ("R(0)", "R(2)") if w else ("(int64_t)(int32_t)R(0)", "(int64_t)(int32_t)R(2)")
+    call = f"rt_pcmpstr(&F, &c->x[0], c->x[{f.xmm(0)}], {f.xsrc(1, 16)}, {ins.immediate(2) & 0xFF}, {la}, {lb}, {expl}, {mask})"
+    if mask:
+        f.emit(f"{call};")
+    else:
+        f.emit(f"R(1) = {call};")
+
+
+@sse("CRC32")
+def crc32(f, ins, m):
+    n = f.size(1)
+    f.wr(0, f"rt_crc32({f.rd(0)}, {f.rd(1)}, {n})")
+
+
 @sse("LDMXCSR", "VLDMXCSR")
 def ldmxcsr(f, ins, m):
     f.emit(f"c->mxcsr = (uint32_t)LD32({f.addr()});")

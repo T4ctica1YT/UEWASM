@@ -422,6 +422,8 @@ static void ctx_ia_ib(CPU* c) { ctx.ib = com_host(A2); ctx.ib_format = (uint32_t
 static void ctx_ia_topology(CPU* c) { ctx.topology = (uint32_t)A2; RET(0); }
 
 static void ctx_begin(CPU* c) { RET(0); }
+/* Flush: work is submitted at present and before readbacks */
+static void ctx_flush(CPU* c) { RET(0); }
 /* End: a timestamp query takes a ticket for "when the GPU has done everything so far" */
 static void ctx_end(CPU* c)
 {
@@ -439,16 +441,21 @@ static void ctx_get_data(CPU* c)
         else if (type == 2 && size >= 8) {
             uint32_t ticket = (uint32_t)LD32(PAY(q) + 4);
             uint64_t ns = 0;
+            static uint32_t last, polls, fresh;
             if (ticket && gpu && gpu->timestamp_get && !gpu->timestamp_get(ticket, &ns)) {
                 /* not finished yet: S_FALSE, as D3D answers. A caller polling the same query in a loop is waiting for it:
-                   then give the browser time to report the GPU's progress */
-                static uint32_t last, polls;
+                   then give the browser time to report the GPU's progress. One that asks each new query once (UE5's
+                   clock calibration, which gives up after ten) gets the CPU clock instead, as a finished query would. */
                 polls = ticket == last ? polls + 1 : 0;
+                if (ticket != last) fresh++;
                 last = ticket;
-                if (polls > 2) sched_sleep(c, 1);
-                RET(1);
-                return;
+                if (fresh < 3) {
+                    if (polls > 2) sched_sleep(c, 1);
+                    RET(1);
+                    return;
+                }
             }
+            fresh = 0;
             ST64(data, ns ? ns : host_ticks_ns());
         }
         /* timestamps are in ns (see ctx_end). They used to be the time of reading, so UE's GPU benchmark saw a zero-time
@@ -472,10 +479,22 @@ static void set_targets(CPU* c, uint32_t n)
     ctx.dsv = com_host(A4);
 }
 static void ctx_om_targets(CPU* c) { set_targets(c, (uint32_t)A2); RET(0); }
+static uint64_t om_uav[8];
+/* OMSetRenderTargetsAndUnorderedAccessViews(n, rtvs, dsv, uav start, uav count, uavs, counts): the UAVs go to slots
+   start..start+count of the pixel stage, separate from the compute stage's */
 static void ctx_om_targets_uav(CPU* c)
 {
-    uint32_t n = (uint32_t)A2;
+    uint32_t n = (uint32_t)A2, start = (uint32_t)ARG(5), nu = (uint32_t)ARG(6);
+    uint64_t uavs = ARG(7);
     if (n != 0xFFFFFFFF) set_targets(c, n);
+    if (nu != 0xFFFFFFFF) {
+        for (int i = 0; i < 8; i++) { om_uav[i] = 0; ctx.ps_uav[i] = NULL; }
+        for (uint32_t i = 0; i < nu && start + i < 8; i++) {
+            uint64_t o = uavs ? LD64(uavs + 8ull * i) : 0;
+            om_uav[start + i] = o;
+            ctx.ps_uav[start + i] = com_host(o);
+        }
+    }
     RET(0);
 }
 static uint64_t addref_obj(uint64_t o) { if (o) ST32(o + 8, LD32(o + 8) + 1); return o; }
@@ -490,7 +509,8 @@ static void ctx_om_get_targets_uav(CPU* c)
 {
     get_targets(c);
     uint64_t uavs = ARG(7);
-    for (uint32_t i = 0; i < (uint32_t)ARG(6) && uavs; i++) ST64(uavs + 8ull * i, 0);
+    uint32_t start = (uint32_t)ARG(5);
+    for (uint32_t i = 0; i < (uint32_t)ARG(6) && uavs; i++) ST64(uavs + 8ull * i, start + i < 8 ? addref_obj(om_uav[start + i]) : 0);
     RET(0);
 }
 static void ctx_rs_get_viewports(CPU* c)
@@ -660,7 +680,7 @@ static int res_bound(GpuRes* r)
 static int view_bound(GpuView* v)
 {
     for (int s = 0; s < SH_COUNT; s++) for (int i = 0; i < 128; i++) if (ctx.srv[s][i] == v) return 1;
-    for (int i = 0; i < 8; i++) if (ctx.uav[i] == v || ctx.rtv[i] == v) return 1;
+    for (int i = 0; i < 8; i++) if (ctx.uav[i] == v || ctx.ps_uav[i] == v || ctx.rtv[i] == v) return 1;
     return ctx.dsv == v;
 }
 static void reap(void)
@@ -760,7 +780,7 @@ static void setup_kinds(void)
     cx[78] = cx[86] = cx[94] = ctx_get_one;
     cx[79] = ctx_get_vbs; cx[80] = ctx_get_ib; cx[83] = ctx_get_topology; cx[91] = ctx_get_blend; cx[92] = ctx_get_depth; cx[93] = ctx_get_so;
     cx[89] = ctx_om_get_targets; cx[90] = ctx_om_get_targets_uav; cx[95] = ctx_rs_get_viewports; cx[96] = ctx_rs_get_scissors;
-    cx[110] = ctx_clear_state; cx[111] = ctx_noop; cx[112] = ctx_get_type; cx[113] = ctx_get_type; cx[114] = ctx_noop;
+    cx[110] = ctx_clear_state; cx[111] = ctx_flush; cx[112] = ctx_get_type; cx[113] = ctx_get_type; cx[114] = ctx_noop;
     /* unimplemented methods fall through to com_unimpl, which logs each one once */
     for (int i = 7; i < 115; i++) if (cx[i] && cx[i] != ctx_noop) k->slots[i] = cx[i];
 

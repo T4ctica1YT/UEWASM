@@ -52,6 +52,7 @@ void uew_threads(void)
     }
 }
 unsigned sched_current_id(void) { return (unsigned)current->tid; }
+int sched_is_main(void) { return current == &main_thread; }
 GThread* sched_current(void) { return current; }
 GThread* sched_by_tid(uint32_t tid) { for (GThread* t = threads; t; t = t->next) if ((uint32_t)t->tid == tid) return t; return NULL; }
 

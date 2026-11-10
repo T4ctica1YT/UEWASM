@@ -54,6 +54,7 @@ typedef struct GpuCtx {
     GpuView* srv[SH_COUNT][128];
     GpuState* samp[SH_COUNT][16];
     GpuView* uav[8];
+    GpuView* ps_uav[8];      /* pixel-shader UAVs (OMSetRenderTargetsAndUnorderedAccessViews), apart from compute ones */
     GpuRes* vb[16];
     uint32_t vb_stride[16], vb_offset[16];
     GpuRes* ib;

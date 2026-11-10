@@ -1,4 +1,5 @@
 #include "host.h"
+#include "sched.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,7 @@ FILE* host_fopen(const char* path, const char* mode);
 #define strtok_r strtok_s
 #endif
 
-enum { H_FREE, H_FILE, H_DIR, H_STD, H_FIND, H_OBJ };
+enum { H_FREE, H_FILE, H_DIR, H_STD, H_FIND, H_OBJ, H_PORT };
 
 typedef struct {
     int kind;
@@ -18,7 +19,12 @@ typedef struct {
     char path[600];
     struct FindList* find;
     void* obj;
+    uint64_t port, key;         /* files: the completion port they report to */
 } Handle;
+
+/* I/O completion ports: overlapped I/O on an associated file completes at once and queues its packet here */
+typedef struct Packet { uint32_t bytes; uint64_t key, ov; } Packet;
+typedef struct Port { Packet* q; uint32_t n, cap, head; } Port;
 
 typedef struct FindEntry { char name[260]; int is_dir; uint64_t size, mtime; } FindEntry;
 typedef struct FindList { FindEntry* e; size_t n, cap, pos; char pat[260]; } FindList;
@@ -159,7 +165,7 @@ static uint64_t open_guest(const char* guest, uint32_t access, uint32_t disp, ui
 {
     uint64_t h = open_guest2(guest, access, disp, flags);
     mt_arm(guest);
-    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL;
+    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL || host_query_flag("filetrace");
     if (file_trace) host_log("[file] open %s -> %llx", guest, (unsigned long long)h);
     return h;
 }
@@ -240,11 +246,38 @@ static void ov_seek(Handle* x, uint64_t ov)
     if (ov) seek(x, (int64_t)((uint64_t)LD32(ov + 16) | (uint64_t)LD32(ov + 20) << 32), 0, &pos);
     else seek(x, 0, 1, &pos);
 }
+void hle_event_signal(uint64_t h);
+static Handle* hget(uint64_t h);
+static void port_post(uint64_t port, uint32_t bytes, uint64_t key, uint64_t ov)
+{
+    Handle* p = hget(port);
+    if (!p || p->kind != H_PORT) return;
+    Port* q = p->obj;
+    if (q->n == q->cap) {
+        uint32_t cap = q->cap ? q->cap * 2 : 64;
+        Packet* nq = malloc(sizeof *nq * cap);
+        for (uint32_t i = 0; i < q->n; i++) nq[i] = q->q[(q->head + i) % q->cap];
+        free(q->q); q->q = nq; q->cap = cap; q->head = 0;
+    }
+    q->q[(q->head + q->n++) % q->cap] = (Packet){ bytes, key, ov };
+}
 static void ov_done(uint64_t ov, size_t n)
 {
     if (!ov) return;
     ST64(ov, 0);
     ST64(ov + 8, n);
+    if (LD64(ov + 24) & ~1ull) hle_event_signal(LD64(ov + 24) & ~1ull);
+}
+/* overlapped I/O on a file with a completion port: the packet is queued and the call reports it pending, which is
+   always a valid answer and needs no knowledge of FILE_SKIP_COMPLETION_PORT_ON_SUCCESS */
+static int ov_port(CPU* c, Handle* x, uint64_t ov, size_t n, int ok)
+{
+    if (!ov || !x->port || (LD64(ov + 24) & 1)) return 0;
+    if (!ok) ST64(ov, 0xC0000011ull);   /* STATUS_END_OF_FILE */
+    port_post(x->port, (uint32_t)n, x->key, ov);
+    set_error(997);
+    RET(0);
+    return 1;
 }
 
 HLE(WriteFile)
@@ -258,7 +291,20 @@ HLE(WriteFile)
     size_t w = fwrite(G2H(buf), 1, (size_t)n, x->f);
     if (written) ST32(written, w);
     ov_done(ov, w);
+    if (ov_port(c, x, ov, w, 1)) return;
     RET(w == n);
+}
+
+/* reads len bytes at off without touching the guest's view of the file position; returns the bytes read */
+uint64_t hle_file_pread(uint64_t h, uint64_t off, uint64_t buf, uint64_t len)
+{
+    Handle* x = hget(h);
+    if (!x || x->kind != H_FILE || !x->f) return 0;
+    uint64_t keep, pos;
+    if (!seek(x, 0, 1, &keep) || !seek(x, (int64_t)off, 0, &pos)) return 0;
+    size_t r = fread(G2H(buf), 1, (size_t)len, x->f);
+    seek(x, (int64_t)keep, 0, &pos);
+    return r;
 }
 
 HLE(ReadFile)
@@ -271,6 +317,7 @@ HLE(ReadFile)
     size_t r = fread(G2H(buf), 1, (size_t)n, x->f);
     if (got) ST32(got, r);
     ov_done(ov, r);
+    if (ov_port(c, x, ov, r, r || !n)) return;
     if (ov && !r && n) { set_error(38); RET(0); return; }
     RET(1);
 }
@@ -362,6 +409,7 @@ HLE(CloseHandle)
     if (!x) { RET(std_of(A1) >= 0); return; }
     if (x->f) fclose(x->f);
     if (x->find) { free(x->find->e); free(x->find); }
+    if (x->kind == H_PORT) { free(((Port*)x->obj)->q); free(x->obj); }
     x->kind = H_FREE;
     RET(1);
 }
@@ -396,7 +444,7 @@ HLE(GetFileAttributesW)
     char host[1200];
     wpath(A1, host, sizeof host);
     int a = attr_of(host, 0);
-    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL;
+    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL || host_query_flag("filetrace");
     if (file_trace) host_log("[file] attr %s -> %d", host, a);
     RET(a < 0 ? 0xFFFFFFFF : (uint64_t)a);
 }
@@ -406,7 +454,7 @@ HLE(GetFileAttributesExW)
     char host[1200];
     wpath(A1, host, sizeof host);
     int a = attr_of(host, A3);
-    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL;
+    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL || host_query_flag("filetrace");
     if (file_trace) host_log("[file] attrex %s -> %d", host, a);
     RET(a >= 0);
 }
@@ -502,7 +550,7 @@ static uint64_t find_first(const char* guest, uint64_t out, int wide)
     if (g_save[0]) { join_root(g_save, abs, host, sizeof host); listed |= host_list_dir(host, find_cb, l); }
     join_root(g_root, abs, host, sizeof host);
     listed |= host_list_dir(host, find_cb, l);
-    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL;
+    if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL || host_query_flag("filetrace");
     if (!listed || !l->n) {
         if (file_trace > 0) host_log("[file] find %s -> none", guest);
         free(l->e);
@@ -594,6 +642,61 @@ HLE(SetConsoleTextAttribute) { RET(1); }
 HLE(SetConsoleTitleW) { RET(1); }
 HLE(CreatePipe) { set_error(50); RET(0); }
 HLE(PeekNamedPipe) { RET(0); }
+
+HLE(CreateIoCompletionPort)
+{
+    uint64_t file = A1, port = A2;
+    if (!port) {
+        port = handle_new(H_PORT, calloc(1, sizeof(Port)));
+        if (port == (uint64_t)-1) { set_error(8); RET(0); return; }
+    } else if (!hget(port) || hget(port)->kind != H_PORT) { set_error(6); RET(0); return; }
+    if (file != (uint64_t)-1) {
+        Handle* x = hget(file);
+        if (x && x->kind == H_FILE) { x->port = port; x->key = A3; }
+    }
+    RET(port);
+}
+HLE(PostQueuedCompletionStatus) { port_post(A1, (uint32_t)A2, A3, A4); RET(hget(A1) != NULL); }
+static int port_wait(CPU* c, uint64_t port, uint32_t ms, Port** out)
+{
+    uint64_t t0 = host_ticks_ns();
+    for (;;) {
+        Handle* p = hget(port);
+        if (!p || p->kind != H_PORT) { set_error(6); return -1; }
+        Port* q = p->obj;
+        if (q->n) { *out = q; return 1; }
+        if (ms != 0xFFFFFFFF && host_ticks_ns() - t0 >= (uint64_t)ms * 1000000ull) { set_error(258); return 0; }
+        sched_sleep(c, 1);
+    }
+}
+static Packet port_pop(Port* q) { Packet k = q->q[q->head]; q->head = (q->head + 1) % q->cap; q->n--; return k; }
+HLE(GetQueuedCompletionStatus)
+{
+    Port* q;
+    int r = port_wait(c, A1, (uint32_t)ARG(5), &q);
+    if (r <= 0) { if (A4) ST64(A4, 0); RET(0); return; }
+    Packet k = port_pop(q);
+    if (A2) ST32(A2, k.bytes);
+    if (A3) ST64(A3, k.key);
+    if (A4) ST64(A4, k.ov);
+    RET(1);
+}
+/* OVERLAPPED_ENTRY: key, overlapped, internal, bytes (32 bytes) */
+HLE(GetQueuedCompletionStatusEx)
+{
+    Port* q;
+    int r = port_wait(c, A1, (uint32_t)ARG(5), &q);
+    if (r <= 0) { if (A4) ST32(A4, 0); RET(0); return; }
+    uint32_t n = 0;
+    while (q->n && n < (uint32_t)A3) {
+        Packet k = port_pop(q);
+        uint64_t e = A2 + 32ull * n++;
+        ST64(e, k.key); ST64(e + 8, k.ov); ST64(e + 16, k.ov ? LD64(k.ov) : 0); ST32(e + 24, k.bytes);
+    }
+    if (A4) ST32(A4, n);
+    RET(1);
+}
+HLE(SetFileCompletionNotificationModes) { RET(1); }
 
 HLE(GetOverlappedResult)
 {

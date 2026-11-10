@@ -305,8 +305,30 @@ __attribute__((used, visibility("default")))
 void uew_set_trace(int on) { trace_on = on; }
 /* one traced call: name, the first four arguments, the guest return address and the green thread */
 const char* host_trace_filter(void);
+/* ?tracering=1: the last calls are kept quietly and printed when the game traps */
+static struct { const char* name; uint64_t a[4], ret; unsigned tid; } ring[64];
+static unsigned ring_n;
+static int ring_on = -1;
+static void ring_dump(void)
+{
+    if (ring_on <= 0) return;
+    host_log("[trap] last %u system calls:", ring_n < 64 ? ring_n : 64);
+    for (unsigned i = ring_n > 64 ? ring_n - 64 : 0; i < ring_n; i++) {
+        unsigned k = i & 63;
+        host_log("  %s(%llx, %llx, %llx, %llx) ret=%llx t=%u", ring[k].name, (unsigned long long)ring[k].a[0], (unsigned long long)ring[k].a[1],
+                 (unsigned long long)ring[k].a[2], (unsigned long long)ring[k].a[3], (unsigned long long)ring[k].ret, ring[k].tid);
+    }
+}
+
 void rt_trace_call(CPU* c, const char* name)
 {
+    if (ring_on < 0) ring_on = host_query_flag("tracering");
+    if (ring_on) {
+        unsigned k = ring_n++ & 63;
+        ring[k].name = name; ring[k].a[0] = R(1); ring[k].a[1] = R(2); ring[k].a[2] = R(8); ring[k].a[3] = R(9);
+        ring[k].ret = LD64(R(4)); ring[k].tid = sched_current_id();
+        return;
+    }
     /* optional ",Name,Name," list (UEW_TRACE_ONLY / window.uewTraceOnly) keeps the log to the calls of interest */
     static const char* only;
     if (!only) only = host_trace_filter();
@@ -330,7 +352,7 @@ void rt_call(CPU* c, uint64_t t)
     }
     if (t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count) {
         const Thunk* e = &rt_thunks[(t - THUNK_BASE) / 8];
-        if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL;
+        if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL || host_query_flag("tracering");
         if (trace_on) rt_trace_call(c, e->name);
         if (e->fn) e->fn(c);
         else hle_missing(c, e);
@@ -341,6 +363,9 @@ void rt_call(CPU* c, uint64_t t)
     const FnEntry* f = find_fn(t);
     if (!f) {
         host_log("[trap] call to %llx from %llx (thread %u)", (unsigned long long)t, (unsigned long long)LD64(R(4)), sched_current_id());
+        /* a background thread that jumps into the void (a corrupt callback in telemetry, say) ends alone, as an
+           unhandled fault there would, instead of taking the game down */
+        if (!sched_is_main()) { host_log("[trap] thread %u ended", sched_current_id()); sched_exit_current(c, 0xC0000005); return; }
         rt_trap(c, t, "call to unknown address");
         return;
     }
@@ -442,6 +467,8 @@ void rt_exit(int code)
 
 void rt_trap(CPU* c, uint64_t pc, const char* what)
 {
+    ring_dump();
+    rt_backtrace(c, "trap");
     host_log("[trap] %s at %llx (rsp=%llx rax=%llx rcx=%llx)", what, (unsigned long long)pc,
              (unsigned long long)R(4), (unsigned long long)R(0), (unsigned long long)R(1));
 #ifdef _MSC_VER
@@ -477,7 +504,7 @@ void rt_cpuid(CPU* c)
     (void)sub;
     switch (leaf) {
     case 0: a = 7; b = 0x756e6547; d = 0x49656e69; cc = 0x6c65746e; break;
-    case 1: a = 0x000906EA; b = 0x00100800; cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 23); d = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 25) | (1u << 26); break;
+    case 1: a = 0x000906EA; b = 0x00100800; cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 23); d = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 25) | (1u << 26); break;
     case 0x80000000: a = 0x80000008; break;
     case 0x80000001: cc = 1u << 5; d = (1u << 29); break;
     case 0x80000002: a = 0x4D534157; b = 0x50432034; cc = 0x00000055; break;
@@ -490,14 +517,91 @@ void rt_cpuid(CPU* c)
 
 void rt_xgetbv(CPU* c) { R(0) = 3; R(2) = 0; }
 
+/* SSE4.2 CRC32: CRC-32C (Castagnoli), reflected, no inversion */
+uint64_t rt_crc32(uint64_t crc, uint64_t v, int bytes)
+{
+    static uint32_t t[256];
+    if (!t[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t r = i;
+            for (int k = 0; k < 8; k++) r = r & 1 ? (r >> 1) ^ 0x82F63B78u : r >> 1;
+            t[i] = r;
+        }
+    uint32_t r = (uint32_t)crc;
+    for (int i = 0; i < bytes; i++) r = t[(r ^ (uint8_t)(v >> (8 * i))) & 0xFF] ^ (r >> 8);
+    return r;
+}
+
+/* PCMPESTRI/PCMPISTRI/PCMPESTRM/PCMPISTRM: returns the index (I forms); M forms write xmm0 */
+uint64_t rt_pcmpstr(Flags* f, XMM* x0, XMM a, XMM b, int imm, int64_t la, int64_t lb, int expl, int mask)
+{
+    int words = imm & 1, sgn = imm & 2, agg = (imm >> 2) & 3, pol = (imm >> 4) & 3, n = words ? 8 : 16;
+    int32_t ea[16], eb[16];
+    for (int i = 0; i < n; i++) {
+        ea[i] = words ? (sgn ? (int32_t)(int16_t)a.w[i] : a.w[i]) : (sgn ? (int32_t)(int8_t)a.b[i] : a.b[i]);
+        eb[i] = words ? (sgn ? (int32_t)(int16_t)b.w[i] : b.w[i]) : (sgn ? (int32_t)(int8_t)b.b[i] : b.b[i]);
+    }
+    int na, nb;
+    if (expl) {
+        int64_t x = la < 0 ? -la : la, y = lb < 0 ? -lb : lb;
+        na = x > n ? n : (int)x;
+        nb = y > n ? n : (int)y;
+    } else {
+        na = n; nb = n;
+        for (int i = 0; i < n; i++) if (!ea[i]) { na = i; break; }
+        for (int i = 0; i < n; i++) if (!eb[i]) { nb = i; break; }
+    }
+    uint32_t res = 0;
+    for (int j = 0; j < n; j++) {
+        int bit = 0;
+        if (agg == 0) {                 /* equal any */
+            if (j < nb) for (int i = 0; i < na && !bit; i++) bit = ea[i] == eb[j];
+        } else if (agg == 1) {          /* ranges */
+            if (j < nb) for (int i = 0; i + 1 < na && !bit; i += 2) bit = eb[j] >= ea[i] && eb[j] <= ea[i + 1];
+        } else if (agg == 2) {          /* equal each */
+            int va = j < na, vb = j < nb;
+            bit = va && vb ? ea[j] == eb[j] : !va && !vb;
+        } else {                        /* equal ordered */
+            bit = 1;
+            for (int k = 0; k < n - j && bit; k++) {
+                if (k >= na) break;
+                if (j + k >= nb) { bit = 0; break; }
+                bit = ea[k] == eb[j + k];
+            }
+        }
+        res |= (uint32_t)bit << j;
+    }
+    uint32_t all = n == 16 ? 0xFFFFu : 0xFFu, valid = nb >= 32 ? all : ((1u << nb) - 1) & all;
+    if (pol == 1) res = ~res & all;
+    else if (pol == 3) res = (res ^ valid) & all;
+    rt_setflags(f, 2 | (res ? 1 : 0) | (nb < n ? 0x40 : 0) | (na < n ? 0x80 : 0) | ((res & 1) ? 0x800 : 0));
+    if (mask) {
+        XMM m;
+        memset(&m, 0, sizeof m);
+        if (imm & 0x40) { for (int j = 0; j < n; j++) if (res >> j & 1) { if (words) m.w[j] = 0xFFFF; else m.b[j] = 0xFF; } }
+        else m.d[0] = res;
+        *x0 = m;
+        return 0;
+    }
+    if (!res) return (uint64_t)n;
+    if (imm & 0x40) { int k = 31; while (!(res >> k & 1)) k--; return (uint64_t)k; }
+    int k = 0;
+    while (!(res >> k & 1)) k++;
+    return (uint64_t)k;
+}
+
 void rt_rdtsc(CPU* c)
 {
+    static uint64_t last;
     uint64_t t = host_ticks_ns();
+    if (t <= last) t = last + 1;   /* strictly increasing, like the hardware counter */
+    last = t;
     R(0) = (uint32_t)t;
     R(2) = t >> 32;
 }
 
-#define DIV_ERR() rt_trap(c, 0, "integer divide error")
+uint64_t rt_div_ip;
+#define DIV_ERR() rt_trap(c, rt_div_ip, "integer divide error")
 void rt_div8(CPU* c, uint64_t s) { uint16_t n = (uint16_t)R(0); if (!(uint8_t)s) { DIV_ERR(); return; } uint16_t q = n / (uint8_t)s, r = n % (uint8_t)s; R(0) = (R(0) & ~0xFFFFull) | (q & 0xFF) | ((uint64_t)(r & 0xFF) << 8); }
 void rt_div16(CPU* c, uint64_t s) { uint32_t n = ((uint32_t)(uint16_t)R(2) << 16) | (uint16_t)R(0); if (!(uint16_t)s) { DIV_ERR(); return; } R(0) = (R(0) & ~0xFFFFull) | (uint16_t)(n / (uint16_t)s); R(2) = (R(2) & ~0xFFFFull) | (uint16_t)(n % (uint16_t)s); }
 void rt_div32(CPU* c, uint64_t s) { uint64_t n = ((uint64_t)(uint32_t)R(2) << 32) | (uint32_t)R(0); if (!(uint32_t)s) { DIV_ERR(); return; } R(0) = (uint32_t)(n / (uint32_t)s); R(2) = (uint32_t)(n % (uint32_t)s); }
@@ -817,3 +921,21 @@ void rt_sj_jump(CPU* c, uint64_t jb, uint64_t val)
     }
     rt_trap(c, LD64(jb + 80), "longjmp to an unknown setjmp buffer");
 }
+
+/* UEW_STORE_CHECK builds: the first bad stores, with the lifted function that made them */
+void rt_bad_store(uint64_t a, const char* fn)
+{
+    static int n;
+    if (n++ < 30) host_log("[store] %s writes %llx (thread %u)", fn, (unsigned long long)a, sched_current_id());
+}
+
+#ifdef UEW_THREADS
+/* locked instructions with guest threads on several cores: a spinlock per 16-byte stripe of the address space */
+static volatile int atomic_stripes[8192];
+void rt_atomic_begin(uint64_t a)
+{
+    volatile int* l = &atomic_stripes[(a >> 4) & 8191];
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) while (__atomic_load_n(l, __ATOMIC_RELAXED)) {}
+}
+void rt_atomic_end(uint64_t a) { __atomic_store_n(&atomic_stripes[(a >> 4) & 8191], 0, __ATOMIC_RELEASE); }
+#endif

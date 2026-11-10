@@ -7,7 +7,7 @@ mergeInto(LibraryManager.library, {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return 0;
     const want = ["texture-compression-bc", "texture-compression-bc-sliced-3d", "float32-filterable", "float32-blendable", "rg11b10ufloat-renderable", "depth32float-stencil8",
-      "depth-clip-control", "indirect-first-instance", "texture-formats-tier1", "texture-component-swizzle", "bgra8unorm-storage", "dual-source-blending"];
+      "depth-clip-control", "indirect-first-instance", "texture-formats-tier1", "texture-formats-tier2", "texture-component-swizzle", "bgra8unorm-storage", "dual-source-blending"];
     // debug: window.uewGpuProfile = 1 times every pass on the GPU and logs the slowest ones
     if (typeof window !== "undefined" && window.uewGpuProfile) want.push("timestamp-query");
     const features = want.filter(f => adapter.features.has(f));
@@ -15,7 +15,8 @@ mergeInto(LibraryManager.library, {
     for (const k of ["maxSampledTexturesPerShaderStage", "maxSamplersPerShaderStage", "maxStorageBuffersPerShaderStage", "maxStorageTexturesPerShaderStage",
       "maxUniformBuffersPerShaderStage", "maxBindingsPerBindGroup", "maxInterStageShaderVariables", "maxColorAttachmentBytesPerSample", "maxBufferSize",
       "maxStorageBufferBindingSize", "maxDynamicUniformBuffersPerPipelineLayout", "maxComputeWorkgroupStorageSize", "maxComputeInvocationsPerWorkgroup",
-      "maxTextureArrayLayers", "maxTextureDimension2D", "maxVertexAttributes", "maxVertexBuffers"]) if (k in L) req[k] = L[k];
+      "maxTextureArrayLayers", "maxTextureDimension2D", "maxVertexAttributes", "maxVertexBuffers", "maxComputeWorkgroupSizeX", "maxComputeWorkgroupSizeY",
+      "maxComputeWorkgroupSizeZ", "maxComputeWorkgroupsPerDimension", "maxTextureDimension3D", "maxTextureDimension1D", "maxBindGroups"]) if (k in L) req[k] = L[k];
     let device;
     try { device = await adapter.requestDevice({ requiredFeatures: features, requiredLimits: req }); }
     catch (e) { console.log("[webgpu] requestDevice failed: " + e.message); return 0; }
@@ -345,6 +346,7 @@ ${P.shaders.get(sh)}`); break; }
   },
 
   uewg_max_dynamic_ubo: function () { return Module.uewg.device.limits.maxDynamicUniformBuffersPerPipelineLayout; },
+  uewg_max_storage: function () { return Module.uewg.device.limits.maxStorageBuffersPerShaderStage; },
 
   uewg_buffer_create: function (size, usage) {
     const g = Module.uewg;
@@ -358,6 +360,88 @@ ${P.shaders.get(sh)}`); break; }
     catch (e) { console.log("[webgpu] buffer " + e.message); return 0; }
   },
 
+  // typed buffer views read through an expanded copy (one vec4<u32> per element); for buffers the GPU writes, the copy
+  // is made on the GPU from the real buffer, so compute results reach later reads
+  uewg_expand_typed: function (srcId, dstId, first, n, fmt, bpe) {
+    const g = Module.uewg, src = g.o[srcId], dst = g.o[dstId];
+    if (!src || !dst || !n) return;
+    if (!g.expand) {
+      const m = g.device.createShaderModule({ code: `struct P { first: u32, n: u32, fmt: u32, bpe: u32 }
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec4<u32>>;
+@group(0) @binding(2) var<uniform> p: P;
+fn b8(o: u32) -> u32 { return (src[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+fn b16(o: u32) -> u32 { return b8(o) | (b8(o + 1u) << 8u); }
+fn w32(o: u32) -> u32 { return b16(o) | (b16(o + 2u) << 16u); }
+fn fb(x: f32) -> u32 { return bitcast<u32>(x); }
+fn h(o: u32) -> u32 { return fb(unpack2x16float(b16(o)).x); }
+fn un8(o: u32) -> u32 { return fb(f32(b8(o)) / 255.0); }
+fn sn8(o: u32) -> u32 { return fb(max(f32(i32(b8(o) << 24u) >> 24u) / 127.0, -1.0)); }
+fn un16(o: u32) -> u32 { return fb(f32(b16(o)) / 65535.0); }
+fn sn16(o: u32) -> u32 { return fb(max(f32(i32(b16(o) << 16u) >> 16u) / 32767.0, -1.0)); }
+fn si8(o: u32) -> u32 { return bitcast<u32>(i32(b8(o) << 24u) >> 24u); }
+fn si16(o: u32) -> u32 { return bitcast<u32>(i32(b16(o) << 16u) >> 16u); }
+fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  if (i >= p.n) { return; }
+  let o = (p.first + i) * p.bpe;
+  var r = vec4<u32>(0u, 0u, 0u, 0x3F800000u);
+  switch p.fmt {
+    case 2u, 3u, 4u: { r = vec4<u32>(w32(o), w32(o + 4u), w32(o + 8u), w32(o + 12u)); }
+    case 6u, 7u, 8u: { r.x = w32(o); r.y = w32(o + 4u); r.z = w32(o + 8u); }
+    case 16u, 17u, 18u: { r.x = w32(o); r.y = w32(o + 4u); }
+    case 10u: { r = vec4<u32>(h(o), h(o + 2u), h(o + 4u), h(o + 6u)); }
+    case 34u: { r.x = h(o); r.y = h(o + 2u); }
+    case 54u: { r.x = h(o); }
+    case 28u, 29u: { r = vec4<u32>(un8(o), un8(o + 1u), un8(o + 2u), un8(o + 3u)); }
+    case 87u: { r = vec4<u32>(un8(o + 2u), un8(o + 1u), un8(o), un8(o + 3u)); }
+    case 88u: { r.x = un8(o + 2u); r.y = un8(o + 1u); r.z = un8(o); }
+    case 30u: { r = vec4<u32>(b8(o), b8(o + 1u), b8(o + 2u), b8(o + 3u)); }
+    case 12u: { r = vec4<u32>(b16(o), b16(o + 2u), b16(o + 4u), b16(o + 6u)); }
+    case 36u: { r.x = b16(o); r.y = b16(o + 2u); }
+    case 57u: { r.x = b16(o); }
+    case 62u: { r.x = b8(o); }
+    case 61u: { r.x = un8(o); }
+    case 56u: { r.x = un16(o); }
+    case 35u: { r.x = un16(o); r.y = un16(o + 2u); }
+    case 11u: { r = vec4<u32>(un16(o), un16(o + 2u), un16(o + 4u), un16(o + 6u)); }
+    case 31u: { r = vec4<u32>(sn8(o), sn8(o + 1u), sn8(o + 2u), sn8(o + 3u)); }
+    case 51u: { r.x = sn8(o); r.y = sn8(o + 1u); }
+    case 63u: { r.x = sn8(o); }
+    case 13u: { r = vec4<u32>(sn16(o), sn16(o + 2u), sn16(o + 4u), sn16(o + 6u)); }
+    case 37u: { r.x = sn16(o); r.y = sn16(o + 2u); }
+    case 58u: { r.x = sn16(o); }
+    case 49u: { r.x = un8(o); r.y = un8(o + 1u); }
+    case 50u: { r.x = b8(o); r.y = b8(o + 1u); }
+    case 32u: { r = vec4<u32>(si8(o), si8(o + 1u), si8(o + 2u), si8(o + 3u)); }
+    case 52u: { r.x = si8(o); r.y = si8(o + 1u); }
+    case 64u: { r.x = si8(o); }
+    case 14u: { r = vec4<u32>(si16(o), si16(o + 2u), si16(o + 4u), si16(o + 6u)); }
+    case 38u: { r.x = si16(o); r.y = si16(o + 2u); }
+    case 59u: { r.x = si16(o); }
+    case 24u: { let v = w32(o); r = vec4<u32>(fb(f32(v & 1023u) / 1023.0), fb(f32((v >> 10u) & 1023u) / 1023.0), fb(f32((v >> 20u) & 1023u) / 1023.0), fb(f32(v >> 30u) / 3.0)); }
+    case 25u: { let v = w32(o); r = vec4<u32>(v & 1023u, (v >> 10u) & 1023u, (v >> 20u) & 1023u, v >> 30u); }
+    case 26u: { let v = w32(o); r.x = small(v & 2047u, 4u); r.y = small((v >> 11u) & 2047u, 4u); r.z = small(v >> 22u, 5u); }
+    default: { r.x = w32(o); }
+  }
+  dst[i] = r;
+}` });
+      g.expand = g.device.createComputePipeline({ layout: "auto", compute: { module: m, entryPoint: "main" } });
+    }
+    const ub = g.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    g.queue.writeBuffer(ub, 0, new Uint32Array([first, n, fmt, bpe]));
+    const bg = g.device.createBindGroup({ layout: g.expand.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: src } }, { binding: 1, resource: { buffer: dst } }, { binding: 2, resource: { buffer: ub } }] });
+    g.endPass();
+    const cp = g.encoder().beginComputePass();
+    cp.setPipeline(g.expand);
+    cp.setBindGroup(0, bg);
+    cp.dispatchWorkgroups(Math.ceil(n / 64));
+    cp.end();
+    (g.expandTmp || (g.expandTmp = [])).push(ub);
+  },
+
   uewg_buffer_write: function (id, offset, ptr, size) {
     ptr >>>= 0;
     const g = Module.uewg, b = g.o[id];
@@ -368,6 +452,14 @@ ${P.shaders.get(sh)}`); break; }
       g.stat.write++; g.stat.writeBytes += n;
       if (g.stat.by) g.stat.by.set(id, [(g.stat.by.get(id) || [0])[0] + n, b.size, offset]);
     }
+  },
+
+  uewg_buffer_copy: function (src, srcOff, dst, dstOff, size) {
+    const g = Module.uewg, a = g.o[src], b = g.o[dst];
+    if (!a || !b) return;
+    g.endPass();
+    const n = Math.min(size, a.size - srcOff, b.size - dstOff) & ~3;
+    if (n > 0) g.encoder().copyBufferToBuffer(a, srcOff, b, dstOff, n);
   },
 
   uewg_buffer_copy_ring: function (ringOff, dst, dstOff, size, ringUsed) {
@@ -403,6 +495,17 @@ ${P.shaders.get(sh)}`); break; }
     g.hitch.upBytes += bpr * rows * d;
     try { g.queue.writeTexture({ texture: t, mipLevel: mip, origin: [x, y, z] }, HEAPU8, { offset: ptr, bytesPerRow: bpr, rowsPerImage: rows }, [w, h, d]); }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] upload " + e.message); }
+  },
+
+  // an upload ordered with the encoder's commands: the rows are in the ring (bytesPerRow a multiple of 256)
+  uewg_texture_copy_ring: function (ringOff, id, mip, x, y, z, w, h, d, bpr, rows) {
+    const g = Module.uewg, t = g.o[id];
+    if (!t) return;
+    if (/^(bc|etc2|eac|astc)/.test(t.format)) { w = (w + 3) & ~3; h = (h + 3) & ~3; }
+    g.endPass();
+    g.stat.texWrite++;
+    try { g.encoder().copyBufferToTexture({ buffer: g.ring, offset: ringOff, bytesPerRow: bpr, rowsPerImage: rows }, { texture: t, mipLevel: mip, origin: [x, y, z] }, [w, h, d]); }
+    catch (e) { if (g.errors++ < 40) console.log("[webgpu] ring upload " + e.message); }
   },
 
   uewg_view_create: function (jsonPtr) {
@@ -803,7 +906,23 @@ ${P.shaders.get(sh)}`); break; }
   uewg_copy_texture: function (src, smip, slayer, sx, sy, sz, dst, dmip, dlayer, dx, dy, dz, w, h, d) {
     const g = Module.uewg;
     g.endPass();
-    if (g.o[src] && /^(bc|etc2|eac|astc)/.test(g.o[src].format)) { w = (w + 3) & ~3; h = (h + 3) & ~3; }
+    const isC = t => t && /^(bc|etc2|eac|astc)/.test(t.format);
+    if (g.o[src] && g.o[dst] && isC(g.o[src]) !== isC(g.o[dst])) {
+      // D3D copies between a block-compressed texture and an uncompressed one of the block's size (one texel per
+      // block, e.g. RG32 <-> BC1); WebGPU only copies like formats, so the bytes go through a buffer
+      const ct = isC(g.o[src]) ? g.o[src] : g.o[dst], bpu = /^(bc1|bc4)/.test(ct.format) ? 8 : 16;
+      const uw = isC(g.o[src]) ? (w + 3) >> 2 : w, uh = isC(g.o[src]) ? (h + 3) >> 2 : h;
+      const se = isC(g.o[src]) ? [uw * 4, uh * 4, d] : [uw, uh, d], de = isC(g.o[src]) ? [uw, uh, d] : [uw * 4, uh * 4, d];
+      const bytesPerRow = (uw * bpu + 255) & ~255;
+      try {
+        const buf = g.device.createBuffer({ size: bytesPerRow * uh * d, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+        const enc = g.encoder();
+        enc.copyTextureToBuffer({ texture: g.o[src], mipLevel: smip, origin: [sx, sy, sz + slayer] }, { buffer: buf, bytesPerRow, rowsPerImage: uh }, se);
+        enc.copyBufferToTexture({ buffer: buf, bytesPerRow, rowsPerImage: uh }, { texture: g.o[dst], mipLevel: dmip, origin: [dx, dy, dz + dlayer] }, de);
+      } catch (e) { if (g.errors++ < 40) console.log("[webgpu] copy " + e.message); }
+      return;
+    }
+    if (isC(g.o[src])) { w = (w + 3) & ~3; h = (h + 3) & ~3; }
     try {
       g.encoder().copyTextureToTexture({ texture: g.o[src], mipLevel: smip, origin: [sx, sy, sz + slayer] },
         { texture: g.o[dst], mipLevel: dmip, origin: [dx, dy, dz + dlayer] }, [w, h, d]);
@@ -995,6 +1114,7 @@ ${P.shaders.get(sh)}`); break; }
       p.end();
     }
     g.flush(ringUsed);
+    if (g.expandTmp && g.expandTmp.length) { const tmp = g.expandTmp; g.expandTmp = []; g.queue.onSubmittedWorkDone().then(() => tmp.forEach(b => b.destroy())); }
     g.lastPass = null;
     // GPU side of the frame: how long until the queue finished it, and what it was given
     {

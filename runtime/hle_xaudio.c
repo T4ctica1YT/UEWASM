@@ -18,6 +18,7 @@ static const uint8_t CLSID_Meter[16] = I(0xcac1105f, 0x619b, 0x4d04, 0x83, 0x1a,
 static const uint8_t CLSID_MeterDbg[16] = I(0x2d9a0f9c, 0xe67b, 0x4b24, 0xab, 0x44, 0x92, 0xb3, 0xe7, 0x70, 0xc0, 0x20);
 static const uint8_t IID_XAudio2[][16] = { I(0x8bcf1f58, 0x9fe7, 0x4583, 0x8a, 0xc6, 0xe2, 0xad, 0xc4, 0x65, 0xc8, 0xbb) };
 static const uint8_t IID_Any[][16] = { I(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) };
+static const uint8_t IID_XAudio2_9[][16] = { I(0x2b02e3cf, 0x2e0b, 0x4ec3, 0xbe, 0x45, 0x1b, 0x2a, 0x3f, 0xe7, 0x21, 0x0d) };
 static const uint8_t CLSID_MMDeviceEnumerator[16] = I(0xbcde0395, 0xe52f, 0x467c, 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e);
 static const uint8_t IID_MMEnum[][16] = { I(0xa95664d2, 0x9614, 0x4f35, 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6) };
 static const uint8_t IID_MMDevice[][16] = { I(0xd666063f, 0x1587, 0x4e43, 0x81, 0xf1, 0xb9, 0x48, 0xe8, 0x07, 0x36, 0x3f) };
@@ -156,6 +157,10 @@ static ComKind K_Engine = { "IXAudio2", 16, {0}, IID_XAudio2, 1 };
 static ComKind K_Source = { "IXAudio2SourceVoice", 29, {0} };
 static ComKind K_Submix = { "IXAudio2SubmixVoice", 19, {0} };
 static ComKind K_Master = { "IXAudio2MasteringVoice", 19, {0} };
+/* XAudio2 2.8/2.9 (the flat XAudio2Create API newer engines use): no device enumeration or Initialize on the engine,
+   GetChannelMask on the mastering voice; voices, buffers and callbacks are as in 2.7 */
+static ComKind K_Engine29 = { "IXAudio2 2.9", 13, {0}, IID_XAudio2_9, 1 };
+static ComKind K_Master29 = { "IXAudio2MasteringVoice 2.9", 20, {0} };
 static ComKind K_Effect = { "IXAPO", 16, {0}, IID_Any, 0 };
 
 static Voice* voices[512];
@@ -539,13 +544,23 @@ static void x_create_submix(CPU* c)
     ST64(A2, v->obj);
     RET(0);
 }
-static void x_create_master(CPU* c)
+static void create_master(CPU* c, ComKind* k)
 {
-    Voice* v = new_voice(V_MASTER, &K_Master, (uint32_t)A3, RATE);
+    Voice* v = new_voice(V_MASTER, k, (uint32_t)A3, RATE);
     if (!v) { RET(0x8007000E); return; }
     master = v;
     ADBG("[adbg] master %d: %u ch (asked %u)", v->id, v->ch, (unsigned)A3);
     ST64(A2, v->obj);
+    RET(0);
+}
+static void x_create_master(CPU* c) { create_master(c, &K_Master); }
+static void x_create_master29(CPU* c) { create_master(c, &K_Master29); }
+/* IXAudio2MasteringVoice::GetChannelMask (2.8+) */
+static void m_channel_mask(CPU* c)
+{
+    Voice* v = VO(A1);
+    uint32_t ch = v ? v->ch : 2;
+    if (A2) ST32(A2, ch == 1 ? 0x4 : ch == 6 ? 0x3F : ch == 8 ? 0x63F : 0x3);
     RET(0);
 }
 /* the engine runs from creation; StartEngine only matters after StopEngine */
@@ -735,7 +750,27 @@ static void setup(void)
     K_Source.slots[27] = s_get_ratio; K_Source.slots[28] = s_set_rate;
     com_iunknown(&K_Effect);
     for (int s = 3; s < 16; s++) K_Effect.slots[s] = x_ok;
+    k = &K_Engine29;
+    com_iunknown(k);
+    k->slots[3] = x_register; k->slots[4] = x_unregister; k->slots[5] = x_create_source; k->slots[6] = x_create_submix;
+    k->slots[7] = x_create_master29; k->slots[8] = x_start; k->slots[9] = x_stop; k->slots[10] = x_ok; k->slots[11] = x_perf;
+    k->slots[12] = x_ok;
+    for (int s = 0; s < 19; s++) K_Master29.slots[s] = K_Master.slots[s];
+    K_Master29.slots[19] = m_channel_mask;
 }
+
+/* XAudio2 2.9 entry points (xaudio2_9.dll / xaudio2_9redist.dll) */
+static void create29(CPU* c)
+{
+    setup();
+    if (A1) ST64(A1, com_new(&K_Engine29, NULL, 0));
+    start_engine();
+    RET(0);
+}
+HLE(XAudio2Create) { create29(c); }
+HLE(XAudio2CreateWithVersionInfo) { create29(c); }
+HLE(CreateAudioReverb) { setup(); if (A1) ST64(A1, com_new(&K_Effect, &reverb_tag, 0)); RET(0); }
+HLE(CreateAudioVolumeMeter) { setup(); if (A1) ST64(A1, com_new(&K_Effect, NULL, 0)); RET(0); }
 
 /* ---- the one audio endpoint (MMDevice API), so engines that enumerate devices find speakers ---- */
 
@@ -803,7 +838,7 @@ static void ac_init(CPU* c)
 static void ac_buffer_size(CPU* c) { if (A2) ST32(A2, wa.frames); RET(0); }
 static void ac_latency(CPU* c) { if (A2) ST64(A2, 100000); RET(0); }
 static void ac_padding(CPU* c) { if (A2) ST32(A2, wa_padding()); RET(0); }
-static void ac_supported(CPU* c) { if (ARG(4)) ST64(ARG(4), 0); RET(0); }
+static void ac_supported(CPU* c) { if (A4) ST64(A4, 0); RET(0); }
 static void ac_mix_format(CPU* c) { uint64_t f = g_alloc(40); wa_format(f); if (A2) ST64(A2, f); RET(0); }
 static void ac_period(CPU* c) { if (A2) ST64(A2, 100000); if (A3) ST64(A3, 30000); RET(0); }
 static void ac_start(CPU* c)
@@ -1010,3 +1045,131 @@ HLE(CreateFX)
     if (A2) ST64(A2, com_new(&K_Effect, NULL, 0));
     RET(0);
 }
+
+/* ---- winmm waveOut: queued PCM buffers played at real-time pace into the same output, resampled to RATE ---- */
+typedef struct WaveOut {
+    int open;
+    uint32_t rate, ch, bits, flt;
+    uint64_t cb, inst;
+    uint32_t cb_type;           /* CALLBACK_WINDOW 1, THREAD 2, FUNCTION 3, EVENT 5 (bits 16-19 of the flags) */
+    uint64_t q[64]; int qn;     /* WAVEHDRs waiting */
+    double pos;                 /* resampler position in the head buffer, in source frames */
+    float vol;
+    int paused;
+    uint64_t played;            /* output frames written */
+} WaveOut;
+static WaveOut wo;
+static int wo_thread;
+void user32_post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
+
+/* WAVEHDR: data +0, length +8, recorded +12, user +16, flags +24 (DONE 1, PREPARED 2, INQUEUE 0x10), loops +28 */
+static void wo_notify(CPU* c, uint32_t msg, uint64_t hdr)
+{
+    if (wo.cb_type == 3 && wo.cb) { uint64_t a[5] = { 0x7C000001, msg, wo.inst, hdr, 0 }; rt_invoke(c, wo.cb, 5, a); }
+    else if (wo.cb_type == 5 && wo.cb) sync_set_event(wo.cb);
+    else if ((wo.cb_type == 1 || wo.cb_type == 2) && wo.cb) user32_post(wo.cb_type == 1 ? wo.cb : 0, msg, 0x7C000001, hdr);
+}
+static float wo_sample(const uint8_t* p, uint32_t i, uint32_t ch)
+{
+    uint32_t k = i * wo.ch + (ch < wo.ch ? ch : 0);
+    if (wo.flt) { float f; memcpy(&f, p + 4 * k, 4); return f; }
+    if (wo.bits == 8) return (p[k] - 128) / 128.0f;
+    if (wo.bits == 16) { int16_t s; memcpy(&s, p + 2 * k, 2); return s / 32768.0f; }
+    if (wo.bits == 24) { int32_t s = (int32_t)((uint32_t)p[3 * k] << 8 | (uint32_t)p[3 * k + 1] << 16 | (uint32_t)p[3 * k + 2] << 24); return s / 2147483648.0f; }
+    int32_t s; memcpy(&s, p + 4 * k, 4); return s / 2147483648.0f;
+}
+static void wo_loop(CPU* c)
+{
+    static float out[2 * PASS];
+    sched_set_prio();
+    for (;;) {
+        if (!wo.open || wo.paused || !wo.qn || host_audio_queued() > RATE / 10) { sched_sleep(c, 5); continue; }
+        int n = 0;
+        double step = (double)wo.rate / RATE;
+        uint32_t fs = wo.ch * (wo.flt ? 4 : wo.bits / 8);
+        while (n < PASS && wo.qn) {
+            uint64_t h = wo.q[0];
+            uint32_t frames = fs ? (uint32_t)LD32(h + 8) / fs : 0;
+            const uint8_t* p = G2H(LD64(h));
+            while (n < PASS && wo.pos < frames) {
+                uint32_t i = (uint32_t)wo.pos;
+                out[2 * n] = wo_sample(p, i, 0) * wo.vol;
+                out[2 * n + 1] = wo_sample(p, i, 1) * wo.vol;
+                n++;
+                wo.pos += step;
+            }
+            if (wo.pos >= frames) {
+                wo.pos -= frames;
+                memmove(wo.q, wo.q + 1, sizeof wo.q[0] * (size_t)--wo.qn);
+                ST32(h + 24, ((uint32_t)LD32(h + 24) & ~0x10u) | 1);
+                wo_notify(c, 0x3BD, h);   /* WOM_DONE */
+            }
+        }
+        if (n) { host_audio_write(out, n); wo.played += (uint64_t)n; }
+    }
+}
+/* waveOutOpen(&h, device, WAVEFORMATEX*, callback, instance, flags) */
+HLE(waveOutOpen)
+{
+    uint64_t fmt = A3;
+    uint32_t flags = (uint32_t)ARG(6);
+    if (!fmt) { RET(11); return; }   /* MMSYSERR_INVALPARAM */
+    uint16_t tag = (uint16_t)LD16(fmt);
+    uint32_t ch = (uint32_t)LD16(fmt + 2), rate = (uint32_t)LD32(fmt + 4), bits = (uint32_t)LD16(fmt + 14);
+    int flt = tag == 3 || (tag == 0xFFFE && LD32(fmt + 24) == 3);   /* IEEE float, or extensible with the float subformat */
+    if (!ch || !rate || (bits != 8 && bits != 16 && bits != 24 && bits != 32) || (tag != 1 && tag != 3 && tag != 0xFFFE)) { RET(32); return; }   /* WAVERR_BADFORMAT */
+    if (flags & 1) { RET(0); return; }   /* WAVE_FORMAT_QUERY: supported */
+    memset(&wo, 0, sizeof wo);
+    wo.open = 1; wo.ch = ch; wo.rate = rate; wo.bits = bits; wo.flt = flt; wo.vol = 1;
+    wo.cb = A4; wo.inst = ARG(5); wo.cb_type = (flags >> 16) & 7;
+    if (A1) ST64(A1, 0x7C000001);
+    host_audio_open(RATE);
+    if (!wo_thread) { wo_thread = 1; sched_create(rt_dyn_thunk(wo_loop, "waveout"), 0, 0); }
+    wo_notify(c, 0x3BB, 0);   /* WOM_OPEN */
+    RET(0);
+}
+HLE(waveOutPrepareHeader) { if (A2) ST32(A2 + 24, (uint32_t)LD32(A2 + 24) | 2); RET(0); }
+HLE(waveOutUnprepareHeader) { if (A2) ST32(A2 + 24, (uint32_t)LD32(A2 + 24) & ~2u); RET(0); }
+HLE(waveOutWrite)
+{
+    if (!wo.open || !A2) { RET(5); return; }   /* MMSYSERR_INVALHANDLE */
+    if (wo.qn == 64) { RET(4); return; }      /* MMSYSERR_ALLOCATED: queue full */
+    ST32(A2 + 24, ((uint32_t)LD32(A2 + 24) & ~1u) | 0x10);
+    wo.q[wo.qn++] = A2;
+    RET(0);
+}
+HLE(waveOutReset)
+{
+    while (wo.qn) { uint64_t h = wo.q[0]; memmove(wo.q, wo.q + 1, sizeof wo.q[0] * (size_t)--wo.qn); ST32(h + 24, ((uint32_t)LD32(h + 24) & ~0x10u) | 1); wo_notify(c, 0x3BD, h); }
+    wo.pos = 0;
+    RET(0);
+}
+HLE(waveOutClose) { if (wo.open) { hle_waveOutReset(c); wo_notify(c, 0x3BC, 0); } wo.open = 0; RET(0); }   /* WOM_CLOSE */
+HLE(waveOutPause) { wo.paused = 1; RET(0); }
+HLE(waveOutRestart) { wo.paused = 0; RET(0); }
+/* MMTIME: type +0, value +4 (TIME_BYTES 4, TIME_SAMPLES 2, TIME_MS 1) */
+HLE(waveOutGetPosition)
+{
+    if (!A2) { RET(11); return; }
+    uint64_t frames = wo.played * wo.rate / RATE;
+    uint32_t type = (uint32_t)LD32(A2);
+    if (type == 2) ST32(A2 + 4, (uint32_t)frames);
+    else if (type == 1) ST32(A2 + 4, (uint32_t)(frames * 1000 / (wo.rate ? wo.rate : 1)));
+    else { ST32(A2, 4); ST32(A2 + 4, (uint32_t)(frames * wo.ch * (wo.flt ? 4 : wo.bits / 8))); }
+    RET(0);
+}
+HLE(waveOutGetNumDevs) { RET(1); }
+/* WAVEOUTCAPSW: mid, pid, version, name[32], formats, channels, reserved, support */
+HLE(waveOutGetDevCapsW)
+{
+    if (!A2) { RET(11); return; }
+    memset(G2H(A2), 0, (size_t)(uint32_t)A3);
+    const char* n = "Speakers";
+    for (int i = 0; n[i]; i++) ST16(A2 + 8 + 2 * i, (uint8_t)n[i]);
+    ST32(A2 + 72, 0xFFFFF); ST16(A2 + 76, 2); ST32(A2 + 80, 0x2C);
+    RET(0);
+}
+HLE(waveOutGetVolume) { if (A2) { uint32_t v = (uint32_t)(wo.vol * 0xFFFF); ST32(A2, v | v << 16); } RET(0); }
+HLE(waveOutSetVolume) { wo.vol = ((uint32_t)A2 & 0xFFFF) / 65535.0f; RET(0); }
+HLE(waveOutGetID) { if (A2) ST32(A2, 0); RET(0); }
+HLE(waveOutMessage) { RET(8); }   /* MMSYSERR_NOTSUPPORTED */

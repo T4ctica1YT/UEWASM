@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from . import pe as pemod
+from . import resources
 from .lift import Func, Program
 from .link import THUNK_BASE, Linker
 
@@ -41,6 +42,35 @@ def implemented_hle():
     return names
 
 
+def refresh_thunks(gen):
+    """binds imports to HLE functions added to the runtime since the lift, so a relink picks them up without lifting again"""
+    meta = gen / "meta.c"
+    if not meta.exists():
+        return 0
+    text = meta.read_text(encoding="utf-8")
+    hle = implemented_hle()
+    have = set(re.findall(r"^void hle_(\w+)\(CPU\*\);", text, re.M))
+    listed = set(re.findall(r'^    \{\w+, "([^"]+)", "[^"]*", \w+\},', text, re.M))
+    new = sorted({n for n in re.findall(r'^    \{NULL, "(\w+)", "[^"]*", NULL\},', text, re.M) if n in hle} - have)
+    extra = sorted(hle - listed - have)
+    if not new and not extra:
+        return 0
+    text = re.sub(r'^    \{NULL, "(\w+)", ("[^"]*"), NULL\},',
+                  lambda m: f'    {{hle_{m[1]}, "{m[1]}", {m[2]}, T_{m[1]}}},' if m[1] in new else m[0], text, flags=re.M)
+    # functions nothing imports, for GetProcAddress
+    if extra:
+        j = text.index("};", text.index("const Thunk rt_thunks[] = {"))
+        text = text[:j] + "".join(f'    {{hle_{n}, "{n}", "hle", T_{n}}},\n' for n in extra) + text[j:]
+        text = re.sub(r"const size_t rt_thunk_count = (\d+);", lambda m: f"const size_t rt_thunk_count = {int(m[1]) + len(extra)};", text)
+    new = sorted(set(new) | set(extra))
+    decl = "".join(f"void hle_{n}(CPU*);\n" for n in new)
+    decl += "".join(f"static void T_{n}(CPU* c) {{ if (rt_trace_on > 0) rt_trace_call(c, \"{n}\"); hle_{n}(c); c->r[4] += 8; "
+                    f"if (--rt_hle_budget < 0) rt_hle_tick(c); }}\n" for n in new)
+    i = text.index("const Thunk rt_thunks[] = {")
+    write_if_changed(meta, text[:i] + decl + text[i:])
+    return len(new)
+
+
 _W = {}
 
 # Win64: a call may change these (rax rcx rdx r8-r11); rsp comes back moved by the callee's ret
@@ -60,7 +90,9 @@ def regs_local(body):
     return [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
 
 
-def _init_worker(all_roots, comments):
+def _init_worker(all_roots, comments, mode="high"):
+    resources.set_mode(mode)
+    resources.lower_this_process()
     _W["roots"] = all_roots
     _W["comments"] = comments
     _W["progs"] = {}
@@ -163,9 +195,9 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
     bad = 0
     for _, prog in progs:
         prog.cache.clear()
-    workers = jobs or max(1, min(os.cpu_count() or 4, 6))
+    workers = jobs or resources.plan()["lift_workers"]
     progress("analyze", 1, 1)
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(all_roots, comments)) as ex:
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(all_roots, comments, resources.mode())) as ex:
         try:
             results = list(_lifted(ex, tasks, progress))
         except BaseException:
@@ -253,7 +285,7 @@ def emsdk_env():
 
 def jspi_flag(node):
     """newer Node ships JSPI enabled and rejects the old flag"""
-    r = subprocess.run([node, "-e", "process.exit(typeof WebAssembly.Suspending == 'function' ? 0 : 1)"])
+    r = resources.run([node, "-e", "process.exit(typeof WebAssembly.Suspending == 'function' ? 0 : 1)"])
     return [] if r.returncode == 0 else ["--experimental-wasm-jspi"]
 
 
@@ -315,10 +347,11 @@ SHELL = """<!doctype html>
   const parts = __PARTS__;
   var Module = {
     canvas: document.getElementById("canvas"),
-    arguments: __ARGS__,
+    arguments: __ARGS__.concat(new URLSearchParams(location.search).getAll("arg")),
     uewSave: __SAVE__,
     uewAsyncShaders: __ASYNC__,
     uewDebugPanel: __DEBUG__,
+    uewNetPlaceholders: __PLACEHOLDERS__,
     print: t => console.log(t),
     printErr: t => console.log(t),
     setStatus: t => { if (t) status.textContent = t; },
@@ -351,6 +384,17 @@ SHELL = """<!doctype html>
 """
 
 
+def _epic_args(exe_rel):
+    # the game signs in to the offline account over WinInet, which the runtime answers (runtime/web/backends/epic.js)
+    app = re.sub(r"(Client|Game)?-Win64-Shipping$", "", exe_rel.stem)
+    return ["-HTTP=WinInet", "-AUTH_TYPE=epic", "-AUTH_LOGIN=Player", "-AUTH_PASSWORD=offline", f"-epicapp={app}", "-epicenv=Prod",
+            "-epiclocale=en-us", "-epicportal", "-skippatchcheck", "-nobe", "-noeac", "-fromfl=none", "-fltoken=none"]
+
+
+# offline stand-ins for online services: a script the page loads, and launch arguments that point the game at it
+BACKENDS = {"epic": {"script": "epic.js", "args": _epic_args}}
+
+
 def default_args(exe):
     """launch arguments a game needs here: Unreal games that can pick D3D12 are told to use D3D11, which this runtime
     translates to WebGPU"""
@@ -361,7 +405,8 @@ def default_args(exe):
     return ["-dx11"] if b"D3D11RHI" in data and b"D3D12RHI" in data else []
 
 
-def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True):
+def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
+                placeholders=False):
     """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts"""
     import json
     wasm = web / "game.wasm"
@@ -381,7 +426,7 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
             .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save))
             .replace("__FPS__", "true" if show_fps else "false")
             .replace("__ASYNC__", "true" if async_shaders else "false")
-            .replace("__DEBUG__", "true" if debug_panel else "false"))
+            .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false"))
     (web / "index.html").write_text(html, encoding="utf-8")
     # Cloudflare Pages reads this; other hosts ignore it
     (web / "_headers").write_text("\n".join([
@@ -392,14 +437,8 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
 
 
 def mem_budget_mb():
-    """RAM the compile jobs may share: UEW_BUILD_MB (default 6 GB) or 80% of what's free, whichever is less"""
-    cap = int(os.environ.get("UEW_BUILD_MB", 6144))
-    try:
-        import psutil
-        cap = min(cap, int(psutil.virtual_memory().available / 1048576 * 0.8))
-    except ImportError:
-        pass
-    return max(cap, 1024)
+    """RAM the compile jobs may share (see resources.plan; UEW_BUILD_MB overrides)"""
+    return resources.plan()["budget_mb"]
 
 
 def run_jobs(jobs, what, progress=nop_progress):
@@ -407,7 +446,7 @@ def run_jobs(jobs, what, progress=nop_progress):
     Progress is reported by estimated size, which tracks compile time."""
     import tempfile
     pending = sorted(jobs, key=lambda j: -j[3])
-    workers = max(1, (os.cpu_count() or 4) - 1)
+    workers = resources.plan()["compile_jobs"]
     budget = mem_budget_mb()
     running, used = [], 0
     total = sum(j[3] for j in jobs) or 1
@@ -418,7 +457,7 @@ def run_jobs(jobs, what, progress=nop_progress):
             while pending and len(running) < workers and (not running or used + pending[0][3] <= budget):
                 name, cmd, env, mb = pending.pop(0)
                 log_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-                running.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT), name, mb, log_f))
+                running.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT, **resources.proc_flags()), name, mb, log_f))
                 used += mb
             time.sleep(0.05)
             for job in running[:]:
@@ -444,7 +483,8 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
-               wasm_opt=False, game_args=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True):
+               wasm_opt=False, game_args=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
+               placeholders=False):
     """wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
     module size in RAM (11 GB for a 550 MB game), so it is off unless asked for."""
     if renderer not in ("webgpu", "webgl2"):
@@ -459,6 +499,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     env, emcc, _ = emsdk_env()
     # simd: wasm SIMD (every current browser) lets clang turn the emulated SSE lanes into real vector ops
     cflags = [opt, "-w", "-mtail-call", *(["-msimd128"] if simd else []), "-sSUPPORT_LONGJMP=wasm", "-DUEW_WEB_GPU", f"-I{RUNTIME}", f"-I{out / 'gen'}", "-D_CRT_SECURE_NO_WARNINGS", "-fno-strict-aliasing"]
+    # developer hook: extra compiler flags for every file (e.g. -DUEW_STORE_CHECK for a store-checking debug build)
+    cflags += os.environ.get("UEW_EXTRA_CFLAGS", "").split()
     if renderer == "webgpu":
         cflags.append("-DUEW_WEBGPU")
     # generated code only depends on rt.h/sse.h and the opt level; the runtime is always rebuilt (it is small)
@@ -469,6 +511,9 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
             o.unlink()
         stamp.write_text(key)
     newest_h = max((RUNTIME / n).stat().st_mtime for n in ("rt.h", "sse.h"))
+    bound = refresh_thunks(out / "gen")
+    if bound:
+        log(f"{bound} imports bound to runtime functions added since the lift")
     gen = sorted((out / "gen").glob("*.c"))
     for o in obj.glob("*.o"):
         if not (out / "gen" / (o.stem + ".c")).exists() and not (RUNTIME / (o.stem + ".c")).exists():
@@ -483,7 +528,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     # generated files go straight to clang with emcc's own flags, skipping emcc's per-file startup
     clang = Path(emcc).parents[1] / "bin" / ("clang.exe" if os.name == "nt" else "clang")
     import shlex
-    em = shlex.split(subprocess.run([emcc, "--cflags", *cflags], env=env, capture_output=True, text=True).stdout)
+    em = shlex.split(resources.run([emcc, "--cflags", *cflags], env=env, capture_output=True, text=True).stdout)
     direct = clang.exists() and em
     # the debug panel and what it drives (UE console enabler, game speed, call tracing) are only built in when wanted, so
     # a build without them carries none of that code (nothing for a game's anti-cheat to find)
@@ -492,7 +537,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     jobs = []
     for src in srcs:
         o = str(obj / (src.stem + ".o"))
-        mb = 300 + 80 * src.stat().st_size / 1048576
+        # peak clang memory measured on generated files: ~175 MB plus ~60 MB per MB of source
+        mb = 190 + 62 * src.stat().st_size / 1048576
         if direct and src in gen_srcs:
             jobs.append((src.name, [str(clang), *em, *(f for f in cflags if not f.startswith("-s")), "-c", str(src), "-o", o], env, mb))
         else:
@@ -515,17 +561,26 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         embed = False
         link += ["--pre-js", str(RUNTIME / "web" / "uew_files.js"), "--pre-js", str(RUNTIME / "web" / "uew_save.js"), *(["--pre-js", str(RUNTIME / "web" / "uew_debug.js")] if debug_panel else []), "-lidbfs.js",
                  "-sFORCE_FILESYSTEM=1"]
+        if backend:
+            link += ["--pre-js", str(RUNTIME / "web" / "backends" / BACKENDS[backend]["script"])]
     if node_fs:
         link += ["-sNODERAWFS=1", "-sENVIRONMENT=node"]
         link.remove("-sENVIRONMENT=web,node")
     elif embed:
         link += ["--embed-file", f"{out / 'image.bin'}@image.bin"]
-    r = subprocess.run(link, env=env, capture_output=True, text=True)
+    r = resources.run(link, env=env, capture_output=True, text=True)
     progress("link", 1, 1)
     if r.returncode:
         errs = [l for l in r.stderr.splitlines() if "error" in l.lower() and len(l) < 600]
         raise RuntimeError("emcc link failed:\n" + "\n".join(errs[:20] or [r.stderr[-3000:]]))
     wasm_mb = (web / "game.wasm").stat().st_size / 1e6
+    # browsers refuse modules over 1 GiB (V8's limit)
+    wasm_bytes = (web / "game.wasm").stat().st_size
+    if wasm_bytes > 1 << 30:
+        log(f"warning: the code is {wasm_bytes / 1048576:.0f} MiB, over the 1024 MiB browsers accept; rebuild with --opt -Os "
+            "(and --wasm-opt if there is enough memory) to make it smaller")
+    elif wasm_bytes > 900 << 20:
+        log(f"note: the code is {wasm_bytes / 1048576:.0f} MiB, close to the 1024 MiB browsers accept")
     if game_root:
         from .package import package
         replace = {}
@@ -537,20 +592,22 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         save = "/save/" + re.sub(r"[^A-Za-z0-9_-]", "", Path(exe_rel).stem)
         if game_args is None:
             game_args = default_args(Path(game_root) / exe_rel)
+        if backend:
+            game_args = [*game_args, *BACKENDS[backend]["args"](Path(exe_rel))]
         args = ["--image", "/image.bin", "--root", "/game", "--save", save, "--exe", exe_rel, *game_args]
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
-                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel)
+                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders)
     log(f"wasm build: {web} ({renderer}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
     return web
 
 
 def msvc_env():
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
-    path = subprocess.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    path = resources.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                            "-property", "installationPath"], capture_output=True, text=True).stdout.strip().splitlines()[0]
     bat = Path(path) / "VC/Auxiliary/Build/vcvars64.bat"
     comspec = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
-    out = subprocess.run(f'"{comspec}" /d /s /c "call "{bat}" >nul && set"', capture_output=True, text=True).stdout
+    out = resources.run(f'"{comspec}" /d /s /c "call "{bat}" >nul && set"', capture_output=True, text=True).stdout
     env = {}
     for line in out.splitlines():
         if "=" in line:
@@ -593,7 +650,7 @@ def build_native(out, log=print, debug=False, progress=nop_progress):
     exe = out / "native.exe"
     lrsp = out / "link.rsp"
     lrsp.write_text("\n".join(f'"{p}"' for p in obj.glob("*.obj")), encoding="utf-8")
-    r = subprocess.run([tool(env, "link"), "/nologo", f"/OUT:{exe}", "/STACK:268435456", f"/MAP:{out / 'native.map'}", f"@{lrsp}"],
+    r = resources.run([tool(env, "link"), "/nologo", f"/OUT:{exe}", "/STACK:268435456", f"/MAP:{out / 'native.map'}", f"@{lrsp}"],
                        env=env, capture_output=True, text=True)
     progress("native link", 1, 1)
     if r.returncode:

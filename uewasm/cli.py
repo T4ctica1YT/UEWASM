@@ -54,6 +54,10 @@ def cmd_recomp(a):
         search = sorted({str(d.parent) for d in extra})
     root = Path(root)
     exe_rel = exe.relative_to(root).as_posix()
+    from .recomp import resources
+    resources.set_mode(a.priority)
+    resources.lower_this_process()
+    print(resources.describe())
     r = build.recompile(exe, out, mem_mb=a.mem_mb, comments=a.comments, extra=extra, search=search, system_dlls=not a.no_system_dlls)
     print(f"{r['functions']} functions in {len(r['modules'])} modules, {r['unsupported_total']} unsupported instructions, "
           f"{len(r['missing_imports'])} imports not implemented yet (details in {out / 'coverage.json'})")
@@ -66,7 +70,8 @@ def cmd_recomp(a):
         w, h = (int(x) for x in a.resolution.lower().split("x"))
         web = build.build_wasm(out, opt=a.opt, threads=a.threads, renderer=a.renderer, game_root=root, exe_rel=exe_rel,
                                size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
-                               wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel)
+                               wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
+                               backend=a.backend, placeholders=a.placeholders)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
 
 
@@ -114,6 +119,11 @@ def main(argv=None):
     r.add_argument("--compress", action="store_true", help="compress game files (not audio) for a smaller download")
     r.add_argument("--sync-shaders", action="store_true", help="compile shaders when first drawn (exact first frames, but freezes while compiling)")
     r.add_argument("--fps", action="store_true", help="show an FPS counter in the page (Ctrl+Shift+F toggles it)")
+    r.add_argument("--priority", choices=["high", "low"], default="high",
+                   help="high: fastest, tuned to this PC; low: far less CPU and memory so the PC stays usable (same result)")
+    r.add_argument("--backend", choices=["epic"], default=None,
+                   help="offline stand-in for a game's online services (epic: Epic accounts, profiles and menus)")
+    r.add_argument("--placeholders", action="store_true", help="with --backend: stand-in images and data for files the servers would send")
     r.add_argument("--no-debug-panel", action="store_true", help="leave out the UEWASM debug panel toggle (\\ or Insert in game)")
     r.add_argument("--wasm-opt", action="store_true", help="run Binaryen on the linked module: ~10%% smaller, needs ~20x its size in RAM")
     r.add_argument("--video-height", type=int, default=0, help="re-encode game videos taller than this (e.g. 720); 0 keeps them")

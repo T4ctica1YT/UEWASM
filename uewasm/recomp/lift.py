@@ -184,6 +184,26 @@ class Program:
                 nxt = min(nxt, self.base + s.rva + s.vsize)
         return nxt
 
+    def window(self, ins, span=96):
+        """the instructions just before ins in address order: decoding from a little earlier until it lands exactly on
+        ins (the bounds check guarding a jump table may belong to code the scan reached from elsewhere)"""
+        best = []
+        for back in range(span, 0, -1):
+            a = ins.ip - back
+            rva = a - self.base
+            if rva < 0:
+                continue
+            got = []
+            for x in I.Decoder(64, self.img[rva:rva + back + 16], ip=a):
+                if x.ip >= ins.ip or x.code == I.Code.INVALID:
+                    break
+                got.append(x)
+            if got and got[-1].next_ip == ins.ip and len(got) > len(best):
+                best = got
+                if len(best) >= 12:
+                    break
+        return best[-11:] + [ins]
+
     def jump_table(self, r, end, insns):
         targets = set()
         bound = None
@@ -192,6 +212,16 @@ class Program:
                 v = ins.immediate(1)
                 if 0 <= v < 4096:
                     bound = v + 1
+        # two-level tables (MSVC for sparse cases): movzx idx, byte [base + idx + bytes]; mov t, [base + idx*4 + dwords]. The
+        # compare bounds the byte table; the dword table has one entry per distinct value in it
+        if bound:
+            # the byte lookup right before the table load (an earlier movzx may read something else entirely)
+            for ins in reversed(insns):
+                if MN[ins.mnemonic] == "MOVZX" and ins.op_kind(1) == OK.MEMORY and I.MemorySizeInfo(ins.memory_size).size == 1                         and ins.memory_index != I.Register.NONE and ins.memory_index_scale == 1:
+                    bt = ins.memory_displacement & 0xFFFFFFFF
+                    if 0 < bt and bt + bound <= len(self.img):
+                        bound = max(self.img[bt:bt + bound]) + 1
+                    break
         for ins in insns:
             if MN[ins.mnemonic] in ("MOV", "MOVSXD") and ins.op_count == 2 and ins.op_kind(1) == OK.MEMORY \
                     and ins.memory_index != I.Register.NONE and ins.memory_index_scale == 4 \
@@ -274,7 +304,9 @@ class Program:
                         extra.add(t)
                     break
                 elif fc == FC.INDIRECT_BRANCH:
-                    tbl = self.jump_table(r, end, insns[-12:])
+                    # the code just before the jump in address order (decode order follows branches, so the bounds
+                    # check guarding the table may have been decoded long before)
+                    tbl = self.jump_table(r, end, self.window(ins))
                     if tbl:
                         self.jt[ins.ip] = sorted(tbl)
                     for t in tbl:
@@ -461,12 +493,27 @@ class Func:
     def one(self, ins):
         m = MN[ins.mnemonic]
         fn = getattr(self, "op_" + m, None)
-        if fn is None:
-            fn = SSE.get(m)
-            if fn is None:
-                raise Unsupported("no handler")
-            return fn(self, ins, m)
-        return fn(ins)
+        sse_fn = None if fn else SSE.get(m)
+        if fn is None and sse_fn is None:
+            raise Unsupported("no handler")
+        # locked read-modify-writes (and xchg with memory, locked implicitly) run under ATOMIC_BEGIN/END: nothing in
+        # cooperative builds, a lock per address in builds with real threads
+        mem0 = ins.op_count > 0 and ins.op_kind(0) == OK.MEMORY
+        mem1 = ins.op_count > 1 and ins.op_kind(1) == OK.MEMORY
+        locked = (mem0 and ins.has_lock_prefix) or (m == "XCHG" and (mem0 or mem1))
+        # an instruction that turns out unsupported halfway leaves nothing behind (its partial lines could leave a
+        # brace open); the caller then emits the trap
+        mark = len(self.out)
+        try:
+            if locked:
+                self.emit(f"{{ uint64_t lk_ = {self.addr()}; ATOMIC_BEGIN(lk_);")
+            r = sse_fn(self, ins, m) if sse_fn else fn(ins)
+            if locked:
+                self.emit("ATOMIC_END(lk_); }")
+            return r
+        except Unsupported:
+            del self.out[mark:]
+            raise
 
     # ---- data movement
     def op_MOV(self, ins):
@@ -763,7 +810,8 @@ class Func:
         s = self.size(0)
         src = self.rd(0)
         fn = "IDIV" if signed else "DIV"
-        self.emit(f"SPILL(); rt_{fn.lower()}{s * 8}(c, {src}); FILL();")
+        # the instruction's address, for the report if it divides by zero
+        self.emit(f"rt_div_ip = {h(ins.ip)}; SPILL(); rt_{fn.lower()}{s * 8}(c, {src}); FILL();")
 
     def op_DIV(self, ins):
         self._div(ins, False)

@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include "dxbc_parse.h"
 
 #include <math.h>
@@ -22,6 +23,7 @@ typedef struct {
     /* two-result instructions (udiv, imul, umul, sincos, swapc) read all sources before writing either result */
     int defer, ndefer;
     Op* defer_dst[2];
+    const DxWgslOpts* opt;
 } Tw;
 
 /* D3D interpolation mode (dcl_input_ps bits 11-14) as a WGSL attribute */
@@ -446,6 +448,34 @@ static void emit_gather(Tw* tr, int opc, Op** o, int off[3], int has_off)
     free(e.p); free(c.p); free(a.p); free(call.p);
 }
 
+/* t<k>[e] -> txr<k>(u32(e)) and arrayLength(&t<k>) -> txn<k>() for buffers moved into the overflow buffer */
+static char* merge_reads(char* body, const DxWgsl* out)
+{
+    if (!body) return body;
+    Str r = { 0 };
+    char stack[256];
+    int sd = 0;
+    for (const char* p = body; *p;) {
+        int idc = p > body && (isalnum((unsigned char)p[-1]) || p[-1] == '_');
+        if (!strncmp(p, "arrayLength(&t", 14) && isdigit((unsigned char)p[14])) {
+            char* e;
+            long k = strtol(p + 14, &e, 10);
+            if (*e == ')' && k < 128 && out->srv[k].merged) { sp(&r, "txn%ld()", k); p = e + 1; continue; }
+        }
+        if (*p == 't' && !idc && isdigit((unsigned char)p[1])) {
+            char* e;
+            long k = strtol(p + 1, &e, 10);
+            if (*e == '[' && k < 128 && out->srv[k].merged && sd < 256) { sp(&r, "txr%ld(u32(", k); stack[sd++] = 1; p = e + 1; continue; }
+        }
+        if (*p == '[' && sd < 256) stack[sd++] = 0;
+        if (*p == ']' && sd > 0 && stack[--sd]) { sp(&r, "))"); p++; continue; }
+        sp(&r, "%c", *p);
+        p++;
+    }
+    free(body);
+    return r.p;
+}
+
 static void emit_ld(Tw* tr, Op** o, int off[3], int has_off, int ms)
 {
     Op *d = o[0], *addr = o[1], *res = o[2];
@@ -598,10 +628,62 @@ static const char* atomic_fn(int opc)
     }
 }
 
+/* WebGPU has no atomics on storage textures: the texel is read, combined and written back (exact unless two
+   invocations update the same texel at the same time). The texture is declared read_write. */
+static void emit_texture_atomic(Tw* tr, int opc, Op** o, int imm)
+{
+    Op* r = o[imm ? 1 : 0];
+    int k = (int)r->idx[0].imm & 7;
+    tr->sh->uav[k].used = 1;
+    tr->sh->uav[k].written = 1;
+    tr->uav_read[k] = 1;
+    int dim = tr->uav_dim[k], n = base_coords(dim);
+    Op* ao = o[imm ? 2 : 1];
+    Str c = { 0 }, l = { 0 }, v = { 0 }, cmpv = { 0 }, nv = { 0 };
+    src(tr, &c, ao, -1, n, K_U);
+    if (is_array(dim)) { sp(&l, ", "); Op t = *ao; t.swz[0] = ao->swz[n]; src(tr, &l, &t, -1, 1, K_U); }
+    int signed_op = opc == 174 || opc == 175 || opc == 186 || opc == 187;
+    if (opc == 172 || opc == 185) { src(tr, &cmpv, o[imm ? 3 : 2], -1, 1, K_U); src(tr, &v, o[imm ? 4 : 3], -1, 1, K_U); }
+    else if (opc != 178 && opc != 179) src(tr, &v, o[imm ? 3 : 2], -1, 1, K_U);
+    const char* fn = atomic_fn(opc);
+    if (opc == 172 || opc == 185) sp(&nv, "select(old_, %s, old_ == %s)", v.p, cmpv.p);
+    else if (opc == 178 || opc == 179) sp(&nv, "old_ + %s", opc == 178 ? "1u" : "0xFFFFFFFFu");
+    else if (fn && !strcmp(fn, "atomicAdd")) sp(&nv, "old_ + %s", v.p);
+    else if (fn && !strcmp(fn, "atomicAnd")) sp(&nv, "old_ & %s", v.p);
+    else if (fn && !strcmp(fn, "atomicOr")) sp(&nv, "old_ | %s", v.p);
+    else if (fn && !strcmp(fn, "atomicXor")) sp(&nv, "old_ ^ %s", v.p);
+    else if (fn && !strcmp(fn, "atomicExchange")) sp(&nv, "%s", v.p);
+    else if (fn && !strcmp(fn, "atomicMax")) sp(&nv, signed_op ? "bitcast<u32>(max(bitcast<i32>(old_), bitcast<i32>(%s)))" : "max(old_, %s)", v.p);
+    else if (fn && !strcmp(fn, "atomicMin")) sp(&nv, signed_op ? "bitcast<u32>(min(bitcast<i32>(old_), bitcast<i32>(%s)))" : "min(old_, %s)", v.p);
+    else sp(&nv, "old_");
+    /* the bound format decides the texel type; the bits are what D3D keeps */
+    const char* bf = tr->opt ? tr->opt->uav_format[k] : NULL;
+    int sint = bf ? strstr(bf, "sint") != NULL : tr->uav_ret[k] == 1;
+    ind(tr);
+    sp(&tr->body, "{ let c_ = %s; let old_ = %s(textureLoad(u%d, c_%s).x); textureStore(u%d, c_%s, vec4<%s>(%s(%s), 0, 0, 1));",
+       c.p, sint ? "bitcast<u32>" : "", k, l.p ? l.p : "", k, l.p ? l.p : "", sint ? "i32" : "u32", sint ? "bitcast<i32>" : "", nv.p);
+    if (imm) {
+        Str e = { 0 };
+        sp(&e, "old_");
+        sp(&tr->body, "\n");
+        tr->indent++;
+        assign(tr, o[0], K_U, 0, e.p);
+        tr->indent--;
+        ind(tr);
+        sp(&tr->body, "}\n");
+        free(e.p);
+    } else sp(&tr->body, " }\n");
+    free(c.p); free(l.p); free(v.p); free(cmpv.p); free(nv.p);
+}
+
 static void emit_atomic(Tw* tr, int opc, Op** o)
 {
     int imm = opc >= 178;
     Op* r = o[imm ? 1 : 0];
+    if (r->type == T_UAV && !tr->uav_raw[r->idx[0].imm & 7] && !tr->uav_stride[r->idx[0].imm & 7] && tr->uav_dim[r->idx[0].imm & 7] != 1) {
+        emit_texture_atomic(tr, opc, o, imm);
+        return;
+    }
     mark_buf(tr, r, 1);
     Str a = { 0 }, nm = { 0 }, call = { 0 };
     int structured = (r->type == T_UAV && tr->uav_stride[r->idx[0].imm & 7]) || (r->type == T_TGSM && tr->g_stride[r->idx[0].imm & 31]);
@@ -613,9 +695,6 @@ static void emit_atomic(Tw* tr, int opc, Op** o)
         int stride = r->type == T_UAV ? tr->uav_stride[r->idx[0].imm & 7] : tr->g_stride[r->idx[0].imm & 31];
         sp(&a, "((u32("); src(tr, &a, tmp[0], -1, 1, K_I); sp(&a, ") * %du + u32(", stride); src(tr, &a, tmp[1], -1, 1, K_I); sp(&a, ")) >> 2u)");
     } else if (r->type == T_UAV && !tr->uav_raw[r->idx[0].imm & 7]) {
-        if (tr->uav_dim[r->idx[0].imm & 7] != 1) {
-            snprintf(tr->sh->error, sizeof tr->sh->error, "atomics on UAV textures are not supported by WebGPU");
-        }
         sp(&a, "u32("); src(tr, &a, ao, -1, 1, K_I); sp(&a, ")");
     } else { sp(&a, "(u32("); src(tr, &a, ao, -1, 1, K_I); sp(&a, ") >> 2u)"); }
     buf_name(&nm, r);
@@ -652,6 +731,8 @@ static void emit_uav_typed(Tw* tr, int opc, Op** o)
         src(tr, &c, o[1], -1, n, K_U);
         if (is_array(dim)) { sp(&a, ", "); Op t = *o[1]; t.swz[0] = o[1]->swz[n]; src(tr, &a, &t, -1, 1, K_U); }
         int ret = tr->uav_ret[k];
+        const char* bf = tr->opt && dim != 1 ? tr->opt->uav_format[k] : NULL;
+        if (bf) ret = strstr(bf, "sint") ? 1 : strstr(bf, "uint") ? 2 : 0;
         src(tr, &v, o[2], -1, 4, ret == 1 ? K_I : ret == 2 ? K_U : K_F);
         ind(tr);
         if (dim == 1 && tr->uav_atomic[k]) sp(&tr->body, "atomicStore(&u%d[%s], bitcast<vec4<u32>>(%s).x);\n", k, c.p, v.p);
@@ -955,6 +1036,7 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
         return 0;
     }
     Tw* tr = calloc(1, sizeof *tr);
+    tr->opt = opt;
     tr->sh = out;
     tr->stage = prog;
     size_t n = tokens[1] < ntok ? tokens[1] : ntok;
@@ -1317,6 +1399,19 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
         rd->pos = start + len;
     }
 
+    if (!lib) {
+        int nst = 0, nsrvb = 0;
+        for (int i = 0; i < 128; i++) if (out->srv[i].used && out->srv[i].buffer) nst++, nsrvb++;
+        for (int i = 0; i < 8; i++) if (out->uav[i].used && (out->uav[i].raw || out->uav[i].structured || out->uav[i].dim == 1)) nst++;
+        int lim = opt && opt->max_storage ? opt->max_storage : 16;
+        if (nst > lim && nsrvb >= nst - lim + 1) {
+            int need = nst - lim + 1, k = 0;
+            for (int i = 127; i >= 0 && k < need; i--)
+                if (out->srv[i].used && out->srv[i].buffer) out->srv[i].merged = ++k;
+            out->nmerged = k;
+            tr->body.p = merge_reads(tr->body.p, out);
+        }
+    }
     Str g = { 0 };
     if (!lib && prog != 2) sp(&g, "%s", dxbc_wgsl_helpers());
     int grp = lib ? opt->group : prog == 0 ? 2 : 0, rgrp = grp + 1;
@@ -1325,11 +1420,24 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
     for (int i = 0; i < 128; i++) {
         DxSlot* s = &out->srv[i];
         if (!s->used) continue;
-        if (s->buffer) {
+        if (s->buffer && s->merged) {
+            int h = (s->merged - 1) * 2;
+            if (s->raw || s->structured)
+                sp(&g, "fn txr%d(i: u32) -> u32 { if (i >= txm[%du]) { return 0u; } return txm[txm[%du] + i]; }\n", i, h + 1, h);
+            else
+                sp(&g, "fn txr%d(i: u32) -> vec4<u32> { if (i >= txm[%du]) { return vec4<u32>(0u); } let b = txm[%du] + i * 4u; "
+                   "return vec4<u32>(txm[b], txm[b + 1u], txm[b + 2u], txm[b + 3u]); }\n", i, h + 1, h);
+            sp(&g, "fn txn%d() -> u32 { return txm[%du]; }\n", i, h + 1);
+        } else if (s->buffer) {
             if (s->raw || s->structured) sp(&g, "@group(%d) @binding(%d) var<storage, read> t%d: array<u32>;\n", rgrp, 16 + i, i);
             else sp(&g, "@group(%d) @binding(%d) var<storage, read> t%d: array<vec4<u32>>;\n", rgrp, 16 + i, i);
-        } else sp(&g, "@group(%d) @binding(%d) var t%d: %s;\n", rgrp, 16 + i, i, tex_type(s->dim, s->ret, s->compare, 0));
+        } else {
+            int as_float = opt && (opt->float_srv[i >> 5] >> (i & 31) & 1) && s->ret && !s->compare;
+            if (as_float) s->ret = 0;   /* the bind group layout follows: a float texture */
+            sp(&g, "@group(%d) @binding(%d) var t%d: %s;\n", rgrp, 16 + i, i, tex_type(s->dim, s->ret, s->compare, 0));
+        }
     }
+    if (out->nmerged) sp(&g, "@group(%d) @binding(176) var<storage, read> txm: array<u32>;\n", rgrp);
     for (int i = 0; i < 16; i++)
         if (out->samp[i].used) sp(&g, "@group(%d) @binding(%d) var s%d: %s;\n", rgrp, 160 + i, i, out->samp[i].compare ? "sampler_comparison" : "sampler");
     for (int i = 0; i < 8; i++) {

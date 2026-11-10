@@ -43,6 +43,7 @@ void host_frame_done(void);
 void sched_frame_report(void);
 void host_idle(uint64_t ns);
 GThread* sched_current(void);
+int sched_is_main(void);
 CPU* sched_current_cpu(void);
 GThread* sched_by_tid(uint32_t tid);
 void sched_note_wait(CPU* c, uint32_t n, uint64_t h, uint32_t ms);

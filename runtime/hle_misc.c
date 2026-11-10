@@ -7,82 +7,7 @@ uint64_t handle_new(int kind, void* obj);
 void* handle_obj(uint64_t h);
 void guest_to_host(const char* guest, char* out, size_t cap);
 
-/* networking: present but offline */
-static uint32_t wsa_error = 10050;
-HLE(WSAStartup)
-{
-    if (A2) { memset(G2H(A2), 0, 408); ST16(A2, (uint16_t)A1); ST16(A2 + 2, 0x0202); ST16(A2 + 4, 32767); memcpy(G2H(A2 + 16), "WinSock 2.0", 12); memcpy(G2H(A2 + 273), "Running", 8); }
-    RET(0);
-}
-STUB(WSACleanup, 0)
-HLE(WSAGetLastError) { RET(wsa_error); }
-HLE(WSASetLastError) { wsa_error = (uint32_t)A1; RET(0); }
-HLE(socket) { wsa_error = 10050; RET((uint64_t)-1); }
-HLE(WSASocketW) { wsa_error = 10050; RET((uint64_t)-1); }
-HLE(WSASocketA) { wsa_error = 10050; RET((uint64_t)-1); }
-STUB(closesocket, 0)
-#define SOCKFAIL(n) HLE(n) { wsa_error = 10050; RET((uint64_t)-1); }
-SOCKFAIL(bind) SOCKFAIL(connect) SOCKFAIL(listen) SOCKFAIL(accept) SOCKFAIL(send) SOCKFAIL(sendto) SOCKFAIL(recv) SOCKFAIL(recvfrom)
-SOCKFAIL(select) SOCKFAIL(setsockopt) SOCKFAIL(getsockopt) SOCKFAIL(ioctlsocket) SOCKFAIL(shutdown) SOCKFAIL(getpeername) SOCKFAIL(getsockname)
-SOCKFAIL(WSAIoctl) SOCKFAIL(WSARecv) SOCKFAIL(WSASend) SOCKFAIL(WSASendDisconnect) SOCKFAIL(WSAEventSelect) SOCKFAIL(WSAEnumNetworkEvents)
-HLE(htons) { RET((uint16_t)(((A1 & 0xFF) << 8) | ((A1 >> 8) & 0xFF))); }
-HLE(ntohs) { hle_htons(c); }
-HLE(htonl) { RET(BSWAP32(A1)); }
-HLE(ntohl) { RET(BSWAP32(A1)); }
-HLE(inet_addr) { RET(0xFFFFFFFF); }
-STUB(inet_ntoa, 0)
-STUB(inet_pton, 0)
-STUB(inet_ntop, 0)
-STUB(gethostbyname, 0)
-STUB(gethostbyaddr, 0)
-STUB(getservbyname, 0)
-STUB(getprotobyname, 0)
-HLE(gethostname) { snprintf((char*)G2H(A1), (size_t)A2, "web"); RET(0); }
-HLE(getaddrinfo) { if (A4) ST64(A4, 0); RET(11001); }
-HLE(GetAddrInfoW) { if (A4) ST64(A4, 0); RET(11001); }
-STUB(freeaddrinfo, 0)
-STUB(FreeAddrInfoW, 0)
-STUB(__WSAFDIsSet, 0)
-STUB(WSACreateEvent, 0)
-STUB(WSACloseEvent, 1)
-STUB(WSASetEvent, 1)
-STUB(WSAResetEvent, 1)
-STUB(WSAWaitForMultipleEvents, 0x102)
-STUB(WSAAddressToStringW, 0xFFFFFFFF)
-STUB(WSAStringToAddressW, 0xFFFFFFFF)
-STUB(WinHttpOpen, 0)
-STUB(WinHttpConnect, 0)
-STUB(WinHttpOpenRequest, 0)
-STUB(WinHttpSendRequest, 0)
-STUB(WinHttpReceiveResponse, 0)
-STUB(WinHttpQueryHeaders, 0)
-STUB(WinHttpQueryDataAvailable, 0)
-STUB(WinHttpReadData, 0)
-STUB(WinHttpWriteData, 0)
-STUB(WinHttpCloseHandle, 1)
-STUB(WinHttpSetOption, 0)
-STUB(WinHttpSetTimeouts, 0)
-STUB(WinHttpSetStatusCallback, 0)
-STUB(WinHttpAddRequestHeaders, 0)
-STUB(WinHttpCrackUrl, 0)
-STUB(WinHttpGetProxyForUrl, 0)
-STUB(WinHttpSetCredentials, 0)
-STUB(WinHttpQueryAuthSchemes, 0)
-STUB(WinHttpGetIEProxyConfigForCurrentUser, 0)
-STUB(WinHttpGetDefaultProxyConfiguration, 0)
-STUB(InternetOpenW, 0)
-STUB(InternetConnectW, 0)
-STUB(InternetCloseHandle, 1)
-STUB(InternetReadFile, 0)
-STUB(InternetQueryOptionW, 0)
-STUB(InternetSetOptionW, 0)
-STUB(InternetGetConnectedState, 0)
-STUB(InternetAttemptConnect, 12029)
-STUB(HttpQueryInfoW, 0)
-STUB(HttpSendRequestW, 0)
-STUB(HttpOpenRequestW, 0)
-STUB(InternetSetStatusCallbackW, 0)
-STUB(InternetCrackUrlW, 0)
+
 STUB(GetAdaptersAddresses, 232)
 STUB(GetAdaptersInfo, 232)
 HLE(IdnToAscii) { int64_t n = (int32_t)A3; if (n < 0) { n = 0; while (LD16(A2 + 2 * n)) n++; n++; } if (A4 && (int32_t)ARG(5) >= n) memcpy(G2H(A4), G2H(A2), 2 * (size_t)n); RET(n); }
@@ -200,6 +125,8 @@ static const struct { const char* name; GuestFn fn; } late[] = {
 };
 
 /* oleaut32 and xinput are commonly imported by ordinal */
+void hle_XAudio2Create(CPU*); void hle_CreateAudioReverb(CPU*); void hle_CreateAudioVolumeMeter(CPU*); void hle_CreateFX(CPU*);
+void hle_X3DAudioCalculate(CPU*); void hle_X3DAudioInitialize(CPU*);
 GuestFn hle_by_ordinal(const char* dll, const char* name)
 {
     if (!dll || !name) return NULL;
@@ -214,6 +141,11 @@ GuestFn hle_by_ordinal(const char* dll, const char* name)
         case 149: return hle_SysStringByteLen; case 150: return hle_SysAllocStringByteLen;
         }
     if (!strcmp(d, "dsound.dll") && (n == 7 || n == 8)) return late_zero;
+    /* xaudio2_9redist.dll's export ordinals */
+    if (!strncmp(d, "xaudio2_9", 9)) switch (n) {
+        case 1: return hle_XAudio2Create; case 2: return hle_CreateAudioReverb; case 3: return hle_CreateAudioVolumeMeter;
+        case 4: return hle_CreateFX; case 5: return hle_X3DAudioCalculate; case 6: return hle_X3DAudioInitialize;
+        }
     if (!strncmp(d, "xinput", 6)) switch (n) {
         case 2: return hle_XInputGetState; case 3: return hle_XInputSetState; case 4: return hle_XInputGetCapabilities;
         case 5: return hle_XInputEnable; case 7: return hle_XInputGetBatteryInformation; case 100: return hle_XInputGetStateEx;
@@ -237,14 +169,19 @@ static void make_user_dir(const char* p)
     }
 }
 
-HLE(SHGetFolderPathW)
+/* the folder behind a CSIDL, created on first use */
+const char* hle_csidl_path(int csidl)
 {
-    int csidl = (int)(A2 & 0xFF);
+    csidl &= 0xFF;
     const char* p = csidl == 0x1C ? "C:\\Users\\Player\\AppData\\Local" : csidl == 0x1A ? "C:\\Users\\Player\\AppData\\Roaming"
                   : csidl == 0x05 ? "C:\\Users\\Player\\Documents" : csidl == 0x23 ? "C:\\ProgramData" : csidl == 0x28 ? "C:\\Users\\Player"
                   : csidl == 0x10 ? "C:\\Users\\Player\\Desktop" : "C:\\Users\\Player";
-    utf8_to_wstr(p, ARG(5), 260);
     make_user_dir(p);
+    return p;
+}
+HLE(SHGetFolderPathW)
+{
+    utf8_to_wstr(hle_csidl_path((int)A2), ARG(5), 260);
     RET(0);
 }
 
@@ -442,7 +379,6 @@ STUB(DwmGetCompositionTimingInfo, 0x80004005)
 STUB(timeBeginPeriod, 0)
 STUB(timeEndPeriod, 0)
 HLE(timeGetTime) { RET((uint32_t)(host_ticks_ns() / 1000000)); }
-STUB(waveOutGetNumDevs, 1)
 STUB(D3DPERF_BeginEvent, 0)
 STUB(D3DPERF_EndEvent, 0)
 STUB(D3DPERF_SetMarker, 0)
@@ -514,9 +450,6 @@ STUB(SetCriticalSectionSpinCount, 0)
 HLE(OpenThread) { RET(0x8001); }
 STUB(SetThreadContext, 0)
 STUB(SetHandleInformation, 1)
-STUB(CreateIoCompletionPort, 0)
-STUB(GetQueuedCompletionStatus, 0)
-STUB(PostQueuedCompletionStatus, 0)
 STUB(CreateWaitableTimerA, 0x8002)
 STUB(CreateWaitableTimerW, 0x8002)
 STUB(SetWaitableTimer, 1)
@@ -575,6 +508,7 @@ HLE(MapViewOfFile)
     if (!m) { RET(0); return; }
     uint64_t off = ((uint64_t)(uint32_t)A3 << 32) | (uint32_t)A4, len = ARG(5);
     extern void hle_GetFileSizeEx(CPU*);
+    if (!len && (m->file == (uint64_t)-1 || !m->file)) len = m->size > off ? m->size - off : 0;
     if (!len) {
         uint64_t tmp = g_calloc(8);
         uint64_t s1 = R(1), s2 = R(2);
@@ -583,19 +517,15 @@ HLE(MapViewOfFile)
         len = LD64(tmp) - off;
         R(1) = s1; R(2) = s2;
     }
-    uint64_t mem = g_alloc_zero_aligned(len + 16, 65536);
-    extern void hle_SetFilePointerEx(CPU*);
-    extern void hle_ReadFile(CPU*);
-    uint64_t save[5] = { R(1), R(2), R(8), R(9), R(4) };
-    R(1) = m->file; R(2) = off; R(8) = 0; R(9) = 0;
-    hle_SetFilePointerEx(c);
-    uint64_t got = g_calloc(8);
-    R(1) = m->file; R(2) = mem; R(8) = len; R(9) = got;
-    hle_ReadFile(c);
-    R(1) = save[0]; R(2) = save[1]; R(8) = save[2]; R(9) = save[3];
+    /* a view is a copy of that part of the file, in pages of its own so unmapping gives them back */
+    uint64_t mem = g_pages(len + 16);
+    if (!mem) { hle_set_error(8); RET(0); return; }
+    extern uint64_t hle_file_pread(uint64_t h, uint64_t off, uint64_t buf, uint64_t len);
+    uint64_t got = m->file ? hle_file_pread(m->file, off, mem, len) : 0;
+    memset(G2H(mem + got), 0, (size_t)(len + 16 - got));
     RET(mem);
 }
-STUB(UnmapViewOfFile, 1)
+HLE(UnmapViewOfFile) { if (A1 && g_pages_query(A1, NULL) == A1) g_pages_free(A1); RET(1); }
 
 typedef struct { uint64_t fn, ctx; } Work;
 HLE(CreateThreadpoolWork) { Work* w = calloc(1, sizeof *w); w->fn = A1; w->ctx = A2; RET(handle_new(5, w)); }

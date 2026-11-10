@@ -130,6 +130,7 @@ void* host_ctx_new(void (*entry)(void*), void* arg, size_t stack)
     if (!c || !mem) return NULL;
     c->id = next_hctx++;
     c->mem = mem;
+    memset(mem, 0xA5, 256);     /* canary: a coroutine that runs off the bottom of its native stack overwrites it */
     c->top = ((uintptr_t)mem + stack - 64) & ~(uintptr_t)15;
     c->fn = entry;
     c->arg = arg;
@@ -141,6 +142,11 @@ void host_ctx_switch(void* to)
     HCtx* t = to;
     if (t == me) return;
     me->sp = emscripten_stack_get_current();
+    if (me->mem) {
+        static int said;
+        const uint8_t* m = me->mem;
+        for (int i = 0; i < 256; i++) if (m[i] != 0xA5) { if (said++ < 10) host_log("[stack] coroutine %d overflowed its native stack (lowest sp %p)", me->id, (void*)me->sp); break; }
+    }
     cur_hctx = t;
     uew_js_switch(me->id, t->id, t);
     _emscripten_stack_restore(me->sp);

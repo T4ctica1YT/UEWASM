@@ -17,13 +17,15 @@
     const head = lines[0].split(" ");
     if (head[0] != "uewasm-files") throw new Error("bad data/index.txt");
     F.part = +head[2];
-    const addDir = (p, name, e) => {
+    // keyed by the lowercased path; listings keep the names' own case (games build paths from what they list)
+    const addDir = (orig, name, e) => {
+      const p = norm(orig);
       let d = F.dirs.get(p);
       if (!d) {
         d = new Map();
         F.dirs.set(p, d);
-        const i = p.lastIndexOf("/");
-        if (i >= 0) addDir(p.slice(0, i), p.slice(i + 1), { dir: true });
+        const i = orig.lastIndexOf("/");
+        if (i >= 0) addDir(orig.slice(0, i), orig.slice(i + 1), { dir: true });
       }
       if (name && !d.has(name)) d.set(name, e);
     };
@@ -35,7 +37,7 @@
       const n = norm(path);
       F.byPath.set(n, f);
       const j = path.lastIndexOf("/");
-      addDir(norm(path.slice(0, j)), path.slice(j + 1), f);
+      addDir(path.slice(0, j), path.slice(j + 1), f);
     }
   };
   F.lookup = p => {

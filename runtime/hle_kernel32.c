@@ -14,7 +14,17 @@ HLE(IsProcessorFeaturePresent)
     uint32_t f = (uint32_t)A1;
     RET(f == 6 || f == 7 || f == 10 || f == 13 || f == 36 || f == 37 || f == 38);
 }
-HLE(QueryPerformanceCounter) { ST64(A1, host_ticks_ns() / 100); RET(1); }
+/* strictly increasing: the browser's clock is coarse (0.1 ms or worse), and code that divides by the time between two
+   reads would divide by zero where Windows' 100 ns counter always moves */
+HLE(QueryPerformanceCounter)
+{
+    static uint64_t last;
+    uint64_t v = host_ticks_ns() / 100;
+    if (v <= last) v = last + 1;
+    last = v;
+    ST64(A1, v);
+    RET(1);
+}
 HLE(QueryPerformanceFrequency) { ST64(A1, 10000000); RET(1); }
 HLE(GetSystemTimeAsFileTime) { ST64(A1, host_time_100ns()); RET(0); }
 HLE(GetSystemTimePreciseAsFileTime) { ST64(A1, host_time_100ns()); RET(0); }
@@ -115,7 +125,7 @@ static void srw_desc(GThread* t, char* out, int cap)
     snprintf(out, cap, " %llx wanted %s, held %s", (unsigned long long)t->block_a, t->block_b ? "shared" : "exclusive",
              v == 1 ? "exclusive" : v ? "shared" : "by nobody");
 }
-__attribute__((constructor)) static void lock_names(void)
+INIT_FN(lock_names)
 {
     sched_name_check(cs_free, "critical section", cs_desc);
     sched_name_check(srw_free, "SRW lock", srw_desc);
@@ -222,8 +232,13 @@ static const char* hle_modules[] = { "kernel32.dll", "kernelbase.dll", "ntdll.dl
     "xinput9_1_0.dll", "d3d11.dll", "dxgi.dll", "d3d9.dll", "dsound.dll", "xaudio2_7.dll", "xaudio2_9.dll", "dbghelp.dll",
     "version.dll", "imm32.dll", "dwmapi.dll", "setupapi.dll", "iphlpapi.dll", "winhttp.dll", "wininet.dll", "crypt32.dll",
     "bcrypt.dll", "d3dcompiler_47.dll", "dinput8.dll", "hid.dll", "psapi.dll", "powrprof.dll", "secur32.dll", "normaliz.dll",
-    "steam_api64.dll", NULL };
+    "steam_api64.dll", "xaudio2_9redist.dll", "x3daudio1_7.dll", NULL };
 #define HLE_MOD_BASE 0x7FF00000ull
+#define SKIP_MOD_BASE 0x7FE00000ull
+void hle_set_error(uint32_t e);
+static char skipped[32][64];
+static int nskipped;
+void guest_to_host(const char* guest, char* out, size_t cap);
 
 static uint64_t module_handle(const char* name)
 {
@@ -240,7 +255,37 @@ static uint64_t module_handle(const char* name)
     if (!strncmp(tmp, "api-ms-win-", 11) || !strncmp(tmp, "ext-ms-", 7)) return HLE_MOD_BASE;
     for (int i = 0; hle_modules[i]; i++)
         if (!strcmp(hle_modules[i], tmp)) return HLE_MOD_BASE + 0x10000ull * (i + 1);
+    for (int i = 0; i < nskipped; i++) if (!strcmp(skipped[i], tmp)) return SKIP_MOD_BASE + 0x10000ull * (uint64_t)i;
     return 0;
+}
+
+/* DLLs the build leaves out on purpose (GPU vendor upscalers, ML runtimes, crash reporters): a game that loads one
+   gets a stand-in module so plugins that only check for the file carry on; it exports nothing */
+static int skipped_dll(const char* lower)
+{
+    static const char* pat[] = { "nvngx", "sl.", "libxess", "libxell", "amd_fidelityfx", "ffx_", "directml", "crashpad",
+                                 "msquic", "nvlowlatency", "gfsdk_aftermath", "winpixeventruntime", "openimagedenoise", "gfnruntimesdk", 0 };
+    for (int i = 0; pat[i]; i++) if (!strncmp(lower, pat[i], strlen(pat[i])) || (strstr(lower, pat[i]) && pat[i][strlen(pat[i]) - 1] != '.')) return 1;
+    return 0;
+}
+static uint64_t load_skipped(const char* name)
+{
+    const char* base = name;
+    for (const char* p = name; *p; p++) if (*p == 92 || *p == '/') base = p + 1;
+    char tmp[260];
+    snprintf(tmp, sizeof tmp, "%s", base);
+    for (char* p = tmp; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+    if (!strchr(tmp, '.')) strcat(tmp, ".dll");
+    if (!skipped_dll(tmp) || nskipped >= 32) return 0;
+    if (base != name) {
+        char host[1200];
+        HostStat st;
+        guest_to_host(name, host, sizeof host);
+        if (!host_stat(host, &st)) return 0;
+    }
+    for (int i = 0; i < nskipped; i++) if (!strcmp(skipped[i], tmp)) return SKIP_MOD_BASE + 0x10000ull * (uint64_t)i;
+    snprintf(skipped[nskipped], sizeof skipped[0], "%s", tmp);
+    return SKIP_MOD_BASE + 0x10000ull * (uint64_t)nskipped++;
 }
 
 HLE(GetModuleHandleA) { RET(module_handle(A1 ? GSTR(A1) : NULL)); }
@@ -258,8 +303,8 @@ static void note_load(const char* n, uint64_t h)
     if (nseen < 256) seen[nseen++] = k;
     host_log(h ? "[load] LoadLibrary(%s)" : "[load] LoadLibrary(%s) failed", n);
 }
-HLE(LoadLibraryA) { uint64_t h = module_handle(GSTR(A1)); note_load(GSTR(A1), h); RET(h); }
-HLE(LoadLibraryW) { char n[520]; wstr_to_utf8(A1, n, sizeof n); uint64_t h = module_handle(n); note_load(n, h); RET(h); }
+HLE(LoadLibraryA) { uint64_t h = module_handle(GSTR(A1)); if (!h) h = load_skipped(GSTR(A1)); note_load(GSTR(A1), h); RET(h); }
+HLE(LoadLibraryW) { char n[520]; wstr_to_utf8(A1, n, sizeof n); uint64_t h = module_handle(n); if (!h) h = load_skipped(n); note_load(n, h); RET(h); }
 HLE(LoadLibraryExA) { hle_LoadLibraryA(c); }
 HLE(LoadLibraryExW) { hle_LoadLibraryW(c); }
 HLE(FreeLibrary) { RET(1); }
@@ -267,20 +312,35 @@ HLE(GetProcAddress)
 {
     uint64_t h = A1;
     const char* name = A2 < 0x10000 ? (const char*)(uintptr_t)A2 : GSTR(A2);
+    /* a stand-in module exports nothing: callers that look functions up see them missing and skip the feature */
+    if (h >= SKIP_MOD_BASE && h < HLE_MOD_BASE) { hle_set_error(127); RET(0); return; }
     if (h >= HLE_MOD_BASE && A2 < 0x10000) {
         GuestFn hle_by_ordinal(const char* dll, const char* name);
         uint64_t i = (h - HLE_MOD_BASE) / 0x10000;
         char ord[16];
         snprintf(ord, sizeof ord, "#%u", (unsigned)A2);
         GuestFn f = i >= 1 && i <= sizeof hle_modules / sizeof *hle_modules - 1 ? hle_by_ordinal(hle_modules[i - 1], ord) : NULL;
+        if (!f) { static int said; if (said++ < 40) host_log("[load] GetProcAddress(%s, %s) not implemented", i >= 1 && i <= sizeof hle_modules / sizeof *hle_modules - 1 ? hle_modules[i - 1] : "?", ord); }
         RET(f ? rt_dyn_thunk(f, ord) : 0);
         return;
     }
-    if (h >= HLE_MOD_BASE) { RET(rt_thunk_by_name(name)); return; }
+    if (h >= HLE_MOD_BASE) {
+        uint64_t t = rt_thunk_by_name(name);
+        static int said;
+        if (!t && said++ < 40) host_log("[load] GetProcAddress(%s, %s) not implemented", (h - HLE_MOD_BASE) / 0x10000 >= 1 ? hle_modules[(h - HLE_MOD_BASE) / 0x10000 - 1] : "system", name);
+        RET(t);
+        return;
+    }
     uint64_t hle_export_override(const char* module, const char* name);
     const ModuleInfo* m = A2 >= 0x10000 ? rt_module_at(h) : NULL;
     uint64_t o = m ? hle_export_override(m->name, name) : 0;
-    RET(o ? o : rt_get_export(h, name));
+    uint64_t r = o ? o : rt_get_export(h, name);
+    if (!r) {
+        static int said;
+        const ModuleInfo* mi = rt_module_at(h);
+        if (said++ < 40) host_log("[load] GetProcAddress(%s, %s) not found", mi ? mi->name : "?", A2 < 0x10000 ? "#ordinal" : name);
+    }
+    RET(r);
 }
 
 static void module_path(uint64_t h, char* out, size_t cap)

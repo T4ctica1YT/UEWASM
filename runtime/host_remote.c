@@ -32,7 +32,7 @@ EM_ASYNC_JS(int, uew_rf_read, (int id, double off, int len, uint8_t* dst), {
 EM_JS(void, uew_rf_start, (int id, double off, int len), { Module.uewFiles.start(id, off, len); });
 EM_JS(int, uew_rf_ready, (int id, double off, int len), { return Module.uewFiles.ready(id, off, len); });
 static int rf_ready(GThread* t) { return uew_rf_ready((int)t->block_a, (double)t->block_b, (int)t->block_n); }
-__attribute__((constructor)) static void rf_names(void) { sched_name_check(rf_ready, "file download", NULL); }
+INIT_FN(rf_names) { sched_name_check(rf_ready, "file download", NULL); }
 
 typedef struct { int id; uint64_t size, pos; } RFile;
 

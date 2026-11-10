@@ -37,7 +37,8 @@ typedef struct DxShader {
 int dxbc_translate(const uint8_t* code, size_t size, DxShader* out);
 void dxbc_free(DxShader* s);
 
-typedef struct DxSlot { int used, dim, ret, compare, buffer, raw, structured, stride, atomic, written, nofilter; } DxSlot;
+/* merged: read-only buffer read from the shared overflow buffer (binding 176), 1-based index into its header */
+typedef struct DxSlot { int used, dim, ret, compare, buffer, raw, structured, stride, atomic, written, nofilter, merged; } DxSlot;
 
 typedef struct DxWgsl {
     int stage;
@@ -53,6 +54,7 @@ typedef struct DxWgsl {
     int nout;                               /* output registers */
     int gs_in, gs_maxout, gs_topo, gs_inst; /* geometry shaders: input vertices, max output, output topology, instances */
     char interp[32];                        /* pixel shaders: D3D interpolation mode per input location (0 = linear) */
+    int nmerged;
     char error[256];
 } DxWgsl;
 
@@ -61,6 +63,8 @@ typedef struct DxWgsl {
 typedef struct DxWgslOpts {
     const DxSig* vs_out;
     uint32_t depth_srv[4];
+    /* integer SRVs whose texture is a 32-bit float format (D3D reinterprets the bits): declared f32, loads bitcast */
+    uint32_t float_srv[4];
     const char* uav_format[8];
     /* lib: only declarations and <prefix>uew_body(), names prefixed, bindings from group `group`, for splicing into a compute shader */
     const char* prefix;
@@ -69,6 +73,8 @@ typedef struct DxWgslOpts {
     const char* out_interp;
     /* pixel shaders: honour the declared interpolation modes (the vertex side must then be built with out_interp) */
     int use_interp;
+    /* storage buffers per stage the device allows (0 = 16) */
+    int max_storage;
 } DxWgslOpts;
 
 const char* dxbc_wgsl_helpers(void);

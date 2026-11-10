@@ -66,12 +66,37 @@ static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n) { memcpy(m + (uint
 #define LD16(a) ld16_(MEMB, (a))
 #define LD32(a) ld32_(MEMB, (a))
 #define LD64(a) ld64_(MEMB, (a))
+#if defined(UEW_STORE_CHECK) && defined(LIFTED)
+/* debug builds: stores with high address bits (a fault on Windows, wrapped here) or into read-only image ranges */
+void rt_bad_store(uint64_t a, const char* fn);
+#define SCHK(a) (((((uint64_t)(a) - UEW_RO_LO) < (UEW_RO_HI - UEW_RO_LO)) | ((uint64_t)(a) >> 32 != 0)) ? rt_bad_store((a), __func__) : (void)0)
+#define ST8(a, v) (SCHK(a), st8_(MEMB, (a), (v)))
+#define ST16(a, v) (SCHK(a), st16_(MEMB, (a), (v)))
+#define ST32(a, v) (SCHK(a), st32_(MEMB, (a), (v)))
+#define ST64(a, v) (SCHK(a), st64_(MEMB, (a), (v)))
+#else
 #define ST8(a, v) st8_(MEMB, (a), (v))
 #define ST16(a, v) st16_(MEMB, (a), (v))
 #define ST32(a, v) st32_(MEMB, (a), (v))
 #define ST64(a, v) st64_(MEMB, (a), (v))
+#endif
 #define XLD(a, n) xld_(MEMB, (a), (n))
+#if defined(UEW_STORE_CHECK) && defined(LIFTED)
+#define XST(a, x, n) (SCHK(a), xst_(MEMB, (a), (x), (n)))
+#else
 #define XST(a, x, n) xst_(MEMB, (a), (x), (n))
+#endif
+
+/* locked instructions: one lock per address stripe when guest threads run on several cores, nothing otherwise */
+#ifdef UEW_THREADS
+void rt_atomic_begin(uint64_t a);
+void rt_atomic_end(uint64_t a);
+#define ATOMIC_BEGIN(a) rt_atomic_begin(a)
+#define ATOMIC_END(a) rt_atomic_end(a)
+#else
+#define ATOMIC_BEGIN(a) ((void)0)
+#define ATOMIC_END(a) ((void)0)
+#endif
 
 #define XLANE8(x, i) ((uint64_t)(x).b[i])
 #define XLANE16(x, i) ((uint64_t)(x).w[i])
@@ -81,6 +106,14 @@ static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n) { memcpy(m + (uint
 #define XSETLANE16(x, i, v) ((x).w[i] = (uint16_t)(v))
 #define XSETLANE32(x, i, v) ((x).d[i] = (uint32_t)(v))
 #define XSETLANE64(x, i, v) ((x).q[i] = (uint64_t)(v))
+
+/* functions run before main */
+#ifdef _MSC_VER
+#pragma section(".CRT$XCU", read)
+#define INIT_FN(f) static void f(void); __declspec(allocate(".CRT$XCU")) void (*f##_init_)(void) = f; static void f(void)
+#else
+#define INIT_FN(f) __attribute__((constructor)) static void f(void)
+#endif
 
 /* flag helpers must inline: next to the instruction that set the flags they fold to a plain compare */
 #ifdef _MSC_VER
@@ -233,10 +266,13 @@ GuestFn rt_ic_fn(CPU* c, uint64_t target, IC* ic);
 #endif
 void rt_trap(CPU* c, uint64_t pc, const char* what);
 void rt_cpuid(CPU* c);
+extern uint64_t rt_div_ip;   /* guest address of the division being run (divide error reports) */
 void rt_fxsave(CPU* c, uint64_t a);
 void rt_fxrstor(CPU* c, uint64_t a);
 void rt_pause(CPU* c);
 void rt_xgetbv(CPU* c);
+uint64_t rt_crc32(uint64_t crc, uint64_t v, int bytes);
+uint64_t rt_pcmpstr(Flags* f, XMM* x0, XMM a, XMM b, int imm, int64_t la, int64_t lb, int expl, int mask);
 void rt_rdtsc(CPU* c);
 void rt_div8(CPU* c, uint64_t s);
 void rt_div16(CPU* c, uint64_t s);

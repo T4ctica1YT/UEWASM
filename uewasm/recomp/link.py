@@ -8,7 +8,7 @@ from . import pe as pemod
 
 SYSTEM = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
 RUNTIME_DLLS = {"ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
-                "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "concrt140.dll", "vccorlib140.dll"}
+                "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "concrt140.dll", "vccorlib140.dll", "msvcrt.dll"}
 # Stateless functions that are faster as host code. Anything that touches CRT state stays recompiled.
 PURE = {"memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strcmp", "strncmp", "strchr", "strrchr", "strstr",
         "wcslen", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sqrt", "exp", "log", "log10", "pow", "fmod",
@@ -16,7 +16,9 @@ PURE = {"memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strcmp", "
         "powf", "fmodf", "floorf", "ceilf", "hypot", "hypotf", "sinh", "cosh", "tanh", "round", "roundf", "trunc", "truncf",
         "log2", "log2f", "exp2", "exp2f", "cbrt", "ldexp", "frexp", "modf", "modff"}
 THUNK_BASE = 0x10000
-ORDINALS = {"ws2_32.dll": {1: "accept", 2: "bind", 3: "closesocket", 4: "connect", 5: "getpeername", 6: "getsockname", 7: "getsockopt",
+ORDINALS = {"xaudio2_9redist.dll": {1: "XAudio2Create", 2: "CreateAudioReverb", 3: "CreateAudioVolumeMeter", 4: "CreateFX",
+                                   5: "X3DAudioCalculate", 6: "X3DAudioInitialize"},
+            "ws2_32.dll": {1: "accept", 2: "bind", 3: "closesocket", 4: "connect", 5: "getpeername", 6: "getsockname", 7: "getsockopt",
                            8: "htonl", 9: "htons", 10: "ioctlsocket", 11: "inet_addr", 12: "inet_ntoa", 13: "listen", 14: "ntohl",
                            15: "ntohs", 16: "recv", 17: "recvfrom", 18: "select", 19: "send", 20: "sendto", 21: "setsockopt",
                            22: "shutdown", 23: "socket", 51: "gethostbyaddr", 52: "gethostbyname", 53: "getprotobyname",
@@ -27,8 +29,25 @@ ORDINALS = {"ws2_32.dll": {1: "accept", 2: "bind", 3: "closesocket", 4: "connect
 FIRST_BASE = 0x00400000
 
 
+# shipped DLLs that are served by the runtime instead (XAudio2 2.9, dbghelp) or never used in a browser build (denoisers,
+# streaming-service SDKs, browsers, VR)
 SKIP_DLLS = re.compile(r"(libcef|chrome_elf|libegl|libglesv2|d3dcompiler|gfsdk_aftermath|winpixeventruntime|dxgi|d3d1\d|"
-                       r"steam_api|nvtt|embree|tbb|libsndfile|ue4prereq|crashreport|unrealcefsubprocess|steamvr|openvr|oculus|libovr)", re.I)
+                       r"steam_api|nvtt|embree|tbb|libsndfile|ue4prereq|crashreport|unrealcefsubprocess|steamvr|openvr|oculus|libovr|"
+                       r"xaudio2_\d|openimagedenoise|gfnruntimesdk|dbghelp|nvngx|^sl\.|libxess|libxell|amd_fidelityfx|ffx_|directml|"
+                       r"crashpad|msquic|nvlowlatency|reflex|^api-ms-win-|^ext-ms-win-|^xinput[0-9]|^x3daudio|beclient|easyanticheat|gfesdk)", re.I)
+
+
+_sys_ords = {}
+
+
+def system_ord_name(dll, ordinal):
+    """The name Windows' own copy of a DLL exports under an ordinal, for imports by number."""
+    if dll not in _sys_ords:
+        try:
+            _sys_ords[dll] = pemod.load(SYSTEM / dll).ord_names if (SYSTEM / dll).is_file() else {}
+        except Exception:
+            _sys_ords[dll] = {}
+    return _sys_ords[dll].get(ordinal)
 
 
 def game_dlls(exe):
@@ -95,6 +114,9 @@ class Linker:
 
     def find(self, dll):
         n = apiset(dll)
+        # left to the runtime: API-set forwarders a game ships, and DLLs the browser can't use
+        if SKIP_DLLS.search(n):
+            return None
         if n not in RUNTIME_DLLS and (SYSTEM / n).is_file():
             return None
         for d in self.search:
@@ -150,8 +172,10 @@ class Linker:
 
     def resolve(self, dll, name, depth=0):
         n = apiset(dll)
-        if name.startswith("#") and n in ORDINALS and n not in self.modules:
-            name = ORDINALS[n].get(int(name[1:]), name)
+        if name.startswith("#") and n not in self.modules:
+            name = ORDINALS[n].get(int(name[1:]), name) if n in ORDINALS else name
+            if name.startswith("#"):
+                name = system_ord_name(n, int(name[1:])) or name
         if name in PURE and name in self.hle:
             return self.thunk(name, n)
         m = self.modules.get(n)
