@@ -65,7 +65,8 @@ This project is in its early stages, meaning not all games work. Here are the ga
 | Game | Status | FPS |
 |---|---|---|
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area|
-| Dispatch | ✅ Works | >60 FPS |
+| Dispatch | ✅ Perfect | >60 FPS |
+| Hello Neighbor: Renovated | ✅ Works (Visual Bugs) | 30-40 FPS |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -145,6 +146,12 @@ Edge/Chrome).
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
 - Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call
   (`coverage` lists what a build still misses).
+
+## Extra Credits
+
+- **[teaser.lua](https://github.com/teaserlua)** - Tester
+
+- **[NotRexed](https://github.com/notrexed)** - Kept his tool (Rexedcomp) private / Inspired the making of UEWASM
 
 > [AI Use Disclosure]
 > This project was made mostly by AI, but WAS overlooked and corrected by a human.
