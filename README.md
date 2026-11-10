@@ -63,7 +63,7 @@ To build the desktop app: `pip install pyinstaller`, then `python build_exe.py` 
 This project is in its early stages, meaning not all games work. Here are the games used for Testing and some screenshots of the tool working
 
 | Game | Status | FPS | UE Version |
-|---|---|---|
+|---|---|---|---|
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 |
 | Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? |
