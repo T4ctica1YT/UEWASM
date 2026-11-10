@@ -22,7 +22,7 @@ is implemented yet.
 <br>
 
 > [!IMPORTANT]
-> This repository **does not contain any games or built recomplilations**.
+> This repository **does not contain any games or built recomplilations, this project is also not affiliated with Epic Games or any Publishers (or else) of games mentioned**.
 > You need your own copy of any game you would like to recompile. Everything this tool creates 
 > comes from your game and stays on your PC. Never share the generated files publicly.
 
