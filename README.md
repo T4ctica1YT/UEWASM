@@ -166,7 +166,7 @@ Edge/Chrome).
 
 - **[teaser.lua](https://github.com/teaserlua)** - Tester
 
-- **[NotRexed](https://github.com/notrexed)** - Kept his tool (Rexedcomp) private / Inspired the making of UEWASM
+- **[NotRexed](https://github.com/notrexed)** - Took too long to make his tool (Rexcomp) / Inspired the making of UEWASM
 
 > [AI Use Disclosure]
 > This project was made mostly by AI, but WAS overlooked and corrected by a human.
