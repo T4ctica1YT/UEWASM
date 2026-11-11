@@ -69,7 +69,7 @@ Here are the games used for Testing and some screenshots of the tool working
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 |
 | Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? |
-|Dead as Disco|✅ Works | 30-50 FPS| UE 5.7.4 |
+|Dead as Disco| ➖ Boots | 30-50 FPS| UE 5.7.4 |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
