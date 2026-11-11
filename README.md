@@ -158,8 +158,7 @@ Edge/Chrome).
 - Unreal Engine 5 support is early: UE5 games boot and reach their menus, but some 3D scenes still render dark or
   without their background, and they run slower than UE4 titles.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.
-- Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call
-  (`coverage` lists what a build still misses).
+- Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call.
 
 ## Extra Credits
 
