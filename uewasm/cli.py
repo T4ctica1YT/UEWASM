@@ -54,6 +54,15 @@ def cmd_recomp(a):
         search = sorted({str(d.parent) for d in extra})
     root = Path(root)
     exe_rel = exe.relative_to(root).as_posix()
+    aes = None
+    if a.aes_key:
+        from .recomp import upak
+        aes = upak.parse_key(a.aes_key)
+        if not aes:
+            sys.exit("--aes-key should be 64 hex digits (0x optional) or base64 of 32 bytes")
+        bad = [p.name for p in upak.encrypted_paks(root) if not upak.check_key(p, aes)]
+        if bad:
+            sys.exit(f"the AES key is wrong for {', '.join(bad[:5])}; give the game's own correct key")
     from .recomp import resources
     resources.set_mode(a.priority)
     resources.lower_this_process()
@@ -71,7 +80,7 @@ def cmd_recomp(a):
         web = build.build_wasm(out, opt=a.opt, threads=a.threads, renderer=a.renderer, game_root=root, exe_rel=exe_rel,
                                size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
-                               backend=a.backend, placeholders=a.placeholders)
+                               backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
 
 
@@ -114,6 +123,7 @@ def main(argv=None):
     r.add_argument("--threads", choices=list(CHOICES["threads"]), default="coop")
     r.add_argument("--opt", choices=list(CHOICES["opt"]), default="-O2")
     r.add_argument("--mem-mb", type=int, default=3072, help="guest memory (the browser limit is 4096 total)")
+    r.add_argument("--mem-limit-gb", type=float, default=8, help="most memory the running game may use in all (game, file cache, video memory)")
     r.add_argument("--resolution", default="1280x720", help="render size; the page scales it to the window")
     r.add_argument("--part-mb", type=int, default=16, help="largest file written for the web host (Cloudflare Pages allows 25)")
     r.add_argument("--compress", action="store_true", help="compress game files (not audio) for a smaller download")
@@ -123,6 +133,7 @@ def main(argv=None):
                    help="high: fastest, tuned to this PC; low: far less CPU and memory so the PC stays usable (same result)")
     r.add_argument("--backend", choices=["epic"], default=None,
                    help="offline stand-in for a game's online services (epic: Epic accounts, profiles and menus)")
+    r.add_argument("--aes-key", help="the game's AES-256 pak key (hex or base64): checked against its encrypted paks, which are packaged decrypted")
     r.add_argument("--placeholders", action="store_true", help="with --backend: stand-in images and data for files the servers would send")
     r.add_argument("--no-debug-panel", action="store_true", help="leave out the UEWASM debug panel toggle (\\ or Insert in game)")
     r.add_argument("--wasm-opt", action="store_true", help="run Binaryen on the linked module: ~10%% smaller, needs ~20x its size in RAM")

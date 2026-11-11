@@ -30,6 +30,8 @@ for i in range(16):
 
 IMM = {OK.IMMEDIATE8, OK.IMMEDIATE8_2ND, OK.IMMEDIATE16, OK.IMMEDIATE32, OK.IMMEDIATE64,
        OK.IMMEDIATE8TO16, OK.IMMEDIATE8TO32, OK.IMMEDIATE8TO64, OK.IMMEDIATE32TO64}
+# selector values a 32-bit Windows process sees
+SEGS = {I.Register.CS: 0x23, I.Register.SS: 0x2B, I.Register.DS: 0x2B, I.Register.ES: 0x2B, I.Register.FS: 0x53, I.Register.GS: 0x2B}
 MASK = {1: "0xFFull", 2: "0xFFFFull", 4: "0xFFFFFFFFull", 8: "~0ull"}
 UT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 ST = {1: "int8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}
@@ -59,7 +61,22 @@ class Program:
         self.comments = False
         self.unsupported = Counter()
         self.unsupported_at = defaultdict(list)
-        self.sj_slots = {base + i.iat_rva for i in pe.imports if i.name in SETJMP}
+        self.sj_slots = {base + i.iat_rva for i in pe.imports if i.name in SETJMP} if pe.bits == 64 else set()
+        self.bits = pe.bits
+        self.ptr = pe.bits // 8
+        self.sj_funcs = self.find_setjmp32() if pe.bits == 32 else set()
+
+    def find_setjmp32(self):
+        """MSVC's static _setjmp/_setjmp3 (no symbols in a shipped exe): mov edx,[esp+4] then ebp/ebx/edi/esi/esp into the buffer"""
+        sig = bytes.fromhex("8B54240489 2A895A04897A0889720C896210".replace(" ", ""))
+        found = set()
+        for s in self.text:
+            blob = self.img[s.rva:s.rva + s.vsize]
+            i = blob.find(sig)
+            while i >= 0:
+                found.add(self.base + s.rva + i)
+                i = blob.find(sig, i + 1)
+        return found
 
     def is_setjmp(self, t):
         """t is the IAT slot of _setjmp, or a 'jmp [slot]' import stub for it"""
@@ -119,7 +136,7 @@ class Program:
         ins = self.cache.get(a)
         if ins is None:
             rva = a - self.base
-            d = I.Decoder(64, self.img[rva:rva + 16], ip=a)
+            d = I.Decoder(self.bits, self.img[rva:rva + 16], ip=a)
             ins = d.decode()
             self.cache[a] = ins
         return ins
@@ -136,9 +153,11 @@ class Program:
             if isinstance(rva, int) and self.in_code(self.base + rva):
                 self.roots.add(self.base + rva)
         for rva in pe.relocs:
-            v = int.from_bytes(self.img[rva:rva + 8], "little")
+            v = int.from_bytes(self.img[rva:rva + self.ptr], "little")
             if self.in_code(v) and not self.in_code(self.base + rva):
                 self.roots.add(v)
+        if self.bits == 32:
+            self.data_pointers()
         self.starts = sorted(self.roots)
         work = list(self.roots)
         seen = set()
@@ -174,6 +193,20 @@ class Program:
                 work += [t for t in extra if t not in self.roots]
         return self
 
+    def data_pointers(self):
+        """32-bit images often carry no relocations: every aligned word in the data sections that points into code is
+        taken as a function (vtables, callback tables, function pointer globals)"""
+        lo = min(s.rva for s in self.text) + self.base
+        hi = max(s.rva + s.vsize for s in self.text) + self.base
+        for s in self.pe.sections:
+            if s.executable:
+                continue
+            blob = self.img[s.rva:s.rva + s.vsize]
+            for o in range(0, len(blob) - 3, 4):
+                v = int.from_bytes(blob[o:o + 4], "little")
+                if lo <= v < hi and self.in_code(v):
+                    self.roots.add(v)
+
     def region_end(self, r):
         if r in self.ends:
             return self.ends[r]
@@ -194,7 +227,7 @@ class Program:
             if rva < 0:
                 continue
             got = []
-            for x in I.Decoder(64, self.img[rva:rva + back + 16], ip=a):
+            for x in I.Decoder(self.bits, self.img[rva:rva + back + 16], ip=a):
                 if x.ip >= ins.ip or x.code == I.Code.INVALID:
                     break
                 got.append(x)
@@ -207,21 +240,62 @@ class Program:
     def jump_table(self, r, end, insns):
         targets = set()
         bound = None
+        # the bound is a compare on the table's index register (or a register copied into it); a compare on anything
+        # else nearby says nothing about the table's length
+        load = None
         for ins in insns:
-            if MN[ins.mnemonic] == "CMP" and ins.op_count == 2 and ins.op_kind(0) == OK.REGISTER and ins.op_kind(1) in IMM:
+            k = 0 if MN[ins.mnemonic] == "JMP" else 1
+            if MN[ins.mnemonic] in ("MOV", "MOVSXD", "JMP") and ins.op_count > k and ins.op_kind(k) == OK.MEMORY \
+                    and ins.memory_index != I.Register.NONE and ins.memory_index_scale == 4:
+                load = ins
+        alias = set()
+        if load is not None and load.memory_index in REG:
+            alias.add(REG[load.memory_index][1])
+        for ins in reversed(insns):
+            if load is not None and ins.ip >= load.ip:
+                continue
+            m = MN[ins.mnemonic]
+            if m in ("MOV", "MOVZX", "MOVSXD") and ins.op_count == 2 and ins.op_kind(0) == OK.REGISTER and ins.op_register(0) in REG \
+                    and REG[ins.op_register(0)][1] in alias:
+                if ins.op_kind(1) == OK.REGISTER and ins.op_register(1) in REG:
+                    alias.add(REG[ins.op_register(1)][1])
+                elif ins.op_kind(1) == OK.MEMORY and ins.memory_index in REG:
+                    alias.add(REG[ins.memory_index][1])
+            elif m == "CMP" and ins.op_count == 2 and ins.op_kind(0) == OK.REGISTER and ins.op_kind(1) in IMM \
+                    and ins.op_register(0) in REG and REG[ins.op_register(0)][1] in alias:
                 v = ins.immediate(1)
                 if 0 <= v < 4096:
                     bound = v + 1
+                break
         # two-level tables (MSVC for sparse cases): movzx idx, byte [base + idx + bytes]; mov t, [base + idx*4 + dwords]. The
         # compare bounds the byte table; the dword table has one entry per distinct value in it
         if bound:
             # the byte lookup right before the table load (an earlier movzx may read something else entirely)
             for ins in reversed(insns):
                 if MN[ins.mnemonic] == "MOVZX" and ins.op_kind(1) == OK.MEMORY and I.MemorySizeInfo(ins.memory_size).size == 1                         and ins.memory_index != I.Register.NONE and ins.memory_index_scale == 1:
-                    bt = ins.memory_displacement & 0xFFFFFFFF
+                    bt = (ins.memory_displacement & 0xFFFFFFFF) - (self.base if self.bits == 32 else 0)
                     if 0 < bt and bt + bound <= len(self.img):
                         bound = max(self.img[bt:bt + bound]) + 1
                     break
+        if self.bits == 32:
+            # absolute tables: jmp [table + idx*4] (or a load of one), entries are addresses
+            for ins in insns:
+                k = 0 if MN[ins.mnemonic] == "JMP" else 1
+                if MN[ins.mnemonic] not in ("JMP", "MOV") or ins.op_count <= k or ins.op_kind(k) != OK.MEMORY \
+                        or ins.memory_index == I.Register.NONE or ins.memory_index_scale != 4 or ins.memory_base != I.Register.NONE:
+                    continue
+                tbl = (ins.memory_displacement & 0xFFFFFFFF) - self.base
+                if not (0 < tbl < self.pe.image_size):
+                    continue
+                for n in range(bound or 1024):
+                    p = tbl + 4 * n
+                    if p + 4 > len(self.img):
+                        break
+                    t = int.from_bytes(self.img[p:p + 4], "little")
+                    if not self.in_code(t):
+                        break
+                    targets.add(t)
+            return targets
         for ins in insns:
             if MN[ins.mnemonic] in ("MOV", "MOVSXD") and ins.op_count == 2 and ins.op_kind(1) == OK.MEMORY \
                     and ins.memory_index != I.Register.NONE and ins.memory_index_scale == 4 \
@@ -326,6 +400,13 @@ class Program:
                     break
                 if MN[ins.mnemonic] == "LEA" and ins.is_ip_rel_memory_operand and self.in_code(ins.ip_rel_memory_address):
                     extra.add(ins.ip_rel_memory_address)
+                if self.bits == 32:
+                    # push offset fn / mov [x], offset fn
+                    for i in range(ins.op_count):
+                        if ins.op_kind(i) in (OK.IMMEDIATE32, OK.IMMEDIATE8TO32):
+                            v = ins.immediate(i) & 0xFFFFFFFF
+                            if self.in_code(v):
+                                extra.add(v)
                 a = nxt
         self.ends.setdefault(r, end)
         return labels, extra
@@ -517,6 +598,11 @@ class Func:
 
     # ---- data movement
     def op_MOV(self, ins):
+        if ins.op_kind(0) == OK.REGISTER and ins.op_register(0) in SEGS:
+            return
+        if ins.op_kind(1) == OK.REGISTER and ins.op_register(1) in SEGS:
+            self.wr(0, h(SEGS[ins.op_register(1)]))
+            return
         if ins.op_kind(0) == OK.REGISTER and self.reg(ins.op_register(0))[0] == "x":
             raise Unsupported("mov xmm")
         self.wr(0, self.rd(1, self.size(0)))
@@ -539,13 +625,34 @@ class Func:
         self.emit("}")
 
     def op_PUSH(self, ins):
+        if self.p.bits == 32:
+            v = self.rd(0, 4) if ins.op_kind(0) not in IMM else h(ins.immediate(0) & 0xFFFFFFFF)
+            self.emit(f"{{ uint64_t v_ = {v}; R(4) -= 4; ST32(R(4), v_); }}")
+            return
         v = self.rd(0, 8) if ins.op_kind(0) not in IMM else h(ins.immediate(0))
         self.emit(f"{{ uint64_t v_ = {v}; R(4) -= 8; ST64(R(4), v_); }}")
 
     def op_POP(self, ins):
-        self.emit("{ uint64_t v_ = LD64(R(4)); R(4) += 8;")
+        if self.p.bits == 32:
+            self.emit("{ uint64_t v_ = LD32(R(4)); R(4) += 4;")
+        else:
+            self.emit("{ uint64_t v_ = LD64(R(4)); R(4) += 8;")
         self.wr(0, "v_")
         self.emit("}")
+
+    def op_PUSHAD(self, ins):
+        self.emit("{ uint64_t s_ = R(4); R(4) -= 32; ST32(R(4) + 28, R(0)); ST32(R(4) + 24, R(1)); ST32(R(4) + 20, R(2)); ST32(R(4) + 16, R(3));"
+                  " ST32(R(4) + 12, s_); ST32(R(4) + 8, R(5)); ST32(R(4) + 4, R(6)); ST32(R(4), R(7)); }")
+
+    def op_POPAD(self, ins):
+        self.emit("R(7) = LD32(R(4)); R(6) = LD32(R(4) + 4); R(5) = LD32(R(4) + 8); R(3) = LD32(R(4) + 16); R(2) = LD32(R(4) + 20);"
+                  " R(1) = LD32(R(4) + 24); R(0) = LD32(R(4) + 28); R(4) += 32;")
+
+    def op_PUSHFD(self, ins):
+        self.emit("R(4) -= 4; ST32(R(4), rt_flags(&F));")
+
+    def op_POPFD(self, ins):
+        self.emit("rt_setflags(&F, LD32(R(4))); R(4) += 4;")
 
     def op_PUSHFQ(self, ins):
         self.emit("R(4) -= 8; ST64(R(4), rt_flags(&F));")
@@ -569,7 +676,11 @@ class Func:
         self.emit("rt_setflags(&F, rt_flags(&F) ^ 1);")
 
     def op_CLD(self, ins):
-        pass
+        if self.p.bits == 32:
+            self.emit("c->df = 0;")
+
+    def op_STD(self, ins):
+        self.emit("c->df = 1;")
 
     def op_NOP(self, ins):
         pass
@@ -579,7 +690,7 @@ class Func:
 
     op_LFENCE = op_MFENCE = op_SFENCE = op_PREFETCHT0 = op_PREFETCHT1 = op_PREFETCHT2 = op_NOP
     # x87 is only touched for control/status words on x64 (CRT float setup); keep the defaults
-    op_FLDCW = op_FNINIT = op_FNCLEX = op_FWAIT = op_FNOP = op_NOP
+    op_FLDCW = op_FNINIT = op_FNCLEX = op_FWAIT = op_WAIT = op_FNOP = op_NOP
 
     def op_FNSTCW(self, ins):
         self.wr(0, "0x27F")
@@ -588,9 +699,13 @@ class Func:
         self.wr(0, "0")
 
     op_FSTCW, op_FSTSW, op_FINIT, op_FCLEX = op_FNSTCW, op_FNSTSW, op_NOP, op_NOP
-    op_PREFETCHNTA = op_PREFETCHW = op_ENDBR64 = op_NOP
+    op_PREFETCHNTA = op_PREFETCHW = op_ENDBR64 = op_ENDBR32 = op_NOP
     # CET shadow stack: without CET these leave the register untouched
     op_RDSSPQ = op_RDSSPD = op_INCSSPQ = op_INCSSPD = op_SETSSBSY = op_SAVEPREVSSP = op_RSTORSSP = op_NOP
+
+    def op_XLATB(self, ins):
+        base = "(uint32_t)R(3)" if self.p.bits == 32 else "R(3)"
+        self.emit(f"R(0) = (R(0) & ~0xFFull) | LD8({base} + (uint8_t)R(0));")
 
     def op_CBW(self, ins):
         self.emit("R(0) = (R(0) & ~0xFFFFull) | (uint16_t)(int16_t)(int8_t)R(0);")
@@ -928,10 +1043,10 @@ class Func:
         self.emit(f"if ({self.cc(ins)}) {{ {self.target(t)} }}")
 
     def op_JMP(self, ins):
-        if ins.op_kind(0) == OK.NEAR_BRANCH64:
+        if ins.op_kind(0) in (OK.NEAR_BRANCH64, OK.NEAR_BRANCH32):
             self.emit(self.target(ins.near_branch_target))
             return True
-        v = self.rd(0, 8)
+        v = self.rd(0, self.p.ptr)
         targets = [t for t in self.p.jt.get(ins.ip, []) if t in self.labels or t in self.p.roots]
         if not targets:
             self.emit(f"{{ static IC ic_; uint64_t t_ = {v}; SPILL(); GuestFn f_ = t_ == ic_.a ? ic_.f : rt_ic_fn(c, t_, &ic_); TAIL f_(c); return; }}")
@@ -945,22 +1060,31 @@ class Func:
 
     def op_CALL(self, ins):
         nxt = h(ins.next_ip)
-        sj = ins.near_branch_target if ins.op_kind(0) == OK.NEAR_BRANCH64 else (ins.ip_rel_memory_address if ins.is_ip_rel_memory_operand else 0)
+        near = ins.op_kind(0) in (OK.NEAR_BRANCH64, OK.NEAR_BRANCH32)
+        sj = ins.near_branch_target if near else (ins.ip_rel_memory_address if ins.is_ip_rel_memory_operand else 0)
         if sj and self.p.is_setjmp(sj):
             # returns twice: the host setjmp has to live in this frame
             # after a longjmp lands here the runtime has put the restored registers in the CPU struct
             self.emit(f"{{ SPILL(); jmp_buf* sj_ = rt_sj_slot(c, R(1), R(2), {nxt}); if (!setjmp(*sj_)) R(0) = 0; else FILL(); }}")
             return
-        if ins.op_kind(0) == OK.NEAR_BRANCH64:
+        P = self.p.ptr
+        push = f"R(4) -= {P}; ST{P * 8}(R(4), {nxt});"
+        if near and ins.near_branch_target in self.p.sj_funcs:
+            # the guest setjmp fills its buffer; a host setjmp here is where a longjmp to this return address lands
             t = ins.near_branch_target
             call = f"F_{t:x}(c);" if t in self.p.roots else f"rt_call(c, {h(t)});"
-            self.emit(f"R(4) -= 8; ST64(R(4), {nxt}); SPILL(); {call} FILLV();")
+            self.emit(f"{push} SPILL(); {call} FILL(); {{ SPILL(); jmp_buf* sj_ = rt_sj_slot32(c, LD32(R(4)), {nxt}); if (setjmp(*sj_)) FILL(); }}")
+            return
+        if near:
+            t = ins.near_branch_target
+            call = f"F_{t:x}(c);" if t in self.p.roots else f"rt_call(c, {h(t)});"
+            self.emit(f"{push} SPILL(); {call} FILLV();")
         else:
-            self.emit(f"{{ static IC ic_; uint64_t t_ = {self.rd(0, 8)}; R(4) -= 8; ST64(R(4), {nxt}); SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}")
+            self.emit(f"{{ static IC ic_; uint64_t t_ = {self.rd(0, P)}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}")
 
     def op_RET(self, ins):
         extra = ins.immediate(0) if ins.op_count else 0
-        self.emit(f"R(4) += {8 + extra}; SPILL(); return;")
+        self.emit(f"R(4) += {self.p.ptr + extra}; SPILL(); return;")
         return True
 
     def op_INT3(self, ins):
@@ -978,7 +1102,10 @@ class Func:
     op_HLT = op_INT
 
     def op_LEAVE(self, ins):
-        self.emit("R(4) = R(5); R(5) = LD64(R(4)); R(4) += 8;")
+        if self.p.bits == 32:
+            self.emit("R(4) = (uint32_t)R(5); R(5) = LD32(R(4)); R(4) += 4;")
+        else:
+            self.emit("R(4) = R(5); R(5) = LD64(R(4)); R(4) += 8;")
 
     def op_FXSAVE(self, ins):
         self.emit(f"rt_fxsave(c, {self.addr()});")
@@ -1036,7 +1163,7 @@ class Func:
     op_CMPSW = op_CMPSQ = op_CMPSB
 
     def op_MOVSD(self, ins):
-        if ins.op_count == 0 or ins.op_kind(0) in (OK.MEMORY_ESRDI,):
+        if ins.op_count == 0 or ins.op_kind(0) in (OK.MEMORY_ESRDI, OK.MEMORY_ESEDI, OK.MEMORY_ESDI):
             return self._string(ins, "movs")
         return SSE["MOVSD"](self, ins, "MOVSD")
 
@@ -1054,3 +1181,4 @@ for _a, _b in (("JZ", "E"), ("JNZ", "NE"), ("JC", "B"), ("JNC", "AE")):
     setattr(Func, "op_" + _a, Func.op_Jcc)
 
 from .sse import SSE  # noqa: E402
+from . import x87  # noqa: E402,F401

@@ -279,12 +279,33 @@ static void dev_create_query(CPU* c)
     if (A3) ST64(A3, o);
     RET(0);
 }
-static void dev_check_format(CPU* c) { ST32(A3, 0x0FFFFFFF); RET(0); }
+/* FORMAT_SUPPORT bit 23 (typed UAV) only where the backend can write the format */
+static void dev_check_format(CPU* c)
+{
+    uint32_t s = 0x0FFFFFFF;
+    if (gpu && gpu->uav_store && !gpu->uav_store((uint32_t)A2)) s &= ~0x800000u;
+    ST32(A3, s);
+    RET(0);
+}
 static void dev_check_msaa(CPU* c) { ST32(A4, (uint32_t)A3 <= 1 ? 1 : (uint32_t)A3 <= 8 ? 1 : 0); RET(0); }
 static void dev_check_feature(CPU* c)
 {
+    uint32_t feature = (uint32_t)A2;
+    uint64_t d = A3;
+    if (feature == 2 || feature == 3) {
+        /* FORMAT_SUPPORT / FORMAT_SUPPORT2 for the format in the first field: typed UAV, typed store, and on tier-2
+           devices typed load (bit 0x40) */
+        uint32_t f = (uint32_t)LD32(d), ok = gpu && gpu->uav_store ? (uint32_t)gpu->uav_store(f) : 0;
+        if (feature == 2) ST32(d + 4, ok ? 0x0FFFFFFFu : 0x0F7FFFFFu);
+        else {
+            uint32_t atom = (f == 42 || f == 43) ? 0x3Fu : 0, load = (f >= 41 && f <= 43) ? 0x40u : 0;
+            ST32(d + 4, ok ? (0x80u | load | atom) : atom);
+        }
+        RET(0);
+        return;
+    }
     memset(G2H(A3), 0, (size_t)A4);
-    if ((uint32_t)A2 == 1 && A4 >= 4) ST32(A3, 1);
+    if (feature == 1 && A4 >= 4) ST32(A3, 1);
     RET(0);
 }
 static void dev_feature_level(CPU* c) { RET(0xB000); }
@@ -607,8 +628,12 @@ static void adapter_desc(CPU* c, int v1)
     utf8_to_wstr(gpu && gpu->name ? gpu->name : "Web GPU", d, 128);
     ST32(d + 256, 0x1234);
     ST32(d + 260, 0x5678);
-    ST64(d + 272, 2048ull << 20);
-    ST64(d + 288, 2048ull << 20);
+    /* video memory from the build's memory limit (UE sizes its texture pool from it); 2 GB without one */
+    extern int host_page_int(const char* name);
+    uint64_t gpu_mb = host_page_int("uewGpuMB");
+    if (!gpu_mb) gpu_mb = 2048;
+    ST64(d + 272, gpu_mb << 20);
+    ST64(d + 288, gpu_mb << 20);
     ST32(d + 296, 1);
     RET(0);
 }

@@ -14,12 +14,14 @@ from uewasm.recomp import build  # noqa: E402
 FLAGS = {".c": ["/O2", "/MD", "/GS"], ".cpp": ["/O2", "/MD", "/GS", "/EHsc", "/std:c++17"]}
 
 
-def compile_test(src, env):
-    out = HERE / "bin" / src.stem
+def compile_test(src, env, x86=False):
+    out = HERE / "bin" / (src.stem + ("32" if x86 else ""))
     out.mkdir(parents=True, exist_ok=True)
     exe = out / f"{src.stem}.exe"
+    # 32-bit builds link the CRT statically, as most 32-bit games ship
+    flags = [f.replace("/MD", "/MT") for f in FLAGS[src.suffix]] if x86 else FLAGS[src.suffix]
     if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
-        r = subprocess.run([build.tool(env, "cl"), "/nologo", *FLAGS[src.suffix], f"/Fe:{exe}", f"/Fo:{out}\\", str(src)],
+        r = subprocess.run([build.tool(env, "cl"), "/nologo", *flags, f"/Fe:{exe}", f"/Fo:{out}\\", str(src)],
                            env=env, capture_output=True, text=True, cwd=out)
         if r.returncode:
             raise RuntimeError(r.stdout[-2000:])
@@ -39,12 +41,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
     ap.add_argument("--no-wasm", action="store_true")
+    ap.add_argument("--x86", action="store_true", help="build the tests as 32-bit programs")
     a = ap.parse_args()
-    env = build.msvc_env()
+    env = build.msvc_env("x86" if a.x86 else "x64")
     srcs = sorted(p for p in HERE.iterdir() if p.suffix in FLAGS and (not a.names or p.stem in a.names))
     failed = 0
     for src in srcs:
-        exe = compile_test(src, env)
+        exe = compile_test(src, env, a.x86)
         out = exe.parent / "recomp"
         build.recompile(exe, out, mem_mb=256, log=lambda *_: None)
         native = build.build_native(out, log=lambda *_: None)

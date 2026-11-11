@@ -248,6 +248,7 @@ void host_browser_turned(void) {}
 int host_ext_waits;
 int host_query_flag(const char* name) { (void)name; return 0; }
 int host_query_int(const char* name) { (void)name; return 0; }
+int host_page_int(const char* name) { (void)name; return 0; }
 void host_frame_request(void) {}
 uint32_t host_frame_seq(void) { static uint32_t n; return ++n; }
 void host_frame_done(void) {}

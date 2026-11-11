@@ -160,8 +160,11 @@
           try {
             const t0 = performance.now();
             const r = await fetch(url(f.id, first.part), { headers: { Range: `bytes=${from}-${to - 1}` } });
-            if (r.status != 206) throw new Error(`HTTP ${r.status} for ${url(f.id, first.part)}`);
-            const buf = new Uint8Array(await r.arrayBuffer());
+            if (!r.ok) throw new Error(`HTTP ${r.status} for ${url(f.id, first.part)}`);
+            let buf = new Uint8Array(await r.arrayBuffer());
+            // a server without Range support sends the whole part
+            if (r.status == 200 && buf.length >= to) buf = buf.slice(from, to);
+            if (buf.length != to - from) throw new Error(`HTTP ${r.status}: ${buf.length} bytes for ${url(f.id, first.part)}`);
             F.fetched += buf.length;
             F.requests = (F.requests || 0) + 1;
             F.fetchMs = (F.fetchMs || 0) + performance.now() - t0;

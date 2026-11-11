@@ -53,7 +53,7 @@ HLE(MultiByteToWideChar)
         uint32_t ch = is_utf8(cp) ? utf8_next(&s, end) : *s++;
         int units = ch >= 0x10000 ? 2 : 1;
         if (cap) {
-            if (n + units > cap) { ST32(g_teb + 0x68, 122); RET(0); return; }
+            if (n + units > cap) { ST32(g_teb + TEB_ERR, 122); RET(0); return; }
             if (units == 2) { ch -= 0x10000; ST16(dst + 2 * n, 0xD800 + (ch >> 10)); ST16(dst + 2 * n + 2, 0xDC00 + (ch & 1023)); }
             else ST16(dst + 2 * n, ch);
         }
@@ -83,7 +83,7 @@ HLE(WideCharToMultiByte)
         else if (w < 0x10000) { buf[0] = 0xE0 | (w >> 12); buf[1] = 0x80 | ((w >> 6) & 63); buf[2] = 0x80 | (w & 63); k = 3; }
         else { buf[0] = 0xF0 | (w >> 18); buf[1] = 0x80 | ((w >> 12) & 63); buf[2] = 0x80 | ((w >> 6) & 63); buf[3] = 0x80 | (w & 63); k = 4; }
         if (cap) {
-            if (n + k > cap) { ST32(g_teb + 0x68, 122); RET(0); return; }
+            if (n + k > cap) { ST32(g_teb + TEB_ERR, 122); RET(0); return; }
             memcpy(G2H(dst + n), buf, (size_t)k);
         }
         n += k;
@@ -234,10 +234,10 @@ static uint64_t locale_info(CPU* c, uint32_t type, uint64_t out, int64_t cap)
         return 2;
     }
     const char* s = locale_str(type, tmp);
-    if (!s) { ST32(g_teb + 0x68, 1004); return 0; }
+    if (!s) { ST32(g_teb + TEB_ERR, 1004); return 0; }
     size_t n = strlen(s) + 1;
     if (!cap) return n;
-    if ((int64_t)n > cap) { ST32(g_teb + 0x68, 122); return 0; }
+    if ((int64_t)n > cap) { ST32(g_teb + TEB_ERR, 122); return 0; }
     utf8_to_wstr(s, out, (size_t)cap);
     (void)c;
     return n;
@@ -344,3 +344,65 @@ HLE(GetDateFormatW) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &m
 HLE(GetTimeFormatW) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &mo, &d, &h, &mi, &s); snprintf(b, sizeof b, "%d:%02d:%02d %s", h % 12 ? h % 12 : 12, mi, s, h < 12 ? "AM" : "PM"); RET(fmt_out(b, ARG(5), (int32_t)ARG(6))); }
 HLE(GetDateFormatEx) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &mo, &d, &h, &mi, &s); snprintf(b, sizeof b, "%d/%d/%d", mo, d, y); RET(fmt_out(b, ARG(5), (int32_t)ARG(6))); }
 HLE(GetTimeFormatEx) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &mo, &d, &h, &mi, &s); snprintf(b, sizeof b, "%d:%02d:%02d %s", h % 12 ? h % 12 : 12, mi, s, h < 12 ? "AM" : "PM"); RET(fmt_out(b, ARG(5), (int32_t)ARG(6))); }
+
+/* ANSI forms (32-bit CRTs call these): Latin-1 bytes widened to the wide implementations' rules */
+HLE(GetStringTypeA)
+{
+    uint32_t type = (uint32_t)A2;
+    int64_t len = (int32_t)A4;
+    if (len < 0) len = (int64_t)strlen(GSTR(A3)) + 1;
+    for (int64_t i = 0; i < len; i++) {
+        uint32_t w = (uint32_t)LD8(A3 + i);
+        ST16(ARG(5) + 2 * i, type == 1 ? ctype1(w) : type == 2 ? (w < 128 ? 1 : 0) : 0);
+    }
+    RET(1);
+}
+HLE(LCMapStringA)
+{
+    uint32_t flags = (uint32_t)A2;
+    uint64_t src = A3, dst = ARG(5);
+    int64_t len = (int32_t)A4, cap = (int32_t)ARG(6);
+    if (len < 0) len = (int64_t)strlen(GSTR(src)) + 1;
+    if (flags & 0x400) {
+        if (!cap) { RET(len + 1); return; }
+        int64_t k = 0;
+        for (int64_t i = 0; i < len && k + 1 < cap; i++) { uint8_t b = (uint8_t)LD8(src + i); if (!b) break; ST8(dst + k++, tolower(b)); }
+        ST8(dst + k++, 0);
+        RET(k);
+        return;
+    }
+    if (!cap) { RET(len); return; }
+    if (len > cap) { RET(0); return; }
+    for (int64_t i = 0; i < len; i++) {
+        int b = (int)LD8(src + i);
+        if (flags & 0x100) b = tolower(b);
+        if (flags & 0x200) b = toupper(b);
+        ST8(dst + i, b);
+    }
+    RET(len);
+}
+HLE(CompareStringA)
+{
+    uint32_t flags = (uint32_t)A2;
+    uint64_t a = A3, b = ARG(5);
+    int64_t la = (int32_t)A4, lb = (int32_t)ARG(6);
+    if (la < 0) la = (int64_t)strlen(GSTR(a));
+    if (lb < 0) lb = (int64_t)strlen(GSTR(b));
+    for (int64_t i = 0; i < la && i < lb; i++) {
+        int x = (int)LD8(a + i), y = (int)LD8(b + i);
+        if (flags & 0x11) { x = tolower(x); y = tolower(y); }
+        if (x != y) { RET(x < y ? 1 : 3); return; }
+    }
+    RET(la == lb ? 2 : la < lb ? 1 : 3);
+}
+HLE(EnumSystemLocalesA) { RET(1); }
+static uint64_t fmt_out_a(const char* s, uint64_t out, int64_t cap)
+{
+    uint64_t n = strlen(s) + 1;
+    if (!cap) return n;
+    if ((int64_t)n > cap) return 0;
+    memcpy(G2H(out), s, n);
+    return n;
+}
+HLE(GetDateFormatA) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &mo, &d, &h, &mi, &s); snprintf(b, sizeof b, "%d/%d/%d", mo, d, y); RET(fmt_out_a(b, ARG(5), (int32_t)ARG(6))); }
+HLE(GetTimeFormatA) { int y, mo, d, h, mi, s; char b[64]; cur_time(c, A3, &y, &mo, &d, &h, &mi, &s); snprintf(b, sizeof b, "%d:%02d:%02d %s", h % 12 ? h % 12 : 12, mi, s, h < 12 ? "AM" : "PM"); RET(fmt_out_a(b, ARG(5), (int32_t)ARG(6))); }

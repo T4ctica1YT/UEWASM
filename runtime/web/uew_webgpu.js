@@ -301,6 +301,34 @@ ${P.shaders.get(sh)}`); break; }
         for (let i = 0; i < dst.length; i += 32768) bin += String.fromCharCode.apply(null, dst.subarray(i, i + 32768));
         raw[mip ? `${id}m${mip}` : id] = { fmt: t.format, w: tw, h: th * L, data: btoa(bin) };
       }
+      // debug: window.uewCaptureBuf dumps the buffers the first depth-only and first multi-target draws read (base64)
+      const bufs = {};
+      if (window.uewCaptureBuf) {
+        const pick = [];
+        for (const e of cap.events) for (const d of e.draws || []) {
+          const nt = (d.targets || []).length;
+          if (!pick.some(p => p.k === "depth") && !nt && d.depth && d.depth.depthWriteEnabled) pick.push({ k: "depth", d });
+          if (!pick.some(p => p.k === "base") && nt >= 4) pick.push({ k: "base", d });
+        }
+        for (const e of cap.events) { const d = (e.draws || []).find(d => d.count === -1); if (d) { pick.push({ k: "indirect", d: { res: [[`b${d.instances}@0+0`]] } }); break; } }
+        for (const p of pick) for (const v of p.d.vbs || []) if (v[0] > 0) p.d.res.push([`b${v[1]}@0+0`]);
+        for (const p of pick) for (const grp of p.d.res || []) for (const r of grp || []) {
+          if (typeof r !== "string" || !/^b\d/.test(r) || bufs[r]) continue;
+          const m = /^b(\d+)@(\d+)\+(\d+)$/.exec(r), src = g.o[+m[1]];
+          if (!(src instanceof GPUBuffer)) continue;
+          const off = +m[2], size = Math.min(+m[3] || (src.size - off), 4 << 20) & ~3;
+          const buf = device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+          const e = device.createCommandEncoder();
+          e.copyBufferToBuffer(src, off, buf, 0, size);
+          g.queue.submit([e.finish()]);
+          await buf.mapAsync(GPUMapMode.READ);
+          const u = new Uint8Array(buf.getMappedRange());
+          let bin = "";
+          for (let i = 0; i < u.length; i += 32768) bin += String.fromCharCode.apply(null, u.subarray(i, i + 32768));
+          buf.unmap(); buf.destroy();
+          bufs[r] = btoa(bin);
+        }
+      }
       const perDraw = [];
       for (const r of cap.perDraw) {
         await r.buf.mapAsync(GPUMapMode.READ);
@@ -327,7 +355,7 @@ ${P.shaders.get(sh)}`); break; }
         }
         r.buf.unmap(); r.buf.destroy();
       }
-      Module.uewgCaptured = { events: cap.events, images: out, shaders: g.capShaders, raw, perDraw, px };
+      Module.uewgCaptured = { events: cap.events, images: out, shaders: g.capShaders, raw, perDraw, px, bufs };
       console.log(`[webgpu] captured frame ${g.frames}: ${cap.events.length} events, ${out.length} targets`);
     };
     g.capShaders = {};
@@ -347,6 +375,8 @@ ${P.shaders.get(sh)}`); break; }
 
   uewg_max_dynamic_ubo: function () { return Module.uewg.device.limits.maxDynamicUniformBuffersPerPipelineLayout; },
   uewg_max_storage: function () { return Module.uewg.device.limits.maxStorageBuffersPerShaderStage; },
+
+  uewg_has_feature: function (name) { return Module.uewg.features.has(UTF8ToString(name)) ? 1 : 0; },
 
   uewg_buffer_create: function (size, usage) {
     const g = Module.uewg;
@@ -383,7 +413,7 @@ fn si8(o: u32) -> u32 { return bitcast<u32>(i32(b8(o) << 24u) >> 24u); }
 fn si16(o: u32) -> u32 { return bitcast<u32>(i32(b16(o) << 16u) >> 16u); }
 fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
 @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let i = id.x;
+  let i = id.x + id.y * 4194240u;
   if (i >= p.n) { return; }
   let o = (p.first + i) * p.bpe;
   var r = vec4<u32>(0u, 0u, 0u, 0x3F800000u);
@@ -437,7 +467,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     const cp = g.encoder().beginComputePass();
     cp.setPipeline(g.expand);
     cp.setBindGroup(0, bg);
-    cp.dispatchWorkgroups(Math.ceil(n / 64));
+    const groups = Math.ceil(n / 64);
+    cp.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535));
     cp.end();
     (g.expandTmp || (g.expandTmp = [])).push(ub);
   },
@@ -614,7 +645,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     try {
       const bg = g.device.createBindGroup({ layout, entries });
       if (g.capFrame) bg.__sz = JSON.parse(UTF8ToString(jsonPtr >>> 0)).filter(e => e.ring).map(e => [e.b, e.off || -1, e.size]);
-      if (g.capFrame) bg.__r = entries.map(e => e.resource && e.resource.__tex ? e.resource.__tex.__id : e.resource && e.resource.buffer ? "b" : e.resource instanceof GPUSampler ? "s" : "?");
+      if (g.capFrame) { const js = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+        bg.__r = entries.map((e, i) => e.resource && e.resource.__tex ? e.resource.__tex.__id : e.resource && e.resource.buffer ? (js[i].buf !== undefined ? `b${js[i].buf}@${js[i].off || 0}+${js[i].size || 0}` : "b") : e.resource instanceof GPUSampler ? "s" : "?"); }
       return g.add(bg);
     }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] bind group " + e.message); return 0; }
@@ -791,7 +823,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
         }
         j += 2 + nd;
       }
-      g.cap.cur.draws.push({ vs: pd.vs, ps: pd.ps, count, instances, indexed, first, baseVertex, topo: pd.primitive && pd.primitive.topology, targets: pd.targets, depth: pd.depth, buffers: pd.buffers, prim: pd.primitive, vp: Array.from(st.vp), sc: Array.from(st.sc), sref, res: groups, cbs });
+      g.cap.cur.draws.push({ vs: pd.vs, ps: pd.ps, count, instances, indexed, first, baseVertex, topo: pd.primitive && pd.primitive.topology, targets: pd.targets, depth: pd.depth, buffers: pd.buffers, prim: pd.primitive, vp: Array.from(st.vp), sc: Array.from(st.sc), sref, res: groups, cbs, firstInstance, vbs: Array.from({ length: 16 }, (_, k) => [k, st.vb[k * 3], st.vb[k * 3 + 1]]).filter(v => v[1] > 0) });
       // debug: window.uewCapturePixels = [[x, y], ...] samples depth and colour target 0 there after every draw
       if (window.uewCapturePixels && g.cap.px.length < 400) {
         pass.end();

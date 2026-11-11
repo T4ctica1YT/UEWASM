@@ -97,6 +97,8 @@ typedef struct GpuBackend {
     /* GPU timestamps: submit what is pending and return a ticket; the time (ns) once the GPU has finished it, else 0 */
     uint32_t (*timestamp)(void);
     int (*timestamp_get)(uint32_t ticket, uint64_t* ns);
+    /* the format can be written through a typed UAV (a WebGPU write-only storage texture) on this device */
+    int (*uav_store)(uint32_t dxgi_format);
 } GpuBackend;
 
 extern GpuBackend* gpu;

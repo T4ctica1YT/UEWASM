@@ -91,6 +91,7 @@ GThread* sched_create(uint64_t start, uint64_t param, int suspended)
     t->suspended = suspended;
     t->cpu = calloc(1, sizeof(CPU));
     t->cpu->mxcsr = 0x1F80;
+    t->cpu->fcw = 0x27F;
     t->cpu->tid = t->tid;
     uint64_t stack_size = 4ull << 20;
     uint64_t stack = g_alloc(stack_size);

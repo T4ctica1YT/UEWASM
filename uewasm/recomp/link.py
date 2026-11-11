@@ -7,6 +7,7 @@ from pathlib import Path
 from . import pe as pemod
 
 SYSTEM = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+SYSTEM32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64"
 RUNTIME_DLLS = {"ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
                 "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "concrt140.dll", "vccorlib140.dll", "msvcrt.dll"}
 # Stateless functions that are faster as host code. Anything that touches CRT state stays recompiled.
@@ -40,14 +41,15 @@ SKIP_DLLS = re.compile(r"(libcef|chrome_elf|libegl|libglesv2|d3dcompiler|gfsdk_a
 _sys_ords = {}
 
 
-def system_ord_name(dll, ordinal):
+def system_ord_name(dll, ordinal, sysdir=SYSTEM):
     """The name Windows' own copy of a DLL exports under an ordinal, for imports by number."""
-    if dll not in _sys_ords:
+    key = (dll, str(sysdir))
+    if key not in _sys_ords:
         try:
-            _sys_ords[dll] = pemod.load(SYSTEM / dll).ord_names if (SYSTEM / dll).is_file() else {}
+            _sys_ords[key] = pemod.load(sysdir / dll).ord_names if (sysdir / dll).is_file() else {}
         except Exception:
-            _sys_ords[dll] = {}
-    return _sys_ords[dll].get(ordinal)
+            _sys_ords[key] = {}
+    return _sys_ords[key].get(ordinal)
 
 
 def game_dlls(exe):
@@ -106,6 +108,8 @@ class Linker:
         self.thunks = []
         self.thunk_index = {}
         self.missing = []
+        self.bits = pemod.load(self.exe).bits
+        self.sysdir = SYSTEM if self.bits == 64 else SYSTEM32
         root = self.add(self.exe)
         for e in extra:
             self.add(Path(e))
@@ -117,15 +121,21 @@ class Linker:
         # left to the runtime: API-set forwarders a game ships, and DLLs the browser can't use
         if SKIP_DLLS.search(n):
             return None
-        if n not in RUNTIME_DLLS and (SYSTEM / n).is_file():
+        if n not in RUNTIME_DLLS and (self.sysdir / n).is_file():
             return None
         for d in self.search:
             p = d / n
-            if p.is_file():
+            if p.is_file() and self.bits_of(p) == self.bits:
                 return p
-        if self.recompile_system and n in RUNTIME_DLLS and (SYSTEM / n).is_file():
-            return SYSTEM / n
+        if self.recompile_system and n in RUNTIME_DLLS and (self.sysdir / n).is_file():
+            return self.sysdir / n
         return None
+
+    def bits_of(self, p):
+        try:
+            return pemod.load(p).bits
+        except Exception:
+            return 0
 
     def add(self, path):
         key = path.name.lower()
@@ -142,6 +152,10 @@ class Linker:
 
     def assign_bases(self):
         base = FIRST_BASE
+        exe = self.order[0].pe
+        # an image without relocations has to sit at its own base
+        if not exe.relocs and exe.image_base >= FIRST_BASE and exe.image_base < 0x40000000:
+            base = exe.image_base
         for m in self.order:
             m.base = base
             base = (base + m.pe.image_size + 0xFFFF) & ~0xFFFF
@@ -175,7 +189,7 @@ class Linker:
         if name.startswith("#") and n not in self.modules:
             name = ORDINALS[n].get(int(name[1:]), name) if n in ORDINALS else name
             if name.startswith("#"):
-                name = system_ord_name(n, int(name[1:])) or name
+                name = system_ord_name(n, int(name[1:]), self.sysdir) or name
         if name in PURE and name in self.hle:
             return self.thunk(name, n)
         m = self.modules.get(n)
@@ -200,6 +214,6 @@ class Linker:
         for m in self.order:
             img = bytearray(m.pe.image(m.base))
             for imp in m.pe.imports:
-                struct.pack_into("<Q", img, imp.iat_rva, self.resolve(imp.dll, imp.name))
+                struct.pack_into("<Q" if m.pe.bits == 64 else "<I", img, imp.iat_rva, self.resolve(imp.dll, imp.name))
             out.append((m, bytes(img)))
         return out

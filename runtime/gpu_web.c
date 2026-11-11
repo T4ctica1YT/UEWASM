@@ -613,7 +613,8 @@ static int bind_vertex_input(GpuCtx* c, GlShader* vs, int32_t base_vertex, uint3
             glBindBuffer(GL_ARRAY_BUFFER, GR(vb)->buf);
             if (f.integer) glVertexAttribIPointer(loc, f.size, f.type, stride, (const void*)(uintptr_t)base);
             else glVertexAttribPointer(loc, f.size, f.type, f.norm, stride, (const void*)(uintptr_t)base);
-            glVertexAttribDivisor(loc, l->el[i].per_instance ? (l->el[i].step ? l->el[i].step : 1) : 0);
+            /* D3D stride 0: every vertex and instance reads the same element (GL's 0 means tightly packed) */
+            glVertexAttribDivisor(loc, !stride ? 0x7FFFFFFF : l->el[i].per_instance ? (l->el[i].step ? l->el[i].step : 1) : 0);
             want[loc] = 1;
         }
     }

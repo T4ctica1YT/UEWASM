@@ -9,7 +9,7 @@
   <br>
 </h1>
 
-<h4 align="center">A WIP Static Recompilation tool for Windows x64 Unreal Engine 4/5 built games into WebAssemably (WASM)
+<h4 align="center">A WIP Static Recompilation tool for Windows (x64 and x86) Unreal Engine 4/5 built games into WebAssemably (WASM)
 </h4>
 
 </p>
@@ -34,15 +34,17 @@ is implemented yet.
    executables are unwrapped (`steamstub.py`).
 2. **Discovery**: functions come from `.pdata` (including chained chunks), entry points, exports, relocated code
    pointers and call targets; switch tables are recovered per function family.
-3. **Lifter** (`lift.py`, `sse.py`): each x86-64 function becomes a C function. Registers live in locals and
-   flags are lazy, so a compare and branch compile to a single comparison; indirect calls go through per-site
-   inline caches; SSE maps to WebAssembly SIMD.
+3. **Lifter** (`lift.py`, `sse.py`, `x87.py`): each x86-64 (or 32-bit x86) function becomes a C function. Registers
+   live in locals and flags are lazy, so a compare and branch compile to a single comparison; indirect calls go
+   through per-site inline caches; SSE (up to SSE4.2) maps to WebAssembly SIMD. 32-bit games get the x87 FPU and
+   stdcall/cdecl calling conventions on top.
 4. **Runtime** (`runtime/`):
    - guest heap, files (game data fetched on demand; a separate save folder), Win32/USER32 windowing and input;
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
      condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI;
    - Direct3D 11/DXGI on WebGPU: DXBC shaders are translated to WGSL (`dxbc_wgsl.c`), including geometry shaders
-     (emulated with compute), with background pipeline compilation and GPU timestamp queries;
+     (emulated with compute), typed buffers read and written in their real formats, UAV-only passes, background
+     pipeline compilation and GPU timestamp queries;
    - XAudio2 2.7 (mixer, submixes, reverb, X3DAudio) and WASAPI on an AudioWorklet; Ogg Vorbis and VP8/VP9 video
      are decoded natively or by the browser's hardware decoder where the game ships libvorbis/libvpx.
 
@@ -69,7 +71,9 @@ Here are the games used for Testing and some screenshots of the tool working
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 |
 | Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? |
-|Dead as Disco| ➖ Boots | 30-50 FPS| UE 5.7.4 |
+| Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 |
+| Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 |
+|Dead as Disco| ➖ Gets in game (intro scenes) | 30-60 FPS| UE 5.7.4 |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -95,6 +99,8 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--threads` | `coop` | Game threads run as green threads on one browser thread. (`real`, Web Workers, is not implemented yet.) |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
 | `--mem-mb` | number | Guest memory; browsers allow 4096 MB total. |
+| `--mem-limit-gb` | number (default `8`) | How much memory the built game may use when run, split between game memory, the download cache and video memory. |
+| `--aes-key` | `0x` + 64 hex digits | Decrypt AES-encrypted `.pak` files with your own key so the browser can read them. The key is checked before the build starts; a wrong key stops the build. |
 | `--resolution` | e.g. `1280x720` | Render size. The page scales it to fit the window, so a lower value helps slow machines. |
 | `--part-mb` | number | Largest file in the output. The default of 16 stays under Cloudflare Pages' 25 MiB limit. |
 | `--compress` |N/A| Compress the game's files (audio excluded) for a smaller download. |
@@ -155,8 +161,8 @@ Edge/Chrome).
 - Shaders compile the first time an effect appears, which can cause short stutters on a first run; browsers cache
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
-- Unreal Engine 5 support is early: UE5 games boot and reach their menus, but some 3D scenes still render dark or
-  without their background, and they run slower than UE4 titles.
+- Unreal Engine 5 support is newer than UE4: tested UE5 games reach their menus and gameplay, but they run slower
+  than UE4 titles and the first visit to each area stutters while shaders compile.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.
 - Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call.
 

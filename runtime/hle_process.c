@@ -61,7 +61,7 @@ HLE(GetEnvironmentVariableW)
     char name[256];
     wstr_to_utf8(A1, name, sizeof name);
     const char* v = env_lookup(name);
-    if (!v) { ST32(g_teb + 0x68, 203); RET(0); return; }
+    if (!v) { ST32(g_teb + TEB_ERR, 203); RET(0); return; }
     size_t n = strlen(v);
     if (A3 <= n) { RET(n + 1); return; }
     RET(utf8_to_wstr(v, A2, (size_t)A3));
@@ -69,7 +69,7 @@ HLE(GetEnvironmentVariableW)
 HLE(GetEnvironmentVariableA)
 {
     const char* v = env_lookup(GSTR(A1));
-    if (!v) { ST32(g_teb + 0x68, 203); RET(0); return; }
+    if (!v) { ST32(g_teb + TEB_ERR, 203); RET(0); return; }
     size_t n = strlen(v);
     if (A3 <= n) { RET(n + 1); return; }
     memcpy(G2H(A2), v, n + 1);
@@ -79,8 +79,8 @@ HLE(SetEnvironmentVariableW) { RET(1); }
 HLE(SetEnvironmentVariableA) { RET(1); }
 HLE(ExpandEnvironmentStringsW) { uint64_t n = 0; while (LD16(A1 + 2 * n)) n++; if (A3 > n) memcpy(G2H(A2), G2H(A1), 2 * (n + 1)); RET(n + 1); }
 
-HLE(GetStartupInfoW) { memset(G2H(A1), 0, 104); ST32(A1, 104); RET(0); }
-HLE(GetStartupInfoA) { memset(G2H(A1), 0, 104); ST32(A1, 104); RET(0); }
+HLE(GetStartupInfoW) { uint32_t n = RT_G32 ? 68 : 104; memset(G2H(A1), 0, n); ST32(A1, n); RET(0); }
+HLE(GetStartupInfoA) { uint32_t n = RT_G32 ? 68 : 104; memset(G2H(A1), 0, n); ST32(A1, n); RET(0); }
 HLE(SetErrorMode) { RET(0); }
 HLE(GetErrorMode) { RET(0); }
 HLE(SetThreadErrorMode) { if (A2) ST32(A2, 0); RET(1); }
@@ -88,12 +88,12 @@ HLE(HeapQueryInformation) { RET(1); }
 HLE(HeapSetInformation) { RET(1); }
 HLE(HeapCompact) { RET(0); }
 HLE(HeapValidate) { RET(1); }
-HLE(HeapWalk) { ST32(g_teb + 0x68, 259); RET(0); }
+HLE(HeapWalk) { ST32(g_teb + TEB_ERR, 259); RET(0); }
 HLE(HeapCreate) { RET(0x7000); }
 HLE(HeapDestroy) { RET(1); }
 HLE(HeapLock) { RET(1); }
 HLE(HeapUnlock) { RET(1); }
-HLE(GetProcessHeaps) { if (A1 >= 1) ST64(A2, 0x7000); RET(1); }
+HLE(GetProcessHeaps) { if (A1 >= 1) STP(A2, 0x7000); RET(1); }
 HLE(LocalAlloc) { RET((A1 & 0x40) ? g_calloc(A2) : g_alloc(A2)); }
 HLE(LocalFree) { g_free(A1); RET(0); }
 HLE(GlobalAlloc) { RET((A1 & 0x40) ? g_calloc(A2) : g_alloc(A2)); }
@@ -104,9 +104,23 @@ HLE(GlobalUnlock) { RET(1); }
 HLE(VirtualQuery)
 {
     uint64_t a = A1 & ~0xFFFull;
-    memset(G2H(A2), 0, 48);
     const ModuleInfo* m = rt_module_at(A1);
     uint64_t len, heap = m ? 0 : g_pages_query(A1, &len);
+    uint64_t base = m ? m->base : heap, size = m ? m->size : len;
+    if (!m && !heap) { base = 0; size = 0; }
+    if (RT_G32) {
+        memset(G2H(A2), 0, 28);
+        ST32(A2, a);
+        ST32(A2 + 4, base);
+        ST32(A2 + 8, (m || heap) ? 4 : 0);
+        ST32(A2 + 12, (m || heap) ? base + size - a : 0x1000);
+        ST32(A2 + 16, (m || heap) ? 0x1000 : 0x10000);
+        ST32(A2 + 20, (m || heap) ? (m ? 0x20 : 4) : 1);
+        ST32(A2 + 24, (m || heap) ? (m ? 0x1000000 : 0x20000) : 0);
+        RET(28);
+        return;
+    }
+    memset(G2H(A2), 0, 48);
     if (!m && !heap) {
         ST64(A2, a);
         ST64(A2 + 24, 0x1000);
@@ -115,7 +129,6 @@ HLE(VirtualQuery)
         RET(48);
         return;
     }
-    uint64_t base = m ? m->base : heap, size = m ? m->size : len;
     ST64(A2, a);
     ST64(A2 + 8, base);
     ST32(A2 + 16, 4);
@@ -161,13 +174,13 @@ HLE(GetUserNameA) { snprintf((char*)G2H(A1), 32, "Player"); ST32(A2, 7); RET(1);
 HLE(OutputDebugStringW) { char s[2048]; wstr_to_utf8(A1, s, sizeof s); host_log("[debug] %s", s); RET(0); }
 HLE(Beep) { RET(1); }
 HLE(GetExitCodeProcess) { ST32(A2, 259); RET(1); }
-HLE(CreateProcessW) { ST32(g_teb + 0x68, 2); RET(0); }
-HLE(CreateProcessA) { ST32(g_teb + 0x68, 2); RET(0); }
-HLE(RtlPcToFileHeader) { const ModuleInfo* m = rt_module_at(A1); ST64(A2, m ? m->base : 0); RET(m ? m->base : 0); }
+HLE(CreateProcessW) { ST32(g_teb + TEB_ERR, 2); RET(0); }
+HLE(CreateProcessA) { ST32(g_teb + TEB_ERR, 2); RET(0); }
+HLE(RtlPcToFileHeader) { const ModuleInfo* m = rt_module_at(A1); STP(A2, m ? m->base : 0); RET(m ? m->base : 0); }
 HLE(GetProcessTimes) { ST64(A2, 0); ST64(A3, 0); ST64(A4, 0); ST64(ARG(5), host_ticks_ns() / 100); RET(1); }
 HLE(GetThreadTimes) { ST64(A2, 0); ST64(A3, 0); ST64(A4, 0); ST64(ARG(5), host_ticks_ns() / 100); RET(1); }
 int hle_cores(void);
-HLE(GetProcessAffinityMask) { uint64_t m = (1ull << hle_cores()) - 1; ST64(A2, m); ST64(A3, m); RET(1); }
+HLE(GetProcessAffinityMask) { uint64_t m = (1ull << hle_cores()) - 1; STP(A2, m); STP(A3, m); RET(1); }
 HLE(SetProcessAffinityMask) { RET(1); }
 HLE(GetActiveProcessorCount) { RET(hle_cores()); }
 HLE(GetMaximumProcessorCount) { RET(hle_cores()); }
@@ -181,21 +194,21 @@ HLE(FlushInstructionCache) { RET(1); }
 
 HLE(InterlockedPushEntrySList)
 {
-    uint64_t head = A1, e = A2, old = LD64(head);
-    ST64(e, old);
-    ST64(head, e);
-    ST64(head + 8, LD64(head + 8) + 1);
+    uint64_t head = A1, e = A2, old = LDP(head), d = head + GP;
+    STP(e, old);
+    STP(head, e);
+    ST16(d, LD16(d) + 1);
     RET(old);
 }
 HLE(InterlockedPopEntrySList)
 {
-    uint64_t head = A1, e = LD64(head);
-    if (e) { ST64(head, LD64(e)); ST64(head + 8, LD64(head + 8) - 1); }
+    uint64_t head = A1, e = LDP(head), d = head + GP;
+    if (e) { STP(head, LDP(e)); ST16(d, LD16(d) - 1); }
     RET(e);
 }
-HLE(InterlockedFlushSList) { uint64_t e = LD64(A1); ST64(A1, 0); ST64(A1 + 8, 0); RET(e); }
-HLE(QueryDepthSList) { RET(LD64(A1 + 8) & 0xFFFF); }
-HLE(RtlInitializeSListHead) { ST64(A1, 0); ST64(A1 + 8, 0); RET(0); }
+HLE(InterlockedFlushSList) { uint64_t e = LDP(A1); memset(G2H(A1), 0, 2 * GP); RET(e); }
+HLE(QueryDepthSList) { RET(LD16(A1 + GP)); }
+HLE(RtlInitializeSListHead) { memset(G2H(A1), 0, 2 * GP); RET(0); }
 
 HLE(RaiseException)
 {

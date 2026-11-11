@@ -403,7 +403,7 @@ HLE(WinHttpSendRequest)
     send_request(c, A1, A2, (int64_t)(int32_t)A3, A4, (uint32_t)ARG(5));
     r->async = async;
     if (!R(0)) {
-        if (async) { notify(r, A1, 0x200000, 3, (uint32_t)LD32(g_teb + 0x68)); hle_set_error(997); }   /* REQUEST_ERROR (API_SEND_REQUEST) */
+        if (async) { notify(r, A1, 0x200000, 3, (uint32_t)LD32(g_teb + TEB_ERR)); hle_set_error(997); }   /* REQUEST_ERROR (API_SEND_REQUEST) */
         return;
     }
     notify(r, A1, 0x400000, 0, 0);   /* SENDREQUEST_COMPLETE */

@@ -12,6 +12,15 @@ typedef struct Thunk {
     GuestFn call;   /* fn plus the return-address pop, so call sites can cache it */
 } Thunk;
 
+/* 32-bit guests: pointers are 4 bytes, system calls take their arguments on the stack (stdcall pops them) */
+extern const int RT_G32;
+extern const unsigned short rt_thunk_pops[];
+#define GP (RT_G32 ? 4u : 8u)
+#define LDP(a) (RT_G32 ? LD32(a) : LD64(a))
+#define STP(a, v) (RT_G32 ? ST32((a), (v)) : ST64((a), (v)))
+#define TEB_ERR (RT_G32 ? 0x34 : 0x68)
+void rt_hle32(CPU* c, const Thunk* e, unsigned pops);
+
 typedef struct ModuleInfo {
     const char* name;
     uint64_t base, size, entry_rva;
@@ -98,6 +107,8 @@ uint64_t host_time_100ns(void);
 #define STUB(name, v) HLE(name) { RET(v); }
 
 uint64_t rt_dyn_thunk(GuestFn fn, const char* name);
+/* nargs: stack arguments a 32-bit guest pushes (stdcall: the call pops them) */
+uint64_t rt_dyn_thunk_n(GuestFn fn, const char* name, int nargs);
 int host_query_flag(const char* name);
 int host_query_int(const char* name);
 uint64_t g_alloc_zero_aligned(uint64_t n, uint64_t align);

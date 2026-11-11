@@ -424,6 +424,18 @@ static void combine(const char* dir, const char* file, char* out, size_t cap)
     }
     canon(t, out, cap);
 }
+HLE(PathAppendW)
+{
+    char d[1200], f[1200], o[1200];
+    if (!A1 || !A2) { RET(0); return; }
+    rd_w(A1, d, sizeof d); rd_w(A2, f, sizeof f);
+    const char* p = f;
+    while (*p == '\\' || *p == '/') p++;
+    combine(d, p, o, sizeof o);
+    if (strlen(o) >= 260) { RET(0); return; }
+    utf8_to_wstr(o, A1, 260);
+    RET(1);
+}
 HLE(PathCombineW)
 {
     char d[1200], f[1200], o[1200];

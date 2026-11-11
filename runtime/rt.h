@@ -30,6 +30,10 @@ typedef struct CPU {
     uint32_t mxcsr;
     uint64_t gsbase;
     int tid;
+    /* x87 (32-bit guests): the register stack as doubles, top index, status and control words */
+    double st[8];
+    uint32_t ftop, fsw, fcw;
+    uint32_t df;   /* direction flag: string instructions step backwards */
 } CPU;
 
 typedef void (*GuestFn)(CPU* __restrict);
@@ -290,3 +294,4 @@ void rt_scas(CPU* c, Flags* f, int n, int rep);
 void rt_cmps(CPU* c, Flags* f, int n, int rep);
 
 #include "sse.h"
+#include "x87.h"

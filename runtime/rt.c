@@ -258,15 +258,42 @@ void sched_tick(CPU* c);
 void rt_hle_tick(CPU* c) { rt_hle_budget = 1024; sched_tick(c); }
 #include "dyn_tramp.inc"
 
-uint64_t rt_dyn_thunk(GuestFn fn, const char* name)
+static uint16_t dyn_pops[DYN_MAX];
+
+uint64_t rt_dyn_thunk_n(GuestFn fn, const char* name, int nargs)
 {
     for (size_t i = 0; i < ndyn; i++)
-        if (dyn[i].fn == fn) return DYN_BASE + 8ull * i;
+        if (dyn[i].fn == fn && dyn_pops[i] == 4 * nargs) return DYN_BASE + 8ull * i;
     if (ndyn == DYN_MAX) return 0;
     dyn[ndyn].fn = fn;
     dyn[ndyn].name = name;
     dyn[ndyn].dll = "dyn";
+    dyn_pops[ndyn] = (uint16_t)(4 * nargs);
     return DYN_BASE + 8ull * ndyn++;
+}
+
+uint64_t rt_dyn_thunk(GuestFn fn, const char* name) { return rt_dyn_thunk_n(fn, name, 0); }
+
+/* a 32-bit guest calling the runtime: the stack arguments are laid out as a Win64 frame (rcx, rdx, r8, r9, then the
+   stack slots) so every HLE function serves both; small negative values (handles like -1) widen with their sign */
+void rt_hle32(CPU* c, const Thunk* e, unsigned pops)
+{
+    uint64_t esp = R(4), f = (esp - 0x200) & ~15ull;
+    uint64_t keep[4] = { R(3), R(5), R(6), R(7) };
+    ST64(f, LD32(esp));
+    for (unsigned i = 1; i <= 20; i++) {
+        uint64_t v = LD32(esp + 4ull * i);
+        if (v >= 0xFFFF0000ull) v |= 0xFFFFFFFF00000000ull;
+        ST64(f + 8ull * i, v);
+    }
+    R(1) = LD64(f + 8); R(2) = LD64(f + 16); R(8) = LD64(f + 24); R(9) = LD64(f + 32);
+    R(4) = f;
+    if (e->fn) e->fn(c);
+    else hle_missing(c, e);
+    R(3) = keep[0]; R(5) = keep[1]; R(6) = keep[2]; R(7) = keep[3];
+    R(2) = (uint32_t)(R(0) >> 32);
+    R(0) = (uint32_t)R(0);
+    R(4) = esp + 4 + pops;
 }
 
 uint64_t g_alloc_zero_aligned(uint64_t n, uint64_t align)
@@ -341,28 +368,41 @@ void rt_trace_call(CPU* c, const char* name)
              (unsigned long long)R(8), (unsigned long long)R(9), (unsigned long long)LD64(R(4)), sched_current_id());
 }
 
+static void sj_jump32(CPU* c, uint64_t t);
 void rt_call(CPU* c, uint64_t t)
 {
     STACK_CHECK(c, t);
     if (t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn) {
-        dyn[(t - DYN_BASE) / 8].fn(c);
-        R(4) += 8;
+        size_t k = (t - DYN_BASE) / 8;
+        if (RT_G32) rt_hle32(c, &dyn[k], dyn_pops[k]);
+        else {
+            dyn[k].fn(c);
+            R(4) += 8;
+        }
         if (--rt_hle_budget < 0) rt_hle_tick(c);
         return;
     }
     if (t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count) {
-        const Thunk* e = &rt_thunks[(t - THUNK_BASE) / 8];
+        size_t k = (t - THUNK_BASE) / 8;
+        const Thunk* e = &rt_thunks[k];
         if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL || host_query_flag("tracering");
-        if (trace_on) rt_trace_call(c, e->name);
-        if (e->fn) e->fn(c);
-        else hle_missing(c, e);
-        R(4) += 8;
+        if (RT_G32) {
+            if (trace_on) host_log("[hle] %s(%x, %x, %x, %x) ret=%x", e->name, (unsigned)LD32(R(4) + 4), (unsigned)LD32(R(4) + 8),
+                                   (unsigned)LD32(R(4) + 12), (unsigned)LD32(R(4) + 16), (unsigned)LD32(R(4)));
+            rt_hle32(c, e, rt_thunk_pops[k]);
+        } else {
+            if (trace_on) rt_trace_call(c, e->name);
+            if (e->fn) e->fn(c);
+            else hle_missing(c, e);
+            R(4) += 8;
+        }
         if (--rt_hle_budget < 0) rt_hle_tick(c);
         return;
     }
     const FnEntry* f = find_fn(t);
+    if (!f && RT_G32) sj_jump32(c, t);
     if (!f) {
-        host_log("[trap] call to %llx from %llx (thread %u)", (unsigned long long)t, (unsigned long long)LD64(R(4)), sched_current_id());
+        host_log("[trap] call to %llx from %llx (thread %u)", (unsigned long long)t, (unsigned long long)LDP(R(4)), sched_current_id());
         /* a background thread that jumps into the void (a corrupt callback in telemetry, say) ends alone, as an
            unhandled fault there would, instead of taking the game down */
         if (!sched_is_main()) { host_log("[trap] thread %u ended", sched_current_id()); sched_exit_current(c, 0xC0000005); return; }
@@ -409,20 +449,39 @@ void rt_call_ic(CPU* c, uint64_t t, IC* ic)
         f->fn(c);
         return;
     }
-    if (t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn && (t - DYN_BASE) / 8 < DYN_TRAMPS) {
+    if (!RT_G32 && t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn && (t - DYN_BASE) / 8 < DYN_TRAMPS) {
         ic->f = dyn_tramp[(t - DYN_BASE) / 8];
         ic->a = t;
     }
     /* imported functions: cache the wrapper unless calls are being logged */
-    if (t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count && rt_thunks[(t - THUNK_BASE) / 8].call) {
+    if (!RT_G32 && t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count && rt_thunks[(t - THUNK_BASE) / 8].call) {
         ic->f = rt_thunks[(t - THUNK_BASE) / 8].call;
         ic->a = t;
     }
     rt_call(c, t);
 }
 
+/* 32-bit: arguments pushed right to left; the stack is put back afterwards, which suits stdcall and cdecl alike */
+static uint64_t invoke32(CPU* c, uint64_t fn, int n, const uint64_t* a)
+{
+    uint64_t save[16];
+    memcpy(save, c->r, sizeof save);
+    uint64_t sp = (R(4) - 64) & ~15ull;
+    for (int i = n; i-- > 0;) { sp -= 4; ST32(sp, a[i]); }
+    sp -= 4;
+    ST32(sp, RET_SENTINEL);
+    R(4) = sp;
+    rt_call(c, fn);
+    uint64_t ret = (uint32_t)R(0);
+    static const int keep[] = { 3, 5, 6, 7 };
+    for (int i = 0; i < 4; i++) c->r[keep[i]] = save[keep[i]];
+    R(4) = save[4];
+    return ret;
+}
+
 uint64_t rt_invoke(CPU* c, uint64_t fn, int n, const uint64_t* a)
 {
+    if (RT_G32) return invoke32(c, fn, n, a);
     static const int regs[4] = { 1, 2, 8, 9 };
     uint64_t save_sp = R(4);
     uint64_t save[16];
@@ -482,19 +541,64 @@ void rt_trap(CPU* c, uint64_t pc, const char* what)
     rt_exit(0xC0000005);
 }
 
-/* FXSAVE area: x87 control/status/tag in their reset state (no x87 here), MXCSR at +24, XMM0-15 at +160 */
+/* FXSAVE area: x87 control/status at +0/+2, MXCSR at +24, ST0-7 at +32, XMM0-15 at +160 */
 void rt_fxsave(CPU* c, uint64_t a)
 {
     memset(G2H(a), 0, 512);
-    ST16(a, 0x037F);
+    ST16(a, c->fcw);
+    ST16(a + 2, fstsw(c));
     ST32(a + 24, c->mxcsr);
     ST32(a + 28, 0xFFFF);
+    for (int i = 0; i < 8; i++) {
+        uint64_t m; uint16_t e;
+        F80S(c->st[(c->ftop + i) & 7], &m, &e);
+        ST64(a + 32 + 16ull * i, m);
+        ST16(a + 40 + 16ull * i, e);
+    }
     for (int i = 0; i < 16; i++) memcpy(G2H(a + 160 + 16ull * i), &c->x[i], 16);
 }
 void rt_fxrstor(CPU* c, uint64_t a)
 {
+    c->fcw = (uint32_t)LD16(a);
+    uint32_t sw = (uint32_t)LD16(a + 2);
+    c->ftop = (sw >> 11) & 7;
+    c->fsw = sw & ~0x3800u;
     c->mxcsr = (uint32_t)LD32(a + 24);
+    for (int i = 0; i < 8; i++) c->st[(c->ftop + i) & 7] = F80B(LD64(a + 32 + 16ull * i), LD16(a + 40 + 16ull * i));
     for (int i = 0; i < 16; i++) memcpy(&c->x[i], G2H(a + 160 + 16ull * i), 16);
+}
+
+/* 32-bit protected-mode environment (28 bytes) and FSAVE image (environment then ST0-7 as 80-bit) */
+void rt_fnstenv(CPU* c, uint64_t a)
+{
+    memset(G2H(a), 0, 28);
+    ST32(a, c->fcw | 0xFFFF0000u);
+    ST32(a + 4, fstsw(c) | 0xFFFF0000u);
+    ST32(a + 8, 0xFFFFFFFFu);
+}
+void rt_fldenv(CPU* c, uint64_t a)
+{
+    c->fcw = (uint32_t)LD16(a);
+    uint32_t sw = (uint32_t)LD16(a + 4);
+    c->ftop = (sw >> 11) & 7;
+    c->fsw = sw & ~0x3800u;
+}
+void rt_fnsave(CPU* c, uint64_t a)
+{
+    rt_fnstenv(c, a);
+    ST32(a + 8, 0);
+    for (int i = 0; i < 8; i++) {
+        uint64_t m; uint16_t e;
+        F80S(c->st[(c->ftop + i) & 7], &m, &e);
+        ST64(a + 28 + 10ull * i, m);
+        ST16(a + 36 + 10ull * i, e);
+    }
+    c->ftop = 0; c->fsw = 0; c->fcw = 0x27F;
+}
+void rt_frstor(CPU* c, uint64_t a)
+{
+    rt_fldenv(c, a);
+    for (int i = 0; i < 8; i++) c->st[(c->ftop + i) & 7] = F80B(LD64(a + 28 + 10ull * i), LD16(a + 36 + 10ull * i));
 }
 
 void rt_cpuid(CPU* c)
@@ -638,6 +742,12 @@ static uint64_t accn(CPU* c, int n) { return n == 8 ? R(0) : R(0) & ((1ull << (8
 
 void rt_movs(CPU* c, int n, int rep)
 {
+    if (c->df) {
+        uint64_t cnt = rep ? R(1) : 1;
+        for (uint64_t i = 0; i < cnt; i++) { stn(R(7), ldn(R(6), n), n); R(6) -= n; R(7) -= n; }
+        if (rep) R(1) = 0;
+        return;
+    }
     if (!rep) { stn(R(7), ldn(R(6), n), n); R(6) += n; R(7) += n; return; }
     uint64_t cnt = R(1) * (uint64_t)n;
     if (cnt) memmove(G2H(R(7)), G2H(R(6)), (size_t)cnt);
@@ -647,8 +757,8 @@ void rt_movs(CPU* c, int n, int rep)
 void rt_stos(CPU* c, int n, int rep)
 {
     uint64_t cnt = rep ? R(1) : 1;
-    if (n == 1) { if (cnt) memset(G2H(R(7)), (int)(uint8_t)R(0), (size_t)cnt); R(7) += cnt; }
-    else for (uint64_t i = 0; i < cnt; i++) { stn(R(7), accn(c, n), n); R(7) += n; }
+    if (n == 1 && !c->df) { if (cnt) memset(G2H(R(7)), (int)(uint8_t)R(0), (size_t)cnt); R(7) += cnt; }
+    else for (uint64_t i = 0; i < cnt; i++) { stn(R(7), accn(c, n), n); R(7) += c->df ? -n : n; }
     if (rep) R(1) = 0;
 }
 
@@ -658,7 +768,7 @@ void rt_lods(CPU* c, int n, int rep)
     for (uint64_t i = 0; i < cnt; i++) {
         uint64_t v = ldn(R(6), n);
         if (n == 4) R(0) = v; else if (n == 8) R(0) = v; else R(0) = (R(0) & ~((1ull << (8 * n)) - 1)) | v;
-        R(6) += n;
+        R(6) += c->df ? -n : n;
     }
     if (rep) R(1) = 0;
 }
@@ -670,7 +780,7 @@ void rt_scas(CPU* c, Flags* f, int n, int rep)
         if (rep && !R(1)) break;
         uint64_t a = accn(c, n), b = ldn(R(7), n), r = (a - b) & mask;
         FL(F_SUB, n * 8, a, b, r);
-        R(7) += n;
+        R(7) += c->df ? -n : n;
         if (rep) R(1)--;
         if (rep == 1 && !ZF(f)) break;
         if (rep == 2 && ZF(f)) break;
@@ -684,7 +794,7 @@ void rt_cmps(CPU* c, Flags* f, int n, int rep)
         if (rep && !R(1)) break;
         uint64_t a = ldn(R(6), n), b = ldn(R(7), n), r = (a - b) & mask;
         FL(F_SUB, n * 8, a, b, r);
-        R(6) += n; R(7) += n;
+        R(6) += c->df ? -n : n; R(7) += c->df ? -n : n;
         if (rep) R(1)--;
         if (rep == 1 && !ZF(f)) break;
         if (rep == 2 && ZF(f)) break;
@@ -731,7 +841,8 @@ uint64_t rt_thunk_by_name(const char* name)
 uint64_t rt_get_export(uint64_t base, const char* name)
 {
     uint64_t pe = base + LD32(base + 0x3C);
-    uint64_t dir = LD32(pe + 24 + 112), size = LD32(pe + 24 + 116);
+    uint64_t dd = pe + 24 + (LD16(pe + 24) == 0x10B ? 96 : 112);
+    uint64_t dir = LD32(dd), size = LD32(dd + 4);
     if (!dir) return 0;
     uint64_t e = base + dir;
     uint64_t ordbase = LD32(e + 16), nfun = LD32(e + 20), nnames = LD32(e + 24);
@@ -763,7 +874,7 @@ uint64_t rt_get_export(uint64_t base, const char* name)
 static void setup_tls(uint64_t teb)
 {
     uint64_t arr = g_calloc(64 * 8);
-    ST64(teb + 0x58, arr);
+    STP(teb + (RT_G32 ? 0x2C : 0x58), arr);
     int k = 0;
     for (size_t i = 0; i < rt_module_count; i++) {
         const ModuleInfo* m = &rt_modules[i];
@@ -771,7 +882,7 @@ static void setup_tls(uint64_t teb)
         uint64_t n = m->tls_end - m->tls_start;
         uint64_t blk = g_calloc(n + m->tls_zero + 16);
         if (n) memcpy(G2H(blk), G2H(m->tls_start), (size_t)n);
-        ST64(arr + 8ull * k, blk);
+        STP(arr + (uint64_t)GP * k, blk);
         ST32(m->tls_index, (uint64_t)k);
         k++;
     }
@@ -780,12 +891,22 @@ static void setup_tls(uint64_t teb)
 uint64_t rt_make_teb(uint64_t stack, uint64_t size, int tid)
 {
     uint64_t teb = g_calloc(0x2000);
-    ST64(teb + 0x08, stack + size);
-    ST64(teb + 0x10, stack);
-    ST64(teb + 0x30, teb);
-    ST64(teb + 0x40, 0x1000);
-    ST64(teb + 0x48, (uint64_t)tid);
-    ST64(teb + 0x60, g_peb);
+    if (RT_G32) {
+        ST32(teb, 0xFFFFFFFFu);
+        ST32(teb + 0x04, stack + size);
+        ST32(teb + 0x08, stack);
+        ST32(teb + 0x18, teb);
+        ST32(teb + 0x20, 0x1000);
+        ST32(teb + 0x24, (uint64_t)tid);
+        ST32(teb + 0x30, g_peb);
+    } else {
+        ST64(teb + 0x08, stack + size);
+        ST64(teb + 0x10, stack);
+        ST64(teb + 0x30, teb);
+        ST64(teb + 0x40, 0x1000);
+        ST64(teb + 0x48, (uint64_t)tid);
+        ST64(teb + 0x60, g_peb);
+    }
     setup_tls(teb);
     return teb;
 }
@@ -833,8 +954,16 @@ int rt_main(int argc, char** argv, const char* image_path)
     CPU* c = &main_cpu;
     memset(c, 0, sizeof *c);
     c->mxcsr = 0x1F80;
+    c->fcw = 0x27F;
     g_peb = g_calloc(0x1000);
-    ST64(g_peb + 0x10, g_exe_base);
+    if (RT_G32) {
+        ST32(g_peb + 0x08, g_exe_base);
+        ST32(g_peb + 0x64, 8);
+        ST32(g_peb + 0xA4, 10);
+        ST32(g_peb + 0xAC, 19045);
+    } else {
+        ST64(g_peb + 0x10, g_exe_base);
+    }
     uint64_t stack_size = 16ull << 20;
     uint64_t stack = g_alloc(stack_size);
     c->tid = 0x1004;
@@ -857,8 +986,8 @@ int rt_main(int argc, char** argv, const char* image_path)
                 if (!(uint32_t)rt_invoke(c, m->base + m->entry_rva, 3, a)) host_log("[load] %s DllMain failed", m->name);
             }
         }
-        R(4) -= 8;
-        ST64(R(4), RET_SENTINEL);
+        R(4) -= GP;
+        STP(R(4), RET_SENTINEL);
         rt_call(c, exe->base + exe->entry_rva);
         exit_code = (int)R(0);
     }
@@ -888,7 +1017,7 @@ _Thread_local uint64_t rt_xfl = 2;
 
 /* setjmp/longjmp: lifted setjmp sites call rt_sj_slot and run a host setjmp in their own frame.
    Guest buffer layout is MSVC x64 _JUMP_BUFFER. */
-typedef struct { uint64_t jb; jmp_buf host; } SjSlot;
+typedef struct { uint64_t jb, rip; jmp_buf host; } SjSlot;
 static SjSlot sj[256];
 static unsigned sj_next;
 
@@ -906,6 +1035,26 @@ jmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip)
     SjSlot* s = &sj[sj_next++ & 255];
     s->jb = jb;
     return &s->host;
+}
+
+/* 32-bit: the guest's own setjmp/longjmp keep the buffer; a jump to a return address a setjmp site recorded is a
+   longjmp, which lands in the host setjmp of the lifted frame that made the call (registers already restored) */
+jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip)
+{
+    (void)c;
+    for (unsigned i = 0; i < 256; i++)
+        if (sj[i].jb == jb) { sj[i].rip = rip; return &sj[i].host; }
+    SjSlot* s = &sj[sj_next++ & 255];
+    s->jb = jb;
+    s->rip = rip;
+    return &s->host;
+}
+
+static void sj_jump32(CPU* c, uint64_t t)
+{
+    for (unsigned i = 0; i < 256; i++)
+        if (sj[i].jb && sj[i].rip == t && LD32(sj[i].jb + 0x14) == t) longjmp(sj[i].host, 1);
+    (void)c;
 }
 
 void rt_sj_jump(CPU* c, uint64_t jb, uint64_t val)

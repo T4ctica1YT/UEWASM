@@ -60,7 +60,9 @@ static void flit(char* b, uint32_t bits)
     float back = strtof(t, NULL);
     uint32_t bb;
     memcpy(&bb, &back, 4);
-    if (bb != bits) { sprintf(b, "bitcast<f32>(%uu)", bits); return; }
+    /* WGSL reads the literal as a double first: one rounded above FLT_MAX (3.40282347e38) is rejected */
+    double wide = strtod(t, NULL);
+    if (bb != bits || wide > 3.4028234663852886e38 || wide < -3.4028234663852886e38) { sprintf(b, "bitcast<f32>(%uu)", bits); return; }
     if (!strchr(t, '.') && !strchr(t, 'e')) strcat(t, ".0");
     sprintf(b, "f32(%s)", t);
 }
@@ -476,6 +478,68 @@ static char* merge_reads(char* body, const DxWgsl* out)
     return r.p;
 }
 
+/* typed buffers read in place: the element's words (w0..w3), 16-bit half (h) or byte (y), as the vec4<u32> bits a D3D load returns */
+static int buf_unpack(int f, Str* b)
+{
+    const char* F1 = "1065353216u";
+    switch (f) {
+    case 2: case 3: case 4: sp(b, "return vec4<u32>(w0, w1, w2, w3);"); return 16;
+    case 6: case 7: case 8: sp(b, "return vec4<u32>(w0, w1, w2, %s);", f == 6 ? F1 : "1u"); return 12;
+    case 16: case 17: case 18: sp(b, "return vec4<u32>(w0, w1, 0u, %s);", f == 16 ? F1 : "1u"); return 8;
+    case 41: case 42: case 43: sp(b, "return vec4<u32>(w0, 0u, 0u, %s);", f == 41 ? F1 : "1u"); return 4;
+    case 10: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16float(w0), unpack2x16float(w1)));"); return 8;
+    case 11: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16unorm(w0), unpack2x16unorm(w1)));"); return 8;
+    case 13: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16snorm(w0), unpack2x16snorm(w1)));"); return 8;
+    case 12: sp(b, "return vec4<u32>(w0 & 0xFFFFu, w0 >> 16u, w1 & 0xFFFFu, w1 >> 16u);"); return 8;
+    case 14: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(w0 << 16u) >> 16u, bitcast<i32>(w0) >> 16u, bitcast<i32>(w1 << 16u) >> 16u, bitcast<i32>(w1) >> 16u));"); return 8;
+    case 34: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16float(w0), 0.0, 1.0));"); return 4;
+    case 35: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16unorm(w0), 0.0, 1.0));"); return 4;
+    case 37: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16snorm(w0), 0.0, 1.0));"); return 4;
+    case 36: sp(b, "return vec4<u32>(w0 & 0xFFFFu, w0 >> 16u, 0u, 1u);"); return 4;
+    case 38: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(w0 << 16u) >> 16u, bitcast<i32>(w0) >> 16u, 0, 1));"); return 4;
+    case 28: case 29: sp(b, "return bitcast<vec4<u32>>(unpack4x8unorm(w0));"); return 4;
+    case 87: sp(b, "return bitcast<vec4<u32>>(unpack4x8unorm(w0).zyxw);"); return 4;
+    case 88: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack4x8unorm(w0).zyx, 1.0));"); return 4;
+    case 31: sp(b, "return bitcast<vec4<u32>>(unpack4x8snorm(w0));"); return 4;
+    case 30: sp(b, "return vec4<u32>(w0 & 0xFFu, (w0 >> 8u) & 0xFFu, (w0 >> 16u) & 0xFFu, w0 >> 24u);"); return 4;
+    case 32: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(w0 << 24u) >> 24u, bitcast<i32>(w0 << 16u) >> 24u, bitcast<i32>(w0 << 8u) >> 24u, bitcast<i32>(w0) >> 24u));"); return 4;
+    case 24: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(vec4<u32>(w0 & 1023u, (w0 >> 10u) & 1023u, (w0 >> 20u) & 1023u, w0 >> 30u)) / vec4<f32>(1023.0, 1023.0, 1023.0, 3.0));"); return 4;
+    case 25: sp(b, "return vec4<u32>(w0 & 1023u, (w0 >> 10u) & 1023u, (w0 >> 20u) & 1023u, w0 >> 30u);"); return 4;
+    case 26: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16float((w0 & 2047u) << 4u).x, unpack2x16float(((w0 >> 11u) & 2047u) << 4u).x, unpack2x16float((w0 >> 22u) << 5u).x, 1.0));"); return 4;
+    case 54: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(unpack2x16float(h).x, 0.0, 0.0, 1.0));"); return 2;
+    case 56: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(f32(h) / 65535.0, 0.0, 0.0, 1.0));"); return 2;
+    case 58: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(max(f32(bitcast<i32>(h << 16u) >> 16u) / 32767.0, -1.0), 0.0, 0.0, 1.0));"); return 2;
+    case 57: sp(b, "return vec4<u32>(h, 0u, 0u, 1u);"); return 2;
+    case 59: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(h << 16u) >> 16u, 0, 0, 1));"); return 2;
+    case 49: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(f32(h & 255u) / 255.0, f32(h >> 8u) / 255.0, 0.0, 1.0));"); return 2;
+    case 51: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(max(f32(bitcast<i32>(h << 24u) >> 24u) / 127.0, -1.0), max(f32(bitcast<i32>(h << 16u) >> 24u) / 127.0, -1.0), 0.0, 1.0));"); return 2;
+    case 50: sp(b, "return vec4<u32>(h & 255u, h >> 8u, 0u, 1u);"); return 2;
+    case 52: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(h << 24u) >> 24u, bitcast<i32>(h << 16u) >> 24u, 0, 1));"); return 2;
+    case 61: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(f32(y) / 255.0, 0.0, 0.0, 1.0));"); return 1;
+    case 63: sp(b, "return bitcast<vec4<u32>>(vec4<f32>(max(f32(bitcast<i32>(y << 24u) >> 24u) / 127.0, -1.0), 0.0, 0.0, 1.0));"); return 1;
+    case 62: sp(b, "return vec4<u32>(y, 0u, 0u, 1u);"); return 1;
+    case 64: sp(b, "return bitcast<vec4<u32>>(vec4<i32>(bitcast<i32>(y << 24u) >> 24u, 0, 0, 1));"); return 1;
+    }
+    return 0;
+}
+
+int dxbc_wgsl_buf_bpe(int fmt)
+{
+    Str b = { 0 };
+    int n = buf_unpack(fmt, &b);
+    free(b.p);
+    return n;
+}
+
+/* the in-place format of typed buffer SRV t, or 0 for the expanded copy */
+static int tb_fmt(Tw* tr, int t)
+{
+    int f = tr->opt && tr->opt->srv_buf_fmt ? tr->opt->srv_buf_fmt[t] : 0;
+    if (!f || !dxbc_wgsl_buf_bpe(f)) return 0;
+    tr->sh->srv[t].fmt = f;
+    return f;
+}
+
 static void emit_ld(Tw* tr, Op** o, int off[3], int has_off, int ms)
 {
     Op *d = o[0], *addr = o[1], *res = o[2];
@@ -487,7 +551,8 @@ static void emit_ld(Tw* tr, Op** o, int off[3], int has_off, int ms)
         tr->sh->srv[t].buffer = 1;
         Str i = { 0 };
         src(tr, &i, addr, -1, 1, K_I);
-        sp(&call, "t%d[%s]", t, i.p);
+        if (!tr->sh->srv[t].raw && !tr->sh->srv[t].structured && tb_fmt(tr, t)) sp(&call, "uew_tb%d(u32(%s))", t, i.p);
+        else sp(&call, "t%d[%s]", t, i.p);
         free(i.p);
         int m = dm(d);
         Str e = { 0 };
@@ -719,6 +784,33 @@ static void emit_atomic(Tw* tr, int opc, Op** o)
     free(a.p); free(nm.p); free(call.p); free(v.p);
 }
 
+/* a typed buffer UAV's element packed into 32-bit words for its view format ("buf:<dxgi>"): number of words, or 0 */
+static int buf_pack(int f, const char* v, char w[4][160], int* kind)
+{
+    *kind = (f == 3 || f == 7 || f == 17 || f == 12 || f == 36 || f == 30 || f == 25) ? K_U : (f == 4 || f == 8 || f == 18 || f == 14 || f == 38 || f == 32) ? K_I : K_F;
+    switch (f) {
+    case 2: case 3: case 4: case 6: case 7: case 8: case 16: case 17: case 18: {
+        int n = f <= 4 ? 4 : f <= 8 ? 3 : 2;
+        for (int i = 0; i < n; i++) snprintf(w[i], 160, "bitcast<vec4<u32>>(%s).%c", v, "xyzw"[i]);
+        return n;
+    }
+    case 10: case 34: snprintf(w[0], 160, "pack2x16float(%s.xy)", v); snprintf(w[1], 160, "pack2x16float(%s.zw)", v); return f == 10 ? 2 : 1;
+    case 11: case 35: snprintf(w[0], 160, "pack2x16unorm(%s.xy)", v); snprintf(w[1], 160, "pack2x16unorm(%s.zw)", v); return f == 11 ? 2 : 1;
+    case 13: case 37: snprintf(w[0], 160, "pack2x16snorm(%s.xy)", v); snprintf(w[1], 160, "pack2x16snorm(%s.zw)", v); return f == 13 ? 2 : 1;
+    case 12: case 14: case 36: case 38:
+        snprintf(w[0], 160, "((bitcast<vec4<u32>>(%s).x & 0xFFFFu) | (bitcast<vec4<u32>>(%s).y << 16u))", v, v);
+        snprintf(w[1], 160, "((bitcast<vec4<u32>>(%s).z & 0xFFFFu) | (bitcast<vec4<u32>>(%s).w << 16u))", v, v);
+        return f == 12 || f == 14 ? 2 : 1;
+    case 28: case 29: snprintf(w[0], 160, "pack4x8unorm(%s)", v); return 1;
+    case 87: snprintf(w[0], 160, "pack4x8unorm(%s.zyxw)", v); return 1;
+    case 31: snprintf(w[0], 160, "pack4x8snorm(%s)", v); return 1;
+    case 30: case 32: snprintf(w[0], 160, "dot(bitcast<vec4<u32>>(%s) & vec4<u32>(0xFFu), vec4<u32>(1u, 256u, 65536u, 16777216u))", v); return 1;
+    case 24: snprintf(w[0], 160, "dot(vec4<u32>(round(clamp(%s, vec4<f32>(0.0), vec4<f32>(1.0)) * vec4<f32>(1023.0, 1023.0, 1023.0, 3.0))), vec4<u32>(1u, 1024u, 1048576u, 1073741824u))", v); return 1;
+    case 25: snprintf(w[0], 160, "dot(bitcast<vec4<u32>>(%s) & vec4<u32>(1023u, 1023u, 1023u, 3u), vec4<u32>(1u, 1024u, 1048576u, 1073741824u))", v); return 1;
+    }
+    return 0;
+}
+
 static void emit_uav_typed(Tw* tr, int opc, Op** o)
 {
     if (opc == 164) {
@@ -729,6 +821,19 @@ static void emit_uav_typed(Tw* tr, int opc, Op** o)
         int dim = tr->uav_dim[k], n = base_coords(dim);
         Str c = { 0 }, a = { 0 }, v = { 0 };
         src(tr, &c, o[1], -1, n, K_U);
+        const char* tag = tr->opt ? tr->opt->uav_format[k] : NULL;
+        int bfmt = dim == 1 && !tr->uav_atomic[k] && tag && !strncmp(tag, "buf:", 4) ? atoi(tag + 4) : 0;
+        char w[4][160];
+        int kind, nw = bfmt ? buf_pack(bfmt, "pv_", w, &kind) : 0;
+        if (nw) {
+            src(tr, &v, o[2], -1, 4, kind);
+            ind(tr);
+            sp(&tr->body, "{ let pv_ = %s; let ix_ = (%s) * %du;", v.p, c.p, nw);
+            for (int i = 0; i < nw; i++) sp(&tr->body, " u%d[ix_ + %du] = %s;", k, i, w[i]);
+            sp(&tr->body, " }\n");
+            free(c.p); free(v.p);
+            return;
+        }
         if (is_array(dim)) { sp(&a, ", "); Op t = *o[1]; t.swz[0] = o[1]->swz[n]; src(tr, &a, &t, -1, 1, K_U); }
         int ret = tr->uav_ret[k];
         const char* bf = tr->opt && dim != 1 ? tr->opt->uav_format[k] : NULL;
@@ -1362,6 +1467,7 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
                 int stride = r->type == T_UAV ? tr->uav_stride[r->idx[0].imm & 7] : out->srv[r->idx[0].imm & 127].stride;
                 if (stride) sp(&e, "%s(arrayLength(&%s) * 4u / %du)", nn == 1 ? "u32" : vt(K_U, nn), nm.p, stride);
                 else if (r->type == T_UAV ? tr->uav_raw[r->idx[0].imm & 7] : out->srv[r->idx[0].imm & 127].raw) sp(&e, "%s(arrayLength(&%s) * 4u)", nn == 1 ? "u32" : vt(K_U, nn), nm.p);
+                else if (r->type == T_RESOURCE && tb_fmt(tr, (int)(r->idx[0].imm & 127))) sp(&e, "%s(uew_tn%u())", nn == 1 ? "u32" : vt(K_U, nn), (unsigned)(r->idx[0].imm & 127));
                 else sp(&e, "%s(arrayLength(&%s))", nn == 1 ? "u32" : vt(K_U, nn), nm.p);
                 assign(tr, o[0], K_U, 0, e.p);
                 free(nm.p);
@@ -1428,6 +1534,27 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
                 sp(&g, "fn txr%d(i: u32) -> vec4<u32> { if (i >= txm[%du]) { return vec4<u32>(0u); } let b = txm[%du] + i * 4u; "
                    "return vec4<u32>(txm[b], txm[b + 1u], txm[b + 2u], txm[b + 3u]); }\n", i, h + 1, h);
             sp(&g, "fn txn%d() -> u32 { return txm[%du]; }\n", i, h + 1);
+            if (s->fmt) {
+                /* moved into the overflow buffer, which holds the expanded copy */
+                sp(&g, "fn uew_tb%d(i: u32) -> vec4<u32> { return txr%d(i); }\nfn uew_tn%d() -> u32 { return txn%d(); }\n", i, i, i, i);
+                s->fmt = 0;
+            }
+        } else if (s->buffer && s->fmt && !s->raw && !s->structured) {
+            Str b = { 0 };
+            int bpe = buf_unpack(s->fmt, &b);
+            sp(&g, "@group(%d) @binding(%d) var<storage, read> t%d: array<u32>;\n", rgrp, 16 + i, i);
+            sp(&g, "fn uew_tn%d() -> u32 { return arrayLength(&t%d) * 4u / %du; }\n", i, i, bpe);
+            sp(&g, "fn uew_tb%d(i: u32) -> vec4<u32> { if (i >= uew_tn%d()) { return vec4<u32>(0u); } ", i, i);
+            if (bpe >= 4) {
+                sp(&g, "let b = i * %du;", bpe / 4);
+                for (int k = 0; k < 4; k++) {
+                    if (k < bpe / 4) sp(&g, " let w%d = t%d[b + %du];", k, i, k);
+                    else sp(&g, " let w%d = 0u;", k);
+                }
+            } else if (bpe == 2) sp(&g, "let h = (t%d[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu;", i);
+            else sp(&g, "let y = (t%d[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu;", i);
+            sp(&g, " %s }\n", b.p);
+            free(b.p);
         } else if (s->buffer) {
             if (s->raw || s->structured) sp(&g, "@group(%d) @binding(%d) var<storage, read> t%d: array<u32>;\n", rgrp, 16 + i, i);
             else sp(&g, "@group(%d) @binding(%d) var<storage, read> t%d: array<vec4<u32>>;\n", rgrp, 16 + i, i);

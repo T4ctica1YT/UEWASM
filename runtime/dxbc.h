@@ -38,7 +38,8 @@ int dxbc_translate(const uint8_t* code, size_t size, DxShader* out);
 void dxbc_free(DxShader* s);
 
 /* merged: read-only buffer read from the shared overflow buffer (binding 176), 1-based index into its header */
-typedef struct DxSlot { int used, dim, ret, compare, buffer, raw, structured, stride, atomic, written, nofilter, merged; } DxSlot;
+/* fmt: typed buffer read in place in that DXGI format (bound as the raw buffer; 0 = the runtime expands it to vec4s) */
+typedef struct DxSlot { int used, dim, ret, compare, buffer, raw, structured, stride, atomic, written, nofilter, merged, fmt; } DxSlot;
 
 typedef struct DxWgsl {
     int stage;
@@ -66,6 +67,8 @@ typedef struct DxWgslOpts {
     /* integer SRVs whose texture is a 32-bit float format (D3D reinterprets the bits): declared f32, loads bitcast */
     uint32_t float_srv[4];
     const char* uav_format[8];
+    /* typed buffer SRVs: the bound view's DXGI format per slot, to unpack in place (0 = expanded copy) */
+    const uint8_t* srv_buf_fmt;
     /* lib: only declarations and <prefix>uew_body(), names prefixed, bindings from group `group`, for splicing into a compute shader */
     const char* prefix;
     int lib, group;
@@ -78,6 +81,8 @@ typedef struct DxWgslOpts {
 } DxWgslOpts;
 
 const char* dxbc_wgsl_helpers(void);
+/* bytes per element when a typed buffer of this DXGI format can be read in place, else 0 */
+int dxbc_wgsl_buf_bpe(int fmt);
 /* location of the flat render-target-layer varying that follows a signature with SV_RenderTargetArrayIndex, or -1 */
 int dxbc_layer_loc(const DxSig* s);
 

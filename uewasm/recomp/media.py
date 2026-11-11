@@ -60,7 +60,7 @@ def _key(*parts):
     return hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:20]
 
 
-def shrink(game_root, exe, out, height=720, mode="fast", log=print, progress=lambda s, d, t: None):
+def shrink(game_root, exe, out, height=720, mode="fast", log=print, progress=lambda s, d, t: None, key=None):
     """Returns {path relative to game_root: replacement file} for files that got smaller."""
     from . import upak
     game_root, out = Path(game_root), Path(out)
@@ -69,7 +69,6 @@ def shrink(game_root, exe, out, height=720, mode="fast", log=print, progress=lam
     jobs = []           # (source description, read source -> path, cached output path)
     paks = {}           # pak path -> (Pak, key, {entry name: cached path})
     loose = {}
-    key = None
     for p in sorted(game_root.rglob("*")):
         rel = p.relative_to(game_root).as_posix()
         if p.suffix.lower() == ".pak":

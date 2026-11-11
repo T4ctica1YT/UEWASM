@@ -159,7 +159,7 @@ HLE(WaitForMultipleObjects)
 {
     uint32_t n = (uint32_t)A1;
     uint64_t hs[64];
-    for (uint32_t i = 0; i < n && i < 64; i++) hs[i] = LD64(A2 + 8ull * i);
+    for (uint32_t i = 0; i < n && i < 64; i++) hs[i] = LDP(A2 + (uint64_t)GP * i);
     RET(wait_many(c, n, hs, (int)A3, (uint32_t)A4));
 }
 HLE(WaitForMultipleObjectsEx) { hle_WaitForMultipleObjects(c); }
@@ -167,15 +167,15 @@ HLE(SignalObjectAndWait) { Obj* o = handle_obj(A1); if (o && o->type == O_EVENT)
 
 /* condition variables: the word counts wakes; a sleeper drops its lock and blocks until the count moves (waking
    every sleeper on WakeConditionVariable is allowed: callers must recheck, as wakeups may be spurious on Windows) */
-HLE(InitializeConditionVariable) { ST64(A1, 0); RET(0); }
-HLE(WakeConditionVariable) { ST64(A1, LD64(A1) + 4); RET(0); }
-HLE(WakeAllConditionVariable) { ST64(A1, LD64(A1) + 4); RET(0); }
-static int cv_check(GThread* t) { return LD64(t->block_a) != t->block_b; }
+HLE(InitializeConditionVariable) { STP(A1, 0); RET(0); }
+HLE(WakeConditionVariable) { STP(A1, LDP(A1) + 4); RET(0); }
+HLE(WakeAllConditionVariable) { STP(A1, LDP(A1) + 4); RET(0); }
+static int cv_check(GThread* t) { return LDP(t->block_a) != t->block_b; }
 static int cv_sleep(CPU* c, uint64_t cv, uint32_t ms)
 {
     GThread* t = sched_current();
     t->block_a = cv;
-    t->block_b = LD64(cv);
+    t->block_b = LDP(cv);
     uint64_t deadline = ms == 0xFFFFFFFF ? ~0ull : host_ticks_ns() + (uint64_t)ms * 1000000ull;
     if (sched_block(c, cv_check, deadline)) return 1;
     hle_set_error(1460);
@@ -206,28 +206,28 @@ HLE(SleepConditionVariableSRW)
     srw_acquire(c, l, shared);
     RET(ok);
 }
-HLE(InitOnceInitialize) { ST64(A1, 0); RET(0); }
+HLE(InitOnceInitialize) { STP(A1, 0); RET(0); }
 HLE(InitOnceExecuteOnce)
 {
     uint64_t once = A1, fn = A2, param = A3, ctx = A4;
-    if (LD64(once) & 2) { if (ctx) ST64(ctx, LD64(once) & ~3ull); RET(1); return; }
+    if (LDP(once) & 2) { if (ctx) STP(ctx, LDP(once) & ~3ull); RET(1); return; }
     uint64_t args[3] = { once, param, ctx };
     uint64_t ok = rt_invoke(c, fn, 3, args);
-    if ((uint32_t)ok) ST64(once, (ctx ? LD64(ctx) & ~3ull : 0) | 2);
+    if ((uint32_t)ok) STP(once, (ctx ? LDP(ctx) & ~3ull : 0) | 2);
     RET((uint32_t)ok != 0);
 }
 /* the ntdll form of InitOnceExecuteOnce: returns an NTSTATUS */
 HLE(RtlRunOnceExecuteOnce)
 {
     uint64_t once = A1, fn = A2, param = A3, ctx = A4;
-    if (LD64(once) & 2) { if (ctx) ST64(ctx, LD64(once) & ~3ull); RET(0); return; }
+    if (LDP(once) & 2) { if (ctx) STP(ctx, LDP(once) & ~3ull); RET(0); return; }
     uint64_t args[3] = { once, param, ctx };
     uint64_t ok = rt_invoke(c, fn, 3, args);
-    if ((uint32_t)ok) ST64(once, (ctx ? LD64(ctx) & ~3ull : 0) | 2);
+    if ((uint32_t)ok) STP(once, (ctx ? LDP(ctx) & ~3ull : 0) | 2);
     RET((uint32_t)ok ? 0 : 0xC0000001);
 }
-HLE(InitOnceBeginInitialize) { ST32(A3, (LD64(A1) & 2) ? 0 : 1); if (A4) ST64(A4, LD64(A1) & ~3ull); RET(1); }
-HLE(InitOnceComplete) { ST64(A1, (A3 & ~3ull) | 2); RET(1); }
+HLE(InitOnceBeginInitialize) { ST32(A3, (LDP(A1) & 2) ? 0 : 1); if (A4) STP(A4, LDP(A1) & ~3ull); RET(1); }
+HLE(InitOnceComplete) { STP(A1, (A3 & ~3ull) | 2); RET(1); }
 static int addr_differs(GThread* t)
 {
     switch (t->block_n) {

@@ -3,6 +3,7 @@
 Encrypted indexes need the game's 32-byte AES key (find_aes_key looks for it in the executable)."""
 import os
 import re
+from pathlib import Path
 import struct
 from dataclasses import dataclass, field
 
@@ -340,3 +341,157 @@ def write_pak(pak, dst, replace, log=print):
         out.write(b"\0" * 16 + b"\0" + struct.pack("<IIqq", MAGIC, pak.version, index_off, len(prim)) + hashlib.sha1(prim).digest() + pak.footer_names)
     os.replace(dst + ".tmp", dst)
     return dst
+
+
+def parse_key(text):
+    """an AES-256 key as 64 hex digits (0x optional) or base64; None when it isn't one"""
+    import base64
+    t = (text or "").strip().replace(" ", "")
+    if t[:2].lower() == "0x":
+        t = t[2:]
+    if re.fullmatch(r"[0-9a-fA-F]{64}", t):
+        return bytes.fromhex(t)
+    try:
+        b = base64.b64decode(t, validate=True)
+    except ValueError:
+        return None
+    return b if len(b) == 32 else None
+
+
+def encrypted_paks(root):
+    """paks under root whose index is encrypted"""
+    out = []
+    for p in sorted(Path(root).rglob("*.pak")):
+        try:
+            if footer(p)[3]:
+                out.append(p)
+        except (ValueError, OSError):
+            pass
+    return out
+
+
+def check_key(pak, key):
+    """the key decrypts this pak's index into something that starts like one (a mount point FString)"""
+    _, off, _, enc, _ = footer(pak)
+    if not enc:
+        return True
+    with open(pak, "rb") as f:
+        f.seek(off)
+        d = _aes(key).decrypt(f.read(16))
+    n = struct.unpack_from("<i", d)[0]
+    return 0 < n < 1024 and (d[4:7] == b"../" or d[4:5] == b"/")
+
+
+def _legacy_index(idx, version):
+    """entries of a pre-path-hash index (versions 3-10): (name, entry offset, size, compressed blocks, flags byte position)"""
+    out = []
+    for _ in range(idx.i32()):
+        name = idx.fstring()
+        off, size, usize = idx.u64(), idx.u64(), idx.u64()
+        method = idx.u32()
+        if version <= 1:
+            idx.u64()
+        idx.raw(20)
+        blocks = []
+        if method:
+            blocks = [(idx.u64(), idx.u64()) for _ in range(idx.i32())]
+        flag_at = idx.p
+        flags = idx.raw(1)[0]
+        idx.u32()
+        out.append((name, off, size, method, blocks, flags, flag_at))
+    return out
+
+
+def encrypted_entries(path, key):
+    """how many entries of an older pak have encrypted data (0: only the index is encrypted)"""
+    version, off, isize, enc, _ = footer(path)
+    with open(path, "rb") as f:
+        f.seek(off)
+        b = f.read(isize)
+    r = Reader(_aes(key).decrypt(b) if enc else b)
+    r.fstring()
+    return sum(1 for e in _legacy_index(r, version) if e[5] & 1)
+
+
+def decrypt_pak(path, key, dst, log=print):
+    """A copy of an older pak (versions 4-10) with the index and every entry decrypted in place: same layout, flags
+    cleared, so the engine reads it as a plain pak (and the data compresses)."""
+    import hashlib
+    import shutil
+    version, off, isize, enc, _ = footer(path)
+    if not 4 <= version <= 10:
+        raise ValueError(f"{path}: pak version {version} can't be decrypted here (versions 4-10 are)")
+    if not check_key(path, key):
+        raise ValueError(f"{path}: the AES key doesn't decrypt this pak")
+    aes = _aes(key)
+    tmp = str(dst) + ".tmp"
+    shutil.copyfile(path, tmp)
+    with open(tmp, "r+b") as f:
+        f.seek(off)
+        index = bytearray(aes.decrypt(f.read(isize)) if enc else f.read(isize))
+        r = Reader(index)
+        r.fstring()
+        entries = _legacy_index(r, version)
+
+        def dec(a, n):
+            n = (n + 15) // 16 * 16
+            f.seek(a)
+            b = f.read(n)
+            f.seek(a)
+            f.write(aes.decrypt(b[:len(b) // 16 * 16]) + b[len(b) // 16 * 16:])
+        for name, eo, size, method, blocks, flags, flag_at in entries:
+            if not flags & 1:
+                continue
+            hdr = 53 + (4 + 16 * len(blocks) if method else 0)
+            if method:
+                for s, t in blocks:
+                    dec(s if version < 5 else eo + s, t - s)
+            else:
+                dec(eo + hdr, size)
+            f.seek(eo + hdr - 5)
+            f.write(bytes([flags & ~1]))
+            index[flag_at] = flags & ~1
+        f.seek(off)
+        f.write(index)
+        size = os.path.getsize(tmp)
+        f.seek(max(0, size - 1024))
+        tail = f.read()
+        i = tail.rfind(struct.pack("<I", MAGIC))
+        base = size - len(tail)
+        f.seek(base + i - 1)
+        f.write(b"\0")
+        f.seek(base + i + 24)
+        f.write(hashlib.sha1(index).digest())
+    os.replace(tmp, dst)
+    log(f"  {Path(path).name}: {sum(1 for e in entries if e[5] & 1)} of {len(entries)} entries decrypted")
+    return dst
+
+
+def decrypt_paks(game_root, key, out, log=print, progress=lambda s, d, t: None):
+    """{path relative to game_root: decrypted copy} for every encrypted pak the key opens; a wrong key raises"""
+    game_root, out = Path(game_root), Path(out)
+    paks = encrypted_paks(game_root)
+    bad = [p for p in paks if not check_key(p, key)]
+    if bad:
+        raise ValueError("The AES key is wrong for " + ", ".join(p.name for p in bad[:5]) + ". Enter the game's own correct AES key.")
+    result, total, done = {}, sum(p.stat().st_size for p in paks) or 1, 0
+    for p in paks:
+        rel = p.relative_to(game_root).as_posix()
+        version = footer(p)[0]
+        if version >= 11:
+            log(f"  {rel}: pak version {version}, left encrypted (the game decrypts it as it plays)")
+            continue
+        if not encrypted_entries(p, key):
+            log(f"  {rel}: only the index is encrypted; the game reads it with its own key, so it is served as it is")
+            continue
+        dst = out / "paks_decrypted" / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        stamp = dst.with_suffix(".stamp")
+        sig = f"{p.stat().st_size}:{p.stat().st_mtime_ns}:{key.hex()[:8]}"
+        if not (dst.exists() and stamp.exists() and stamp.read_text() == sig):
+            decrypt_pak(p, key, dst, log)
+            stamp.write_text(sig)
+        result[rel] = dst
+        done += p.stat().st_size
+        progress("decrypt", done, total)
+    return result

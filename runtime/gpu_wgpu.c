@@ -12,6 +12,7 @@
 int uewg_init(int w, int h, void* ring, int ring_size);
 int uewg_max_dynamic_ubo(void);
 int uewg_max_storage(void);
+int uewg_has_feature(const char* name);
 int uewg_buffer_create(int size, int usage);
 void uewg_buffer_write(int id, int offset, const void* p, int size);
 void uewg_buffer_copy_ring(int ring_off, int dst, int dst_off, int size, int ring_used);
@@ -285,6 +286,11 @@ static uint8_t* ring;
    over it (ring_gen counts wraps) */
 static uint32_t ring_size = 64u << 20, ring_used, ring_gen;
 static int pass_open;
+static int expand_bufs = -1;
+/* why open passes end (source line), for the per-frame report */
+static uint16_t brk_line[64]; static uint32_t brk_n[64];
+static void pass_break(int line) { if (pass_open) for (int i = 0; i < 64; i++) if (brk_line[i] == line || !brk_line[i]) { brk_line[i] = (uint16_t)line; brk_n[i]++; break; } pass_open = 0; }
+#define PASS_BREAK() pass_break(__LINE__)
 static uint32_t pass_gen = 1, bg_epoch = 1;   /* bumped when pass targets change / cached groups are dropped */
 static GpuView* pass_rt[8];
 static GpuView* pass_ds;
@@ -313,7 +319,7 @@ void uewg_buffer_copy(int src, int src_off, int dst, int dst_off, int size);
 static void ring_submit(void)
 {
     uewg_submit((int)ring_used);
-    pass_open = 0;
+    PASS_BREAK();
 }
 /* the ring is full: submit, then start over from the front */
 static void ring_flush(void)
@@ -321,7 +327,7 @@ static void ring_flush(void)
     uewg_flush((int)ring_used);
     ring_used = 0;
     ring_gen++;
-    pass_open = 0;
+    PASS_BREAK();
     g_serial++;
 }
 /* debug switches for the draw-path caches: ?nodrawmemo=1 ?norescache=1 ?noringkeep=1 */
@@ -337,7 +343,7 @@ static int ring_live(uint32_t gen, uint32_t off)
     return gen == ring_gen;
 }
 
-static uint64_t st_bg_rc, st_cb_same, st_ring_bytes, st_cb_hit, st_cb_miss, st_gs, st_static, st_bg_memo, st_bg_hash, st_bg_new;
+static uint64_t st_bg_rc, st_cb_same, st_ring_bytes, st_cb_hit, st_cb_miss, st_gs, st_static, st_bg_memo, st_bg_hash, st_bg_new, st_ind, st_iid_ind, st_iid_lost;
 static uint32_t ring_put(const void* p, uint32_t n, uint32_t pad_to)
 {
     st_ring_bytes += pad_to > n ? pad_to : n;
@@ -467,7 +473,7 @@ static void res_create(GpuRes* r, uint64_t init)
                     bpool[i] = bpool[--nbpool];
                     /* on the encoder, after the old owner's commands */
                     uewg_clear_buffer(t->id, 0, (int)r->width);
-                    pass_open = 0;
+                    PASS_BREAK();
                     return;
                 }
         t->id = uewg_buffer_create((int)r->width, u);
@@ -530,7 +536,7 @@ static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint3
     if (t->used == g_serial) {
         uint32_t ro = ring_put(p, n, (n + 3) & ~3u);
         uewg_buffer_copy_ring((int)ro, t->id, (int)(off & ~3u), (int)((n + 3) & ~3u), (int)ring_used);
-        pass_open = 0;
+        PASS_BREAK();
     } else uewg_buffer_write(t->id, (int)(off & ~3u), p, (int)n);
     (void)r;
 }
@@ -550,7 +556,7 @@ static void tex_write(WTex* t, int mip, int x, int y, int z, int w, int h, int d
     ring_used = off + (uint32_t)need;
     st_ring_bytes += need;
     uewg_texture_copy_ring((int)off, t->id, mip, x, y, z, w, h, d, (int)bpr, rows);
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src, uint32_t pitch, uint32_t slice)
@@ -749,15 +755,21 @@ static uint64_t sig_hash(const DxSig* s)
     return memo[k].h;
 }
 
+/* typed buffer SRV formats for the next variant() call (read in place by the shader), see buf_fmts */
+static const uint8_t* cur_bfmt;
+
 /* interp: for a vertex shader, the output interpolation its pixel shader asked for */
 static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* vs_out, const char* const* uav_fmt, const char* interp, int use_interp)
 {
+    const uint8_t* bf = cur_bfmt;
+    cur_bfmt = NULL;
     WShader* w = s ? s->backend : NULL;
     if (!w || !w->refl_ok) return NULL;
     uint64_t sh = sig_hash(vs_out);
     uint64_t key = 0x9E3779B97F4A7C15ull * (uint64_t)(use_interp + 1);
     if (uav_fmt) for (int i = 0; i < 8; i++) if (uav_fmt[i]) key = (key ^ (uint64_t)(uintptr_t)uav_fmt[i] ^ (uint64_t)i << 56) * 0x100000001B3ull;
     if (interp) for (int i = 0; i < 32; i++) if (interp[i]) key = (key ^ (uint64_t)(i << 8 | interp[i])) * 0x100000001B3ull;
+    if (bf) for (int i = 0; i < 128; i++) if (bf[i]) key = (key ^ ((uint64_t)i << 40 | bf[i])) * 0x100000001B3ull;
     for (Variant* v = w->vars; v; v = v->next)
         if (v->vkey == key && v->sig == sh && !memcmp(v->depth, depth, 32)) return v->failed ? NULL : v;
     Variant* v = calloc(1, sizeof *v);
@@ -774,6 +786,7 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* v
     memcpy(o.depth_srv, depth, 16);
     memcpy(o.float_srv, depth + 4, 16);
     if (uav_fmt) memcpy(o.uav_format, uav_fmt, sizeof o.uav_format);
+    o.srv_buf_fmt = bf;
     if (!dxbc_to_wgsl_ex(s->code, s->size, &o, &v->w) || !v->w.wgsl) {
         static int skipped;
         if (skipped++ < 40) host_log("[webgpu] shader skipped: %s", v->w.error);
@@ -784,6 +797,30 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* v
     free(v->w.wgsl);
     v->w.wgsl = NULL;
     return v;
+}
+
+/* formats of the typed buffer views a stage's shader reads, when they can be read in place (format known to the
+   translator, first element at a storage-offset boundary); returns a hash for the draw memo, 0 when there are none */
+static uint32_t buf_fmts(GpuCtx* c, int stage, uint8_t f[128])
+{
+    GpuShader* sh = c->sh[stage];
+    WShader* w = sh ? sh->backend : NULL;
+    uint32_t h = 0;
+    memset(f, 0, 128);
+    if (!w || !w->refl_ok || dbg_flag("expandbuffers", &expand_bufs)) return 0;
+    for (int k = 0; k < w->nsrv; k++) {
+        int i = w->srv_ix[k];
+        DxSlot* s = &w->refl.srv[i];
+        if (!s->buffer || s->raw || s->structured) continue;
+        GpuView* v = c->srv[stage][i];
+        if (!v || !v->res || v->res->type != RES_BUFFER || v->format >= 256) continue;
+        int bpe = dxbc_wgsl_buf_bpe((int)v->format);
+        WView* vw = V(v);
+        if (!bpe || !vw || ((uint64_t)vw->first_elem * (uint32_t)bpe) & 255) continue;
+        f[i] = (uint8_t)v->format;
+        h = (h ^ (uint32_t)(i << 8 | f[i])) * 16777619u;
+    }
+    return h;
 }
 
 static Variant* variant(GpuShader* s, const uint32_t depth[8], const DxSig* vs_out, const char* const* uav_fmt)
@@ -1052,7 +1089,7 @@ static int typed_buffer(GpuView* v, uint32_t* size)
     WView* w = V(v);
     GpuRes* r = v->res;
     WTex* t = T(r);
-    if (!w || !t || !r->backing) return 0;
+    if (!w || !t || (!r->backing && !(t->id && (r->bind & 0x80)))) return 0;
     uint32_t bpe = src_bpb(v->format);
     if (!bpe) bpe = 4;
     uint32_t n = w->num_elem;
@@ -1068,7 +1105,7 @@ static int typed_buffer(GpuView* v, uint32_t* size)
     if (w->typed_version != t->version && t->id && (r->bind & 0x80)) {
         /* compute shaders may write this buffer: expand from the GPU copy, which also holds every CPU upload */
         uewg_expand_typed(t->id, w->typed_buf, (int)w->first_elem, (int)n, (int)v->format, (int)bpe);
-        pass_open = 0;
+        PASS_BREAK();
         t->used = g_serial;
         w->typed_version = t->version;
     }
@@ -1135,7 +1172,7 @@ static int merged_buffer(GpuCtx* c, Variant* v, int stage, uint32_t* total)
     WTex tt = { .id = v->mbuf, .used = g_serial };
     buffer_put(NULL, &tt, 0, (const uint8_t*)hdr, (uint32_t)w->nmerged * 8);
     for (int k = 0; k < ncp; k++) uewg_buffer_copy(cp[k].id, (int)cp[k].off, v->mbuf, (int)cp[k].dst, (int)cp[k].size);
-    if (ncp) pass_open = 0;
+    if (ncp) PASS_BREAK();
     *total = pos;
     return v->mbuf;
 }
@@ -1279,7 +1316,19 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
         if (view && conflicts(view)) view = NULL;
         WTex* t = view ? T(view->res) : NULL;
         if (s->merged) continue;
-        if (s->buffer) {
+        if (s->buffer && s->fmt && !s->raw && !s->structured) {
+            WView* vw = view ? V(view) : NULL;
+            int bpe = dxbc_wgsl_buf_bpe(s->fmt);
+            uint64_t off = vw ? (uint64_t)vw->first_elem * (uint32_t)bpe : 0, size = vw ? (uint64_t)vw->num_elem * (uint32_t)bpe : 0;
+            if (t && t->id && view->res->type == RES_BUFFER && !(off & 255) && off < view->res->width) {
+                if (!size || off + size > view->res->width) size = view->res->width - off;
+                size = (size + 3) & ~3ull;
+                if (off + size > view->res->width) size = (view->res->width - off) & ~3ull;
+                t->used = g_serial;
+                if (size) { ENT(16 + i, E_BUF, t->id, (uint32_t)off, (uint32_t)size); continue; }
+            }
+            ENT(16 + i, E_DUMMY_BUF);
+        } else if (s->buffer) {
             uint32_t off = 0, size = 0;
             int id = srv_buffer(view, s, &off, &size);
             if (id && size) ENT(16 + i, E_BUF, id, off, size);
@@ -1331,7 +1380,7 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
             t->version++;
             if (view->res->type == RES_BUFFER) {
                 WView* vw = V(view);
-                uint32_t stride = view->res->stride && (u->structured) ? view->res->stride : 4;
+                uint32_t stride = view->res->stride && (u->structured) ? view->res->stride : !u->raw && src_bpb(view->format) >= 4 ? src_bpb(view->format) : 4;
                 uint32_t off = vw->first_elem * stride, size = vw->num_elem * stride;
                 if ((off & 255) || !size || off + size > view->res->width) { off = 0; size = view->res->width; }
                 ENT(180 + i, E_BUF, t->id, off, size & ~3u);
@@ -1470,8 +1519,42 @@ static int cb_bind(GpuCtx* c, Program* p, Variant* v, int stage, int s, int32_t*
 
 /* ---- render passes ---- */
 
+/* D3D draws with no render target and no depth buffer (pixel shaders writing UAVs only); WebGPU passes need an
+   attachment, so those passes get a shared scratch target the size of the viewport that nothing is written to */
+static int null_view;
+static uint32_t null_w, null_h;
+static int no_targets(GpuCtx* c)
+{
+    for (int i = 0; i < 8; i++) if (c->rtv[i] && V(c->rtv[i]) && V(c->rtv[i])->rt_view) return 0;
+    return !(c->dsv && V(c->dsv) && V(c->dsv)->rt_view);
+}
+static void null_target(GpuCtx* c)
+{
+    uint32_t w = 1, h = 1;
+    for (int i = 0; i < (c->nvp ? c->nvp : 0); i++) {
+        float x = c->vp[i].x + c->vp[i].w, y = c->vp[i].y + c->vp[i].h;
+        if (x > (float)w) w = (uint32_t)(x + 0.999f);
+        if (y > (float)h) h = (uint32_t)(y + 0.999f);
+    }
+    if (w > 8192) w = 8192;
+    if (h > 8192) h = 8192;
+    if (null_view && w <= null_w && h <= null_h) return;
+    if (w < null_w) w = null_w;
+    if (h < null_h) h = null_h;
+    breset(&jb);
+    bp(&jb, "{\"w\":%u,\"h\":%u,\"d\":1,\"mips\":1,\"format\":\"r8unorm\",\"dim\":\"2d\",\"rt\":1,\"uav\":0}", w, h);
+    int tex = uewg_texture_create(jb.p);
+    breset(&jb);
+    bp(&jb, "{\"tex\":%d,\"dim\":\"2d\",\"mip\":0,\"mips\":1,\"layer\":0,\"layers\":1,\"aspect\":\"all\"}", tex);
+    null_view = uewg_view_create(jb.p);
+    null_w = w; null_h = h;
+    PASS_BREAK();
+}
+
 static void ensure_pass(GpuCtx* c, uint32_t* w, uint32_t* h)
 {
+    int none = no_targets(c);
+    if (none) null_target(c);
     int same = pass_open && pass_ds == c->dsv;
     for (int i = 0; i < 8 && same; i++) if (pass_rt[i] != c->rtv[i]) same = 0;
     *w = 0; *h = 0;
@@ -1480,6 +1563,7 @@ static void ensure_pass(GpuCtx* c, uint32_t* w, uint32_t* h)
         if (v && v->res) { WView* vw = V(v); uint32_t m = vw ? vw->mip : 0; *w = v->res->width >> m; *h = v->res->height >> m; break; }
     }
     if (!*w && c->dsv && c->dsv->res) { WView* vw = V(c->dsv); uint32_t m = vw ? vw->mip : 0; *w = c->dsv->res->width >> m; *h = c->dsv->res->height >> m; }
+    if (none) { *w = null_w; *h = null_h; }
     if (!*w) *w = 1;
     if (!*h) *h = 1;
     if (same) return;
@@ -1495,6 +1579,7 @@ static void ensure_pass(GpuCtx* c, uint32_t* w, uint32_t* h)
         if (vw && vw->rt_view) bp(&jb, "%s{\"view\":%d,\"slice\":%d}", i ? "," : "", vw->rt_view, vw->slice);
         else bp(&jb, "%snull", i ? "," : "");
     }
+    if (none && null_view) bp(&jb, "{\"view\":%d,\"slice\":-1}", null_view);
     bp(&jb, "]");
     WView* dv = c->dsv ? V(c->dsv) : NULL;
     if (dv && dv->rt_view) {
@@ -1515,7 +1600,7 @@ static void clear_rtv(GpuView* v, const float* rgba)
     breset(&jb);
     bp(&jb, "{\"color\":[{\"view\":%d,\"slice\":%d,\"clear\":[%g,%g,%g,%g]}]}", w->rt_view, w->slice, rgba[0], rgba[1], rgba[2], rgba[3]);
     uewg_clear(jb.p, (int)ring_used);
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 static void clear_dsv(GpuView* v, uint32_t flags, float depth, uint8_t stencil)
@@ -1530,7 +1615,7 @@ static void clear_dsv(GpuView* v, uint32_t flags, float depth, uint8_t stencil)
     if ((flags & 2) && has_st) bp(&jb, ",\"sclear\":%u", stencil);
     bp(&jb, "}}");
     uewg_clear(jb.p, (int)ring_used);
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 /* ---- pipelines ---- */
@@ -1698,6 +1783,7 @@ static void key_targets(GpuCtx* c, PipeKey* k)
         const char* real = T(c->rtv[i]->res)->fmt.name;
         if (rf.name && real && strcmp(rf.name, real)) k->rt_fmt[i] = !strcmp(real, "r32float") ? 41 : !strcmp(real, "rg32float") ? 16 : 10; }
     if (c->dsv && V(c->dsv) && V(c->dsv)->rt_view) { k->ds_fmt = c->dsv->res->format; k->ds_ro = (uint8_t)V(c->dsv)->read_only; }
+    if (no_targets(c)) k->rt_fmt[0] = 61;
     k->sample_mask = c->sample_mask ? c->sample_mask : 0xFFFFFFFFu;
 }
 
@@ -2169,7 +2255,7 @@ static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vert
         if (has_depth) { int sl; pk[n++] = layer_view(c->dsv, L, &sl); }
     }
     uewg_gs(pk);
-    pass_open = 0;
+    PASS_BREAK();
     drawn++;
 }
 
@@ -2195,7 +2281,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
         uint32_t rtfmt[8], rtview[8];
         GpuView* dsv;
         GpuRes* dsres;
-        uint32_t dsfmt, dsro, dsview, stride[16], sample_mask, topology, strip32;
+        uint32_t dsfmt, dsro, dsview, stride[16], sample_mask, topology, strip32, vbf, pbf;
     } dk, last_dk;
     static struct { int valid; Variant *vs, *ps; Program* p; int pipe; } dmemo;
     memset(&dk, 0, sizeof dk);
@@ -2212,6 +2298,9 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     if (c->dsv) { dk.dsv = c->dsv; dk.dsres = c->dsv->res; dk.dsfmt = c->dsv->res ? c->dsv->res->format : 0; dk.dsro = V(c->dsv) ? (uint32_t)V(c->dsv)->read_only : 0; dk.dsview = V(c->dsv) ? (uint32_t)V(c->dsv)->rt_view : 0; }
     for (int i = 0; i < 16; i++) dk.stride[i] = c->vb[i] ? c->vb_stride[i] : 0;
     dk.sample_mask = c->sample_mask; dk.topology = c->topology; dk.strip32 = c->ib_format == 42;
+    static uint8_t vbfmt[128], pbfmt[128];
+    dk.vbf = buf_fmts(c, SH_VS, vbfmt);
+    dk.pbf = c->sh[SH_PS] ? buf_fmts(c, SH_PS, pbfmt) : 0;
     Variant *vs, *ps = NULL;
     Program* p;
     int pipe;
@@ -2221,13 +2310,16 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
         ensure_pass(c, &w, &h);
     } else {
         dmemo.valid = 0;
+        cur_bfmt = vbfmt;
         vs = variant(c->sh[SH_VS], vdm, NULL, NULL);
         if (!vs) DROP(2);
         if (c->sh[SH_PS]) {
+            cur_bfmt = pbfmt;
             ps = variant_ex(c->sh[SH_PS], dm, &vs->w.out, NULL, NULL, 1);
             if (!ps) DROP(3);
             int any = 0;
             for (int i = 0; i < 32; i++) any |= ps->w.interp[i];
+            if (any) cur_bfmt = vbfmt;
             if (any && !(vs = variant_ex(c->sh[SH_VS], vdm, NULL, NULL, ps->w.interp, 0))) DROP(2);
         }
         p = program(vs, ps, NULL, NULL);
@@ -2263,12 +2355,14 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     /* likewise SV_VertexID of an indexed draw is the index alone, without the base vertex (Unreal's manual vertex fetch
        adds that itself), while WebGPU's vertex_index includes it: move the per-vertex buffers instead */
     WShader* vsw = c->sh[SH_VS] ? (WShader*)c->sh[SH_VS]->backend : NULL;
+    if (indirect) { st_ind++; if (vsw && vsw->refl.uses_instance_id) st_iid_ind++; }
+    else if (first_instance && shift != first_instance && vsw && vsw->refl.uses_instance_id) st_iid_lost++;
     uint32_t vshift = !indirect && indexed && base_vertex > 0 && vsw && vsw->refl_ok && vsw->refl.uses_vertex_id ? (uint32_t)base_vertex : 0;
     for (int i = 0; i < 16 && vshift; i++)
         if (!inst_step[i] && c->vb[i] && dk.stride[i] && ((uint64_t)c->vb_offset[i] + (uint64_t)vshift * c->vb_stride[i] >= c->vb[i]->width || (vshift * c->vb_stride[i]) & 3)) vshift = 0;
     for (int i = 0; i < 16; i++) {
         WTex* t = T(c->vb[i]);
-        if (!t || !t->id || !dk.stride[i]) {
+        if (!t || !t->id || !(want_vb >> i & 1)) {
             /* D3D reads zeros from an unbound slot; WebGPU needs a buffer there */
             if (want_vb >> i & 1) { pk[n++] = i; pk[n++] = -1; pk[n++] = 0; nvb++; }
             continue;
@@ -2301,12 +2395,26 @@ static void dispatch(GpuCtx* c, uint32_t x, uint32_t y, uint32_t z)
     const char* uf[8] = { 0 };
     WShader* ws = c->sh[SH_CS]->backend;
     if (!ws || !ws->refl_ok) return;
+    static char buf_tags[128][8];
     for (int i = 0; i < 8; i++) {
-        if (!ws->refl.uav[i].used || ws->refl.uav[i].buffer || ws->refl.uav[i].raw || ws->refl.uav[i].structured || ws->refl.uav[i].dim == 1) continue;
+        if (!ws->refl.uav[i].used || ws->refl.uav[i].raw || ws->refl.uav[i].structured) continue;
+        if (ws->refl.uav[i].buffer || ws->refl.uav[i].dim == 1) {
+            /* typed buffer UAVs wider or narrower than one 32-bit channel: stores pack to the view's format */
+            GpuView* v = c->uav[i];
+            uint32_t f = v && v->res && v->res->type == RES_BUFFER ? v->format : 0;
+            if (f && f < 128 && f != 41 && f != 42 && f != 43 && src_bpb(f) >= 4) {
+                if (!buf_tags[f][0]) snprintf(buf_tags[f], sizeof buf_tags[f], "buf:%u", f);
+                uf[i] = buf_tags[f];
+            }
+            continue;
+        }
         GpuView* v = c->uav[i];
         WTex* t = v ? T(v->res) : NULL;
         if (t && t->fmt.name && v->res->type != RES_BUFFER) uf[i] = t->fmt.name;
     }
+    static uint8_t cbfmt[128];
+    buf_fmts(c, SH_CS, cbfmt);
+    cur_bfmt = cbfmt;
     Variant* cs = variant(c->sh[SH_CS], dm, NULL, uf);
     if (!cs) return;
     Program* p = program(NULL, NULL, cs, uf);
@@ -2341,7 +2449,7 @@ static void dispatch(GpuCtx* c, uint32_t x, uint32_t y, uint32_t z)
     } else { pk[n++] = (int32_t)x; pk[n++] = (int32_t)y; pk[n++] = (int32_t)z; }
     pk[n++] = (int32_t)ring_used;
     uewg_dispatch(pk);
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 /* ---- copies, present ---- */
@@ -2357,7 +2465,7 @@ static void copy(GpuRes* dst, uint32_t dsub, uint32_t dx, uint32_t dy, uint32_t 
         d->version++;
         free(d->shadow);
         d->shadow = NULL;
-        if (d->id && s->id && !(so & 3) && !(dx & 3)) { uewg_copy_buffer(s->id, (int)so, d->id, (int)dx, (int)n); pass_open = 0; d->used = s->used = g_serial; }
+        if (d->id && s->id && !(so & 3) && !(dx & 3)) { uewg_copy_buffer(s->id, (int)so, d->id, (int)dx, (int)n); PASS_BREAK(); d->used = s->used = g_serial; }
         return;
     }
     if (!d->id || !s->id || dst->type == RES_BUFFER || src->type == RES_BUFFER) return;
@@ -2376,7 +2484,7 @@ static void copy(GpuRes* dst, uint32_t dsub, uint32_t dx, uint32_t dy, uint32_t 
     uewg_copy_texture(s->id, (int)smip, src->type == RES_TEX3D ? 0 : (int)sl, (int)sx, (int)sy, (int)sz, d->id, (int)dmip, dst->type == RES_TEX3D ? 0 : (int)dl,
                       (int)dx, (int)dy, (int)dz, (int)w, (int)h, (int)dd);
     d->used = s->used = g_serial;
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 /* GPU -> CPU for Map(READ) of staging resources: submit what's pending, then wait for the copy (the import suspends) */
@@ -2428,6 +2536,23 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
         host_log("[webgpu] per frame: %u draws, %u GS draws, CB ring %.0f KB (%llu hits, %llu unchanged, %llu copies), %llu per-draw CB groups, res groups %llu memo / %llu cached / %llu hashed / %llu new, %d live",
                  drawn / 600, (unsigned)(st_gs / 600), st_ring_bytes / 600 / 1024.0, (unsigned long long)(st_cb_hit / 600), (unsigned long long)(st_cb_same / 600), (unsigned long long)(st_cb_miss / 600),
                  (unsigned long long)(st_static / 600), (unsigned long long)(st_bg_memo / 600), (unsigned long long)(st_bg_rc / 600), (unsigned long long)(st_bg_hash / 600), (unsigned long long)(st_bg_new / 600), bg_count);
+        if (st_ind || st_iid_lost) host_log("[webgpu] per frame: %.1f indirect draws (%.1f read SV_InstanceID), %.1f direct draws lost their start instance",
+                                            st_ind / 600.0, st_iid_ind / 600.0, st_iid_lost / 600.0);
+        st_ind = st_iid_ind = st_iid_lost = 0;
+        {
+            char m[512]; int o = 0;
+            uint32_t total = 0;
+            for (int i = 0; i < 64; i++) total += brk_n[i];
+            for (int k = 0; k < 6 && total > 600 * 20; k++) {
+                int best = -1;
+                for (int i = 0; i < 64; i++) if (brk_n[i] && (best < 0 || brk_n[i] > brk_n[best])) best = i;
+                if (best < 0) break;
+                o += snprintf(m + o, sizeof m - o, " line %u: %.1f", brk_line[best], brk_n[best] / 600.0);
+                brk_n[best] = 0;
+            }
+            if (o) host_log("[webgpu] pass breaks per frame by source line:%s", m);
+            memset(brk_n, 0, sizeof brk_n);
+        }
         st_bg_rc = st_ring_bytes = st_cb_hit = st_cb_same = st_cb_miss = st_gs = st_static = st_bg_memo = st_bg_hash = st_bg_new = 0;
         memset(drops, 0, sizeof drops);
         drawn = 0;
@@ -2443,7 +2568,7 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
     for (int i = 0; i < ntemp_views; i++) uewg_release(temp_views[i]);
     ntemp_views = 0;
     ngs_old = 0;
-    pass_open = 0;
+    PASS_BREAK();
     g_serial++;
     memset(pass_rt, 0, sizeof pass_rt);
     pass_gen++;
@@ -2464,7 +2589,7 @@ static void clear_uav(GpuView* v, const uint32_t* val, int is_float)
         size = (size + 3) & ~3u;
         uint32_t word = val[0];
         if (is_float) { float f; memcpy(&f, &val[0], 4); word = (uint32_t)f; }
-        if (!word) { uewg_clear_buffer(t->id, (int)off, (int)size); pass_open = 0; return; }
+        if (!word) { uewg_clear_buffer(t->id, (int)off, (int)size); PASS_BREAK(); return; }
         /* non-zero fill: a pattern in the ring, copied in order with the other commands */
         for (uint32_t done = 0; done < size;) {
             uint32_t n = size - done > (1u << 20) ? 1u << 20 : size - done;
@@ -2475,7 +2600,7 @@ static void clear_uav(GpuView* v, const uint32_t* val, int is_float)
             uewg_buffer_copy_ring((int)ro, t->id, (int)(off + done), (int)n, (int)ring_used);
             done += n;
         }
-        pass_open = 0;
+        PASS_BREAK();
         t->used = g_serial;
         return;
     }
@@ -2498,7 +2623,7 @@ static void clear_uav(GpuView* v, const uint32_t* val, int is_float)
         if (ntemp_views < 4096) temp_views[ntemp_views++] = id;
     }
     t->used = g_serial;
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 static void gen_mips(GpuView* v)
@@ -2507,7 +2632,7 @@ static void gen_mips(GpuView* v)
     if (!g_ok || !t || !t->id || t->mips < 2 || v->res->type == RES_TEX3D) return;
     uewg_gen_mips(t->id);
     t->used = g_serial;
-    pass_open = 0;
+    PASS_BREAK();
 }
 
 static void layout_create(GpuLayout* l) { (void)l; }
@@ -2526,7 +2651,7 @@ static void view_destroy(GpuView* v)
 /* freed views/resources may come back at the same address: drop pointer-keyed state */
 static void forget(void)
 {
-    pass_open = 0;
+    PASS_BREAK();
     memset(pass_rt, 0, sizeof pass_rt);
     pass_ds = NULL;
     pass_gen++;
@@ -2549,9 +2674,28 @@ static int timestamp_get(uint32_t ticket, uint64_t* ns)
     return 1;
 }
 
+/* WebGPU write-only storage formats: the core set, bgra8unorm with its feature, the 8/16-bit and packed ones with
+   texture-formats-tier1 */
+static int uav_store(uint32_t f)
+{
+    const char* n = texfmt(f, 0).name;
+    if (!n) return 0;
+    static const char* core[] = { "rgba8unorm", "rgba8snorm", "rgba8uint", "rgba8sint", "rgba16uint", "rgba16sint", "rgba16float",
+        "r32uint", "r32sint", "r32float", "rg32uint", "rg32sint", "rg32float", "rgba32uint", "rgba32sint", "rgba32float" };
+    static const char* tier1[] = { "r8unorm", "r8snorm", "r8uint", "r8sint", "rg8unorm", "rg8snorm", "rg8uint", "rg8sint", "r16uint",
+        "r16sint", "r16float", "rg16uint", "rg16sint", "rg16float", "rgb10a2uint", "rgb10a2unorm", "rg11b10ufloat", "r16unorm",
+        "r16snorm", "rg16unorm", "rg16snorm", "rgba16unorm", "rgba16snorm" };
+    for (size_t i = 0; i < sizeof core / sizeof *core; i++) if (!strcmp(n, core[i])) return 1;
+    if (!strcmp(n, "bgra8unorm")) return uewg_has_feature("bgra8unorm-storage");
+    static int t1 = -1;
+    if (t1 < 0) t1 = uewg_has_feature("texture-formats-tier1");
+    if (t1) for (size_t i = 0; i < sizeof tier1 / sizeof *tier1; i++) if (!strcmp(n, tier1[i])) return 1;
+    return 0;
+}
+
 static GpuBackend wgpu = { "WebGPU", res_create, res_upload, res_destroy, view_create, shader_create, state_create, layout_create,
                            clear_rtv, clear_dsv, draw, dispatch, copy, readback, present, NULL, clear_uav, gen_mips, view_destroy, forget,
-                           timestamp, timestamp_get };
+                           timestamp, timestamp_get, uav_store };
 
 GpuBackend* gpu_wgpu_backend(void)
 {

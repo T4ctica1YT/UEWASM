@@ -43,6 +43,11 @@ class PE:
     tls_callbacks: list = field(default_factory=list)
     tls: dict = field(default_factory=dict)
     dirs: list = field(default_factory=list)
+    bits: int = 64
+
+    @property
+    def ptr(self):
+        return self.bits // 8
 
     def off(self, rva):
         for s in self.sections:
@@ -58,6 +63,9 @@ class PE:
     def u64(self, rva):
         o = self.off(rva)
         return struct.unpack_from("<Q", self.data, o)[0]
+
+    def uptr(self, rva):
+        return self.u64(rva) if self.bits == 64 else self.u32(rva)
 
     def cstr(self, rva):
         o = self.off(rva)
@@ -81,9 +89,10 @@ class PE:
             n = min(s.rsize, s.vsize or s.rsize)
             img[s.rva:s.rva + n] = self.data[s.raw:s.raw + n]
         delta = base - self.image_base
+        f = "<Q" if self.bits == 64 else "<I"
         for rva in self.relocs:
-            v = struct.unpack_from("<Q", img, rva)[0]
-            struct.pack_into("<Q", img, rva, (v + delta) & 0xFFFFFFFFFFFFFFFF)
+            v = struct.unpack_from(f, img, rva)[0]
+            struct.pack_into(f, img, rva, (v + delta) & ((1 << self.bits) - 1))
         return bytes(img)
 
 
@@ -99,17 +108,21 @@ def load(path):
     if data[pe_off:pe_off + 4] != b"PE\0\0":
         raise ValueError("bad PE signature")
     machine, nsec, _, _, _, optsize, _ = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
-    if machine != 0x8664:
-        raise ValueError("only x86-64 executables are supported")
+    if machine not in (0x8664, 0x14C):
+        raise ValueError("only x86 and x86-64 executables are supported")
     opt = pe_off + 24
-    if struct.unpack_from("<H", data, opt)[0] != 0x20B:
-        raise ValueError("not a PE32+ image")
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if (machine, magic) not in ((0x8664, 0x20B), (0x14C, 0x10B)):
+        raise ValueError("unexpected optional header")
+    bits = 64 if magic == 0x20B else 32
     entry = struct.unpack_from("<I", data, opt + 16)[0]
-    image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+    image_base = struct.unpack_from("<Q", data, opt + 24)[0] if bits == 64 else struct.unpack_from("<I", data, opt + 28)[0]
     image_size = struct.unpack_from("<I", data, opt + 56)[0]
-    ndirs = struct.unpack_from("<I", data, opt + 108)[0]
-    dirs = [struct.unpack_from("<II", data, opt + 112 + 8 * i) for i in range(ndirs)]
-    pe = PE(path, data, image_base, entry, image_size, dirs=dirs)
+    dd = opt + (112 if bits == 64 else 96)
+    ndirs = struct.unpack_from("<I", data, dd - 4)[0]
+    dirs = [struct.unpack_from("<II", data, dd + 8 * i) for i in range(ndirs)]
+    pe = PE(path, data, image_base, entry, image_size, dirs=dirs, bits=bits)
+    P = pe.ptr
     so = opt + optsize
     for i in range(nsec):
         name = data[so:so + 8].rstrip(b"\0").decode("latin-1")
@@ -131,13 +144,13 @@ def load(path):
             dll = pe.cstr(name_rva)
             q, slot = ilt or iat, iat
             while True:
-                v = pe.u64(q)
+                v = pe.uptr(q)
                 if not v:
                     break
-                name = f"#{v & 0xFFFF}" if v >> 63 else pe.cstr((v & 0x7FFFFFFF) + 2)
+                name = f"#{v & 0xFFFF}" if v >> (bits - 1) else pe.cstr((v & 0x7FFFFFFF) + 2)
                 pe.imports.append(Import(dll, name, slot))
-                q += 8
-                slot += 8
+                q += P
+                slot += P
             p += 20
 
     rva, size = d(0)
@@ -167,7 +180,7 @@ def load(path):
             break
         for i in range((bsize - 8) // 2):
             e = struct.unpack_from("<H", data, pe.off(p + 8 + 2 * i))[0]
-            if e >> 12 == 10:
+            if e >> 12 == (10 if bits == 64 else 3):
                 pe.relocs.append(page + (e & 0xFFF))
         p += bsize
 
@@ -196,12 +209,12 @@ def load(path):
 
     rva, size = d(9)
     if rva:
-        start, end, idx, cb = struct.unpack_from("<QQQQ", data, pe.off(rva))
-        zero, chars = struct.unpack_from("<II", data, pe.off(rva) + 32)
+        start, end, idx, cb = struct.unpack_from("<QQQQ" if bits == 64 else "<IIII", data, pe.off(rva))
+        zero, chars = struct.unpack_from("<II", data, pe.off(rva) + 4 * P)
         pe.tls = {"start": start - image_base, "end": end - image_base, "index": idx - image_base, "zero": zero}
         if cb:
             p = cb - image_base
-            while pe.off(p) is not None and pe.u64(p):
-                pe.tls_callbacks.append(pe.u64(p) - image_base)
-                p += 8
+            while pe.off(p) is not None and pe.uptr(p):
+                pe.tls_callbacks.append(pe.uptr(p) - image_base)
+                p += P
     return pe

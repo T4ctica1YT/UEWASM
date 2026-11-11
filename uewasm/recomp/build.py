@@ -53,6 +53,10 @@ def refresh_thunks(gen):
     listed = set(re.findall(r'^    \{\w+, "([^"]+)", "[^"]*", \w+\},', text, re.M))
     new = sorted({n for n in re.findall(r'^    \{NULL, "(\w+)", "[^"]*", NULL\},', text, re.M) if n in hle} - have)
     extra = sorted(hle - listed - have)
+    if "RT_G32" not in text:
+        text += "const int RT_G32 = 0;\nconst unsigned short rt_thunk_pops[] = {0};\n"
+        if not new and not extra:
+            write_if_changed(meta, text)
     if not new and not extra:
         return 0
     text = re.sub(r'^    \{NULL, "(\w+)", ("[^"]*"), NULL\},',
@@ -62,6 +66,10 @@ def refresh_thunks(gen):
         j = text.index("};", text.index("const Thunk rt_thunks[] = {"))
         text = text[:j] + "".join(f'    {{hle_{n}, "{n}", "hle", T_{n}}},\n' for n in extra) + text[j:]
         text = re.sub(r"const size_t rt_thunk_count = (\d+);", lambda m: f"const size_t rt_thunk_count = {int(m[1]) + len(extra)};", text)
+        if "const int RT_G32 = 1;" in text:
+            from . import stdcall
+            add = ", ".join(str(stdcall.pops("", n) or 0) for n in extra)
+            text = re.sub(r"(const unsigned short rt_thunk_pops\[\] = \{[^}]*)\};", lambda m: m[1] + ", " + add + "};", text)
     new = sorted(set(new) | set(extra))
     decl = "".join(f"void hle_{n}(CPU*);\n" for n in new)
     decl += "".join(f"static void T_{n}(CPU* c) {{ if (rt_trace_on > 0) rt_trace_call(c, \"{n}\"); hle_{n}(c); c->r[4] += 8; "
@@ -71,6 +79,25 @@ def refresh_thunks(gen):
     return len(new)
 
 
+def thunk_pops(thunks, bits):
+    """rt_thunk_pops[]: argument bytes each import's callee pops (32-bit stdcall); unknown ones are listed"""
+    if bits != 32:
+        return "const unsigned short rt_thunk_pops[] = {0};"
+    from . import stdcall
+    vals, unknown = [], []
+    for name, dll in thunks:
+        v = stdcall.pops(dll if dll != "hle" else "", name)
+        if v is None:
+            if dll != "hle":
+                unknown.append(name)
+            v = 0
+        vals.append(v)
+    stdcall.save()
+    if unknown:
+        print(f"  stack argument size unknown for {len(unknown)} imports (taken as 0): {', '.join(unknown[:12])}")
+    return "const unsigned short rt_thunk_pops[] = {" + ", ".join(map(str, vals)) + "};"
+
+
 _W = {}
 
 # Win64: a call may change these (rax rcx rdx r8-r11); rsp comes back moved by the callee's ret
@@ -78,15 +105,15 @@ VOLATILE = {0, 1, 2, 4, 8, 9, 10, 11}
 _WRITE = re.compile(r"\bR\((\d+)\)\s*(?:[-+&|^]|<<|>>)?=(?!=)")
 
 
-def regs_local(body):
+def regs_local(body, bits=64):
     """expands SPILL/FILL/FILLV for one lifted function: spill only registers it writes, reload only ones it reads
-    (after a guest call, only those the callee may have changed)"""
+    (after a guest call, only those the callee may have changed; 32-bit code has no fixed convention to lean on)"""
     text = "\n".join(body)
     used = sorted({int(n) for n in re.findall(r"\bR\((\d+)\)", text)})
     wrote = sorted({int(n) for n in _WRITE.findall(text)})
     spill = "".join(f"c->r[{n}] = r{n}_; " for n in wrote) or ""
     fill = "".join(f"r{n}_ = c->r[{n}]; " for n in used)
-    fillv = "".join(f"r{n}_ = c->r[{n}]; " for n in used if n in VOLATILE)
+    fillv = "".join(f"r{n}_ = c->r[{n}]; " for n in used if n in VOLATILE or bits == 32)
     return [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
 
 
@@ -118,7 +145,7 @@ def _lift_chunk(args):
         bad += fn.lift()
         out.append(f"void F_{r:x}(CPU* __restrict c) {{")
         entry = "2" if prog.func_start(r) or not prog.flags_live(r) else "rt_xfl"
-        body = regs_local(fn.out)
+        body = regs_local(fn.out, prog.bits)
         used = sorted({int(n) for l in body for n in re.findall(r"\bR\((\d+)\)", l)})
         decl = (" uint64_t " + ", ".join(f"r{n}_ = c->r[{n}]" for n in used) + ";") if used else ""
         out.append(f"    uint8_t* const mem_ = MEM; Flags F = {{0}}; F.fop = F_RAW; F.rawfl = {entry}; F.fsz = 64;{decl}")
@@ -130,8 +157,9 @@ def _lift_chunk(args):
         out.append("")
     prog.cache.clear()
     text = "\n".join(out)
-    if "rt_sj_slot(" in text:
-        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);', 1)
+    if "rt_sj_slot(" in text or "rt_sj_slot32(" in text:
+        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\n'
+                            'jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);', 1)
     if "rt_xfl" in text:
         text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + XFL_DECL, 1)
     write_if_changed(out_path, text)
@@ -212,6 +240,7 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
 
     lines = ['#include "host.h"', '#include "funcs.h"', ""]
     lines.append(f"const uint64_t IMAGE_LO = 0x{lo:x}ull, IMAGE_HI = 0x{link.end:x}ull, GUEST_MEM_MB = {mem_mb}ull;")
+    lines.append(f"const int RT_G32 = {int(link.bits == 32)};")
     cbs = []
     lines.append("const ModuleInfo rt_modules[] = {")
     for m in link.init_order:
@@ -237,6 +266,7 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
         lines.append(f"    {{{fn}, {c_str(name)}, {c_str(dll)}, {call}}},")
     lines.append("};")
     lines.append(f"const size_t rt_thunk_count = {len(thunks)};")
+    lines.append(thunk_pops(thunks, link.bits))
     lines.append("const FnEntry rt_fn_table[] = {")
     lines += [f"    {{0x{r:x}ull, F_{r:x}}}," for r in roots]
     lines.append("    {0, NULL}};")
@@ -352,6 +382,8 @@ SHELL = """<!doctype html>
     uewAsyncShaders: __ASYNC__,
     uewDebugPanel: __DEBUG__,
     uewNetPlaceholders: __PLACEHOLDERS__,
+    uewCacheMB: __CACHEMB__,
+    uewGpuMB: __GPUMB__,
     print: t => console.log(t),
     printErr: t => console.log(t),
     setStatus: t => { if (t) status.textContent = t; },
@@ -405,8 +437,17 @@ def default_args(exe):
     return ["-dx11"] if b"D3D11RHI" in data and b"D3D12RHI" in data else []
 
 
+def memory_split(limit_gb, guest_mb):
+    """how a running game's memory limit is shared: the wasm heap (guest memory plus ~700 MB of runtime), the file
+    download cache, and the rest for the GPU (reported to the game as video memory)"""
+    total = int(limit_gb * 1024)
+    cache = max(256, min(1024, total // 12))
+    gpu = max(512, total - guest_mb - 700 - cache)
+    return cache, gpu
+
+
 def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
-                placeholders=False):
+                placeholders=False, cache_mb=640, gpu_mb=2048):
     """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts"""
     import json
     wasm = web / "game.wasm"
@@ -426,7 +467,8 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
             .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save))
             .replace("__FPS__", "true" if show_fps else "false")
             .replace("__ASYNC__", "true" if async_shaders else "false")
-            .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false"))
+            .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false")
+            .replace("__CACHEMB__", str(int(cache_mb))).replace("__GPUMB__", str(int(gpu_mb))))
     (web / "index.html").write_text(html, encoding="utf-8")
     # Cloudflare Pages reads this; other hosts ignore it
     (web / "_headers").write_text("\n".join([
@@ -484,8 +526,10 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
                wasm_opt=False, game_args=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
-               placeholders=False):
-    """wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
+               placeholders=False, aes_key=None, mem_limit_gb=8):
+    """aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
+    older-format ones are packaged decrypted, so they compress.
+    wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
     module size in RAM (11 GB for a 550 MB game), so it is off unless asked for."""
     if renderer not in ("webgpu", "webgl2"):
         raise ValueError("renderer must be webgpu or webgl2")
@@ -584,9 +628,12 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     if game_root:
         from .package import package
         replace = {}
+        if aes_key:
+            from .upak import decrypt_paks
+            replace = decrypt_paks(game_root, aes_key, out, log=log, progress=progress)
         if video_height:
             from .media import shrink
-            replace = shrink(game_root, Path(game_root) / exe_rel, out, video_height, video_mode, log=log, progress=progress)
+            replace.update(shrink(game_root, Path(game_root) / exe_rel, out, video_height, video_mode, log=log, progress=progress, key=aes_key))
         package(game_root, web, extra={"/image.bin": out / "image.bin"}, part_mb=part_mb, compress=compress, log=log, progress=progress,
                 replace=replace)
         save = "/save/" + re.sub(r"[^A-Za-z0-9_-]", "", Path(exe_rel).stem)
@@ -595,17 +642,20 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         if backend:
             game_args = [*game_args, *BACKENDS[backend]["args"](Path(exe_rel))]
         args = ["--image", "/image.bin", "--root", "/game", "--save", save, "--exe", exe_rel, *game_args]
+        guest = mem_mb or json.loads((out / "options.json").read_text()).get("mem_mb", 3072) if (out / "options.json").exists() else (mem_mb or 3072)
+        cache_mb, gpu_mb = memory_split(mem_limit_gb, guest)
+        log(f"memory limit {mem_limit_gb} GB: {guest} MB game memory, {cache_mb} MB download cache, {gpu_mb} MB video memory")
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
-                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders)
+                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb)
     log(f"wasm build: {web} ({renderer}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
     return web
 
 
-def msvc_env():
+def msvc_env(arch="x64"):
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     path = resources.run([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                            "-property", "installationPath"], capture_output=True, text=True).stdout.strip().splitlines()[0]
-    bat = Path(path) / "VC/Auxiliary/Build/vcvars64.bat"
+    bat = Path(path) / f"VC/Auxiliary/Build/vcvars{'64' if arch == 'x64' else '32'}.bat"
     comspec = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
     out = resources.run(f'"{comspec}" /d /s /c "call "{bat}" >nul && set"', capture_output=True, text=True).stdout
     env = {}

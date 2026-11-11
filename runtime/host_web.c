@@ -184,6 +184,11 @@ EM_JS(int, host_query_flag, (const char* name), {
     if (typeof location === "undefined") return 0;
     return new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=1(&|$)").test(location.search) ? 1 : 0;
 });
+/* a number the page sets on Module (build settings such as the memory budget), or 0 */
+EM_JS(int, host_page_int, (const char* name), {
+    const v = typeof Module !== "undefined" ? Module[UTF8ToString(name >>> 0)] : 0;
+    return v ? v | 0 : 0;
+});
 /* ?name=N in the page address, or 0 */
 EM_JS(int, host_query_int, (const char* name), {
     if (typeof location === "undefined") return 0;

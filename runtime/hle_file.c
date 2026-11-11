@@ -65,10 +65,10 @@ void* handle_obj(uint64_t h)
     return x && x->kind == H_OBJ ? x->obj : NULL;
 }
 
-void hle_set_error(uint32_t e) { ST32(g_teb + 0x68, e); }
+void hle_set_error(uint32_t e) { ST32(g_teb + TEB_ERR, e); }
 static void set_error(uint32_t e) { hle_set_error(e); }
 
-HLE(GetLastError) { RET(LD32(g_teb + 0x68)); }
+HLE(GetLastError) { RET(LD32(g_teb + TEB_ERR)); }
 HLE(SetLastError) { set_error((uint32_t)A1); RET(0); }
 
 void guest_abs(const char* in, char* out, size_t cap)

@@ -66,6 +66,10 @@ class Cancelled(Exception):
     pass
 
 
+class WrongKey(Exception):
+    pass
+
+
 class Estimator:
     """Overall time left: the running stage extrapolates from its own rate, later stages use past builds."""
 
@@ -208,11 +212,14 @@ class App:
         ttk.Label(s, text="Guest memory (MB)").grid(row=1, column=2, sticky="w")
         self.mem = tk.IntVar(value=prefs.get("mem", 3072))
         ttk.Spinbox(s, from_=1024, to=3584, increment=256, textvariable=self.mem, width=12).grid(row=1, column=3, sticky="w", padx=6)
+        ttk.Label(s, text="Memory limit when run (GB)").grid(row=3, column=2, sticky="w", pady=(8, 0))
+        self.mem_limit = tk.DoubleVar(value=prefs.get("mem_limit", 8))
+        ttk.Spinbox(s, from_=4, to=32, increment=1, textvariable=self.mem_limit, width=12).grid(row=3, column=3, sticky="w", padx=6, pady=(8, 0))
         ttk.Label(s, text="Largest file (MB)").grid(row=2, column=2, sticky="w")
         self.part = tk.IntVar(value=prefs.get("part", 16))
         ttk.Spinbox(s, from_=4, to=24, increment=4, textvariable=self.part, width=12).grid(row=2, column=3, sticky="w", padx=6)
         checks = ttk.Frame(s)
-        checks.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        checks.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.game_dlls = tk.BooleanVar(value=prefs.get("game_dlls", True))
         self.sys_dlls = tk.BooleanVar(value=prefs.get("sys_dlls", True))
         self.native = tk.BooleanVar(value=prefs.get("native", False))
@@ -244,6 +251,17 @@ class App:
         self.placeholders = tk.BooleanVar(value=prefs.get("placeholders", False))
         ttk.Checkbutton(s, text="Stand-in files for what the servers would send (images, data)", variable=self.placeholders).grid(
             row=10, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        aes = ttk.Frame(s)
+        aes.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        aes.columnconfigure(1, weight=1)
+        self.aes_on = tk.BooleanVar(value=prefs.get("aes_on", False))
+        self.aes_key = tk.StringVar()
+        ttk.Checkbutton(aes, text="Decrypt AES Encrypted content", variable=self.aes_on, command=self.aes_changed).grid(row=0, column=0, sticky="w")
+        self.aes_entry = ttk.Entry(aes, textvariable=self.aes_key, width=70)
+        self.aes_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.aes_note = ttk.Label(aes, text="", style="Sub.TLabel")
+        self.aes_note.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.aes_key.trace_add("write", lambda *_: self.aes_changed())
         ttk.Label(s, text="Videos").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.videos = tk.StringVar(value=prefs.get("videos") if prefs.get("videos") in VIDEOS else "Keep original videos")
         ttk.Combobox(s, textvariable=self.videos, values=list(VIDEOS), state="readonly", width=34).grid(row=5, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
@@ -287,6 +305,7 @@ class App:
 
         self.toolchain = ttk.Label(main, text="", style="Sub.TLabel")
         self.toolchain.grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.aes_changed()
         root.after(100, self.check_tools)
         root.after(100, self.describe)
         root.after(100, self.pump)
@@ -345,6 +364,38 @@ class App:
             self.q.put(("tools", " · ".join(parts)))
         threading.Thread(target=run, daemon=True).start()
 
+    # ---- AES key ----
+
+    def aes_changed(self):
+        """the key box only when decrypting; Recompile greyed out while it is on and the key is missing or malformed"""
+        from .recomp.upak import parse_key
+        on = self.aes_on.get()
+        self.aes_entry["state"] = "normal" if on else "disabled"
+        text = self.aes_key.get().strip()
+        ok = not on or parse_key(text) is not None
+        if not on:
+            self.aes_note["text"] = ""
+        elif not text:
+            self.aes_note["text"] = "Enter the game's AES key (64 hex digits, 0x optional) to build"
+        elif not ok:
+            self.aes_note["text"] = "That isn't a 256-bit AES key (64 hex digits or base64)"
+        else:
+            self.aes_note["text"] = "Checked against the game's encrypted paks when the build starts"
+        if not (self.worker and self.worker.is_alive()):
+            self.start_btn["state"] = "normal" if ok else "disabled"
+
+    def ask_aes_key(self, why):
+        from tkinter import simpledialog
+        from .recomp.upak import parse_key
+        while True:
+            t = simpledialog.askstring(TITLE, why + "\n\nEnter your correct AES key:", parent=self.root)
+            if t is None:
+                return
+            if parse_key(t):
+                self.aes_key.set(t.strip())
+                return
+            why = "That isn't a 256-bit AES key (64 hex digits or base64)."
+
     # ---- building ----
 
     def save_prefs(self):
@@ -352,7 +403,8 @@ class App:
                                     "opt": self.opt.get(), "res": self.res.get(), "mem": self.mem.get(), "part": self.part.get(),
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
                                     "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
-                                    "backend": self.backend.get(), "placeholders": self.placeholders.get()})
+                                    "backend": self.backend.get(), "placeholders": self.placeholders.get(), "aes_on": self.aes_on.get(),
+                                    "mem_limit": self.mem_limit.get()})
 
     def start(self):
         exe = self.find_exe()
@@ -367,11 +419,15 @@ class App:
         if THREADS[self.threads.get()] == "real":
             messagebox.showinfo(TITLE, "Real-thread builds aren't finished yet; this build will use cooperative threading.")
         out = Path(self.out.get() or Path.home() / "UEWASM Builds" / exe.stem)
+        from .recomp.upak import parse_key
+        aes = parse_key(self.aes_key.get()) if self.aes_on.get() else None
+        if self.aes_on.get() and not aes:
+            return
         self.save_prefs()
         opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=(w, h), mem=int(self.mem.get()),
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
                     compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
-                    backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get())
+                    backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()))
         self.cancel.clear()
         self.clear_log()
         self.start_btn["state"] = "disabled"
@@ -397,6 +453,13 @@ class App:
             resources.lower_this_process()
             log(resources.describe())
             root, found = game_dlls(o["exe"])
+            if o.get("aes"):
+                from .recomp import upak
+                paks = upak.encrypted_paks(root)
+                bad = [p.name for p in paks if not upak.check_key(p, o["aes"])]
+                if bad:
+                    raise WrongKey(f"The AES key is wrong for {', '.join(bad[:5])}.")
+                log(f"AES key opens all {len(paks)} encrypted paks" if paks else "AES key given, but no pak here is encrypted")
             extra = found if o["game_dlls"] else []
             input_mb = (o["exe"].stat().st_size + sum(p.stat().st_size for p in extra)) / 1048576
             stages = [s for s in STAGES if o["native"] or not s.startswith("native")]
@@ -412,11 +475,14 @@ class App:
                                    size=o["size"], part_mb=o["part"], compress=o["compress"], log=log, progress=self.progress,
                                    video_height=o["size"][1] if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
                                    wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
-                                   backend=o.get("backend"), placeholders=o.get("placeholders", False))
+                                   backend=o.get("backend"), placeholders=o.get("placeholders", False), aes_key=o.get("aes"),
+                                   mem_limit_gb=o.get("mem_limit", 8))
             self.est.remember()
             self.q.put(("done", str(web)))
         except Cancelled:
             self.q.put(("cancelled",))
+        except WrongKey as e:
+            self.q.put(("badkey", str(e)))
         except Exception as e:
             self.q.put(("failed", f"{e}\n\n{traceback.format_exc(limit=4)}"))
 
@@ -458,6 +524,11 @@ class App:
                     self.append(f"\nWeb build ready: {m[1]}\nUpload the whole folder to a static host, or press 'Play in browser'.")
                 elif kind == "cancelled":
                     self.finish("Cancelled", None)
+                elif kind == "badkey":
+                    self.finish("Failed: wrong AES key", None)
+                    self.append("\nERROR: " + m[1] + " Enter the game's own correct AES key.")
+                    self.aes_changed()
+                    self.ask_aes_key(m[1])
                 elif kind == "failed":
                     self.finish("Failed", None)
                     self.append("\nERROR: " + m[1])
@@ -480,6 +551,7 @@ class App:
             self.sbar["value"] = bar
         self.start_btn["state"] = "normal"
         self.cancel_btn["state"] = "disabled"
+        self.aes_changed()
 
     def clear_log(self):
         self.log["state"] = "normal"

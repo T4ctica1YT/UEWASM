@@ -419,7 +419,7 @@ int hle_cores(void)
 HLE(GetLogicalProcessorInformation)
 {
     uint32_t need = 32 * (CORES + 1);
-    if ((uint32_t)LD32(A2) < need || !A1) { ST32(A2, need); ST32(g_teb + 0x68, 122); RET(0); return; }
+    if ((uint32_t)LD32(A2) < need || !A1) { ST32(A2, need); ST32(g_teb + TEB_ERR, 122); RET(0); return; }
     memset(G2H(A1), 0, need);
     for (int i = 0; i < CORES; i++) { ST64(A1 + 32ull * i, 1ull << i); ST32(A1 + 32ull * i + 8, 0); }
     ST64(A1 + 32ull * CORES, (1ull << CORES) - 1);
@@ -430,7 +430,7 @@ HLE(GetLogicalProcessorInformation)
 HLE(GetLogicalProcessorInformationEx)
 {
     uint32_t rel = (uint32_t)A1, each = 48, n = rel == 0 || rel == 0xFFFF ? CORES : 1, need = each * n;
-    if ((uint32_t)LD32(A3) < need || !A2) { ST32(A3, need); ST32(g_teb + 0x68, 122); RET(0); return; }
+    if ((uint32_t)LD32(A3) < need || !A2) { ST32(A3, need); ST32(g_teb + TEB_ERR, 122); RET(0); return; }
     memset(G2H(A2), 0, need);
     for (uint32_t i = 0; i < n; i++) {
         uint64_t p = A2 + (uint64_t)each * i;

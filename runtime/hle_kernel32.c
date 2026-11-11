@@ -30,7 +30,7 @@ HLE(GetSystemTimeAsFileTime) { ST64(A1, host_time_100ns()); RET(0); }
 HLE(GetSystemTimePreciseAsFileTime) { ST64(A1, host_time_100ns()); RET(0); }
 HLE(GetTickCount) { RET((uint32_t)(host_ticks_ns() / 1000000)); }
 HLE(GetTickCount64) { RET(host_ticks_ns() / 1000000); }
-HLE(InitializeSListHead) { ST64(A1, 0); ST64(A1 + 8, 0); RET(0); }
+HLE(InitializeSListHead) { memset(G2H(A1), 0, 2 * GP); RET(0); }
 HLE(RtlCaptureContext) { RET(0); }
 HLE(RtlLookupFunctionEntry) { RET(0); }
 HLE(RtlVirtualUnwind) { RET(0); }
@@ -50,54 +50,56 @@ HLE(OutputDebugStringA) { host_log("[debug] %s", GSTR(A1)); RET(0); }
 
 static int tls_used[1088];
 static uint64_t tls_addr(CPU* c, uint64_t i, int create);
-HLE(TlsAlloc) { for (int i = 0; i < 1088; i++) if (!tls_used[i]) { tls_used[i] = 1; ST64(tls_addr(c, (uint64_t)i, 1), 0); RET(i); return; } RET(0xFFFFFFFF); }
+HLE(TlsAlloc) { for (int i = 0; i < 1088; i++) if (!tls_used[i]) { tls_used[i] = 1; STP(tls_addr(c, (uint64_t)i, 1), 0); RET(i); return; } RET(0xFFFFFFFF); }
 HLE(TlsFree) { if (A1 < 1088) tls_used[A1] = 0; RET(1); }
 /* TLS values are per thread, where Windows keeps them: TEB TlsSlots (+0x1480, 64) then TlsExpansionSlots (+0x1780) */
+/* 32-bit TEB: TlsSlots at +0xE10, TlsExpansionSlots at +0xF94 */
 static uint64_t tls_addr(CPU* c, uint64_t i, int create)
 {
-    if (i < 64) return c->gsbase + 0x1480 + 8 * i;
-    uint64_t ex = LD64(c->gsbase + 0x1780);
+    uint64_t slots = RT_G32 ? 0xE10 : 0x1480, exp = RT_G32 ? 0xF94 : 0x1780;
+    if (i < 64) return c->gsbase + slots + GP * i;
+    uint64_t ex = LDP(c->gsbase + exp);
     if (!ex) {
         if (!create) return 0;
         ex = g_calloc(8 * 1024);
-        ST64(c->gsbase + 0x1780, ex);
+        STP(c->gsbase + exp, ex);
     }
-    return ex + 8 * (i - 64);
+    return ex + GP * (i - 64);
 }
-HLE(TlsGetValue) { uint64_t a = A1 < 1088 ? tls_addr(c, A1, 0) : 0; RET(a ? LD64(a) : 0); }
-HLE(TlsSetValue) { if (A1 < 1088) ST64(tls_addr(c, A1, 1), A2); RET(1); }
+HLE(TlsGetValue) { uint64_t a = A1 < 1088 ? tls_addr(c, A1, 0) : 0; RET(a ? LDP(a) : 0); }
+HLE(TlsSetValue) { if (A1 < 1088) STP(tls_addr(c, A1, 1), A2); RET(1); }
 HLE(FlsAlloc) { hle_TlsAlloc(c); }
 HLE(FlsFree) { hle_TlsFree(c); }
 HLE(FlsGetValue) { hle_TlsGetValue(c); }
 HLE(FlsSetValue) { hle_TlsSetValue(c); }
 
 /* Locks are real: a green thread can be switched out inside one (time slices, blocking calls), so another thread
-   that wants it yields until it is free. CRITICAL_SECTION keeps RecursionCount at +12 and OwningThread at +16;
-   an SRW lock word is 1 when held exclusively, else 2 per shared holder. */
-#define CS_REC(cs) ((cs) + 12)
-#define CS_OWNER(cs) ((cs) + 16)
-static int cs_free(GThread* t) { uint64_t o = LD64(CS_OWNER(t->block_a)); return !o || o == (uint64_t)t->tid; }
+   that wants it yields until it is free. CRITICAL_SECTION keeps RecursionCount at +12 and OwningThread at +16 (+8 and
+   +12 in 32-bit code); an SRW lock word is 1 when held exclusively, else 2 per shared holder. */
+#define CS_REC(cs) ((cs) + (RT_G32 ? 8 : 12))
+#define CS_OWNER(cs) ((cs) + (RT_G32 ? 12 : 16))
+static int cs_free(GThread* t) { uint64_t o = LDP(CS_OWNER(t->block_a)); return !o || o == (uint64_t)t->tid; }
 void cs_enter(CPU* c, uint64_t cs)
 {
     uint64_t me = sched_current_id();
-    uint64_t owner = LD64(CS_OWNER(cs));
+    uint64_t owner = LDP(CS_OWNER(cs));
     if (owner && owner != me) {
         sched_current()->block_a = cs;
         while (!cs_free(sched_current())) sched_block(c, cs_free, ~0ull);
     }
-    ST64(CS_OWNER(cs), me);
+    STP(CS_OWNER(cs), me);
     ST32(CS_REC(cs), LD32(CS_REC(cs)) + 1);
 }
 /* like Windows, any thread may leave (some code hands a section from one thread to another) */
 void cs_leave(uint64_t cs)
 {
-    if (!LD64(CS_OWNER(cs))) return;
+    if (!LDP(CS_OWNER(cs))) return;
     uint32_t r = LD32(CS_REC(cs));
     if (r > 1) { ST32(CS_REC(cs), r - 1); return; }
     ST32(CS_REC(cs), 0);
-    ST64(CS_OWNER(cs), 0);
+    STP(CS_OWNER(cs), 0);
 }
-static void cs_init(uint64_t cs) { memset(G2H(cs), 0, 40); ST32(cs + 8, 0xFFFFFFFF); }
+static void cs_init(uint64_t cs) { memset(G2H(cs), 0, RT_G32 ? 24 : 40); ST32(cs + GP, 0xFFFFFFFF); }
 HLE(InitializeCriticalSection) { cs_init(A1); RET(0); }
 HLE(InitializeCriticalSectionAndSpinCount) { cs_init(A1); RET(1); }
 HLE(InitializeCriticalSectionEx) { cs_init(A1); RET(1); }
@@ -105,9 +107,9 @@ HLE(EnterCriticalSection) { cs_enter(c, A1); RET(0); }
 HLE(LeaveCriticalSection) { cs_leave(A1); RET(0); }
 HLE(TryEnterCriticalSection)
 {
-    uint64_t owner = LD64(CS_OWNER(A1)), me = sched_current_id();
+    uint64_t owner = LDP(CS_OWNER(A1)), me = sched_current_id();
     if (owner && owner != me) { RET(0); return; }
-    ST64(CS_OWNER(A1), me);
+    STP(CS_OWNER(A1), me);
     ST32(CS_REC(A1), LD32(CS_REC(A1)) + 1);
     RET(1);
 }
@@ -115,13 +117,13 @@ HLE(DeleteCriticalSection) { RET(0); }
 
 static void cs_desc(GThread* t, char* out, int cap)
 {
-    snprintf(out, cap, " %llx owned by %llu (depth %u)", (unsigned long long)t->block_a, (unsigned long long)LD64(CS_OWNER(t->block_a)),
+    snprintf(out, cap, " %llx owned by %llu (depth %u)", (unsigned long long)t->block_a, (unsigned long long)LDP(CS_OWNER(t->block_a)),
              (unsigned)LD32(CS_REC(t->block_a)));
 }
 static int srw_free(GThread* t);
 static void srw_desc(GThread* t, char* out, int cap)
 {
-    uint64_t v = LD64(t->block_a);
+    uint64_t v = LDP(t->block_a);
     snprintf(out, cap, " %llx wanted %s, held %s", (unsigned long long)t->block_a, t->block_b ? "shared" : "exclusive",
              v == 1 ? "exclusive" : v ? "shared" : "by nobody");
 }
@@ -133,7 +135,7 @@ INIT_FN(lock_names)
 /* a writer waiting on a lock makes new readers queue behind it, as on Windows, so readers can't starve it */
 static int srw_free(GThread* t)
 {
-    uint64_t v = LD64(t->block_a);
+    uint64_t v = LDP(t->block_a);
     if (!t->block_b) return v == 0;
     return !(v & 1) && !sched_find_blocked(srw_free, t->block_a, 0);
 }
@@ -141,9 +143,9 @@ void srw_acquire(CPU* c, uint64_t l, int shared)
 {
     GThread* t = sched_current();
     for (;;) {
-        uint64_t v = LD64(l);
+        uint64_t v = LDP(l);
         int ok = shared ? !(v & 1) && !sched_find_blocked(srw_free, l, 0) : v == 0;
-        if (ok) { ST64(l, shared ? v + 2 : 1); return; }
+        if (ok) { STP(l, shared ? v + 2 : 1); return; }
         t->block_a = l;
         t->block_b = (uint64_t)shared;
         sched_block(c, srw_free, ~0ull);
@@ -151,17 +153,17 @@ void srw_acquire(CPU* c, uint64_t l, int shared)
 }
 void srw_release(uint64_t l, int shared)
 {
-    uint64_t v = LD64(l);
-    if (shared) ST64(l, v >= 2 ? v - 2 : 0);
-    else ST64(l, 0);
+    uint64_t v = LDP(l);
+    if (shared) STP(l, v >= 2 ? v - 2 : 0);
+    else STP(l, 0);
 }
-HLE(InitializeSRWLock) { ST64(A1, 0); RET(0); }
+HLE(InitializeSRWLock) { STP(A1, 0); RET(0); }
 HLE(AcquireSRWLockExclusive) { srw_acquire(c, A1, 0); RET(0); }
 HLE(ReleaseSRWLockExclusive) { srw_release(A1, 0); RET(0); }
 HLE(AcquireSRWLockShared) { srw_acquire(c, A1, 1); RET(0); }
 HLE(ReleaseSRWLockShared) { srw_release(A1, 1); RET(0); }
-HLE(TryAcquireSRWLockExclusive) { if (LD64(A1) == 0) { ST64(A1, 1); RET(1); } else RET(0); }
-HLE(TryAcquireSRWLockShared) { uint64_t v = LD64(A1); if (!(v & 1)) { ST64(A1, v + 2); RET(1); } else RET(0); }
+HLE(TryAcquireSRWLockExclusive) { if (LDP(A1) == 0) { STP(A1, 1); RET(1); } else RET(0); }
+HLE(TryAcquireSRWLockShared) { uint64_t v = LDP(A1); if (!(v & 1)) { STP(A1, v + 2); RET(1); } else RET(0); }
 
 HLE(VirtualAlloc)
 {
@@ -185,14 +187,16 @@ HLE(VirtualFree)
 HLE(VirtualProtect) { if (A4) ST32(A4, 4); RET(1); }
 HLE(GetSystemInfo)
 {
-    memset(G2H(A1), 0, 48);
+    uint64_t p = GP;
+    memset(G2H(A1), 0, 8 + 3 * p + 16);
     ST32(A1 + 4, 4096);
-    ST64(A1 + 8, 0x10000);
-    ST64(A1 + 16, MEM_SIZE - 1);
-    ST64(A1 + 24, 1);
-    ST32(A1 + 32, 1);
-    ST32(A1 + 36, 8664);
-    ST32(A1 + 40, 65536);
+    STP(A1 + 8, 0x10000);
+    STP(A1 + 8 + p, (RT_G32 && MEM_SIZE > 0x7FFF0000ull ? 0x7FFF0000ull : MEM_SIZE) - 1);
+    STP(A1 + 8 + 2 * p, 1);
+    ST32(A1 + 8 + 3 * p, 1);
+    ST32(A1 + 12 + 3 * p, RT_G32 ? 586 : 8664);
+    ST32(A1 + 16 + 3 * p, 65536);
+    ST16(A1 + 20 + 3 * p, 6);
     RET(0);
 }
 
@@ -290,8 +294,8 @@ static uint64_t load_skipped(const char* name)
 
 HLE(GetModuleHandleA) { RET(module_handle(A1 ? GSTR(A1) : NULL)); }
 HLE(GetModuleHandleW) { char n[520]; if (A1) wstr_to_utf8(A1, n, sizeof n); RET(module_handle(A1 ? n : NULL)); }
-HLE(GetModuleHandleExW) { char n[520]; uint64_t h; if (A1 & 4) { const ModuleInfo* m = rt_module_at(A2); h = m ? m->base : 0; } else { if (A2) wstr_to_utf8(A2, n, sizeof n); h = module_handle(A2 ? n : NULL); } if (A3) ST64(A3, h); RET(h != 0); }
-HLE(GetModuleHandleExA) { uint64_t h; if (A1 & 4) { const ModuleInfo* m = rt_module_at(A2); h = m ? m->base : 0; } else h = module_handle(A2 ? GSTR(A2) : NULL); if (A3) ST64(A3, h); RET(h != 0); }
+HLE(GetModuleHandleExW) { char n[520]; uint64_t h; if (A1 & 4) { const ModuleInfo* m = rt_module_at(A2); h = m ? m->base : 0; } else { if (A2) wstr_to_utf8(A2, n, sizeof n); h = module_handle(A2 ? n : NULL); } if (A3) STP(A3, h); RET(h != 0); }
+HLE(GetModuleHandleExA) { uint64_t h; if (A1 & 4) { const ModuleInfo* m = rt_module_at(A2); h = m ? m->base : 0; } else h = module_handle(A2 ? GSTR(A2) : NULL); if (A3) STP(A3, h); RET(h != 0); }
 /* every module asked for, once: what a game tries to load says which features it turns on */
 static void note_load(const char* n, uint64_t h)
 {
