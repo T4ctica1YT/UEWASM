@@ -60,7 +60,9 @@ To build the desktop app: `pip install pyinstaller`, then `python build_exe.py` 
 
 ## UEWASM Status and Support
 
-This project is in its early stages, meaning not all games work. Here are the games used for Testing and some screenshots of the tool working
+This project is in its early stages, meaning **not all games work**. 
+
+Here are the games used for Testing and some screenshots of the tool working
 
 | Game | Status | FPS | UE Version |
 |---|---|---|---|
