@@ -9,7 +9,7 @@
   <br>
 </h1>
 
-<h4 align="center">A WIP Static Recompilation tool for Windows (x64 and x86) Unreal Engine 4/5 built games into WebAssemably (WASM)
+<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 4/5 built games into WebAssemably (WASM)
 </h4>
 
 </p>
