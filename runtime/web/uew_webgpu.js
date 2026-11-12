@@ -311,6 +311,7 @@ ${P.shaders.get(sh)}`); break; }
           if (!pick.some(p => p.k === "base") && nt >= 4) pick.push({ k: "base", d });
         }
         for (const e of cap.events) { const d = (e.draws || []).find(d => d.count === -1); if (d) { pick.push({ k: "indirect", d: { res: [[`b${d.instances}@0+0`]] } }); break; } }
+        if (window.uewCaptureBufCount) for (const e of cap.events) for (const d of e.draws || []) if (d.count === window.uewCaptureBufCount) pick.push({ k: "count", d });
         for (const p of pick) for (const v of p.d.vbs || []) if (v[0] > 0) p.d.res.push([`b${v[1]}@0+0`]);
         for (const p of pick) for (const grp of p.d.res || []) for (const r of grp || []) {
           if (typeof r !== "string" || !/^b\d/.test(r) || bufs[r]) continue;
@@ -814,7 +815,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
         const bg = g.o[I[j]], nd = I[j + 1];
         groups.push(bg && bg.__r);
         // constant buffer contents straight from the ring (first draws of a pass only)
-        if (bg && bg.__sz && g.cap.cur.draws.length < 8) {
+        if (bg && bg.__sz && (g.cap.cur.draws.length < 8 || count === window.uewCaptureBufCount)) {
           let d = 0;
           for (const [b, off, size] of bg.__sz) {
             const o = off >= 0 ? off : HEAPU32[j + 2 + d++];

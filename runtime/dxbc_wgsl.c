@@ -1635,7 +1635,8 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
         int declared[32] = { 0 };
         for (int i = 0; i < out->in.n; i++) {
             DxSigElem* e = &out->in.e[i];
-            if (e->sysval == 1) { sp(&pro, "    v[%u] = i.pos;\n", e->reg); continue; }
+            /* D3D's SV_Position.w in a pixel shader is the clip-space w (view depth); WGSL's position.w is 1/w */
+            if (e->sysval == 1) { sp(&pro, "    v[%u] = vec4<f32>(i.pos.xyz, 1.0 / i.pos.w);\n", e->reg); continue; }
             if (e->sysval == 9) { sp(&pro, "    v[%u].x = bitcast<f32>(select(0u, 0xFFFFFFFFu, i.ff));\n", e->reg); continue; }
             if (e->sysval == 4) {
                 int ll = dxbc_layer_loc(vs_out);

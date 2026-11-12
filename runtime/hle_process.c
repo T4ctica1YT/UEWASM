@@ -210,6 +210,7 @@ HLE(InterlockedFlushSList) { uint64_t e = LDP(A1); memset(G2H(A1), 0, 2 * GP); R
 HLE(QueryDepthSList) { RET(LD16(A1 + GP)); }
 HLE(RtlInitializeSListHead) { memset(G2H(A1), 0, 2 * GP); RET(0); }
 
+void rt_backtrace(CPU* c, const char* tag);
 HLE(RaiseException)
 {
     if ((uint32_t)A1 == 0x406D1388) {
@@ -223,9 +224,9 @@ HLE(RaiseException)
         return;
     }
     host_log("[seh] RaiseException code=%08llx flags=%llx from %llx", (unsigned long long)(uint32_t)A1, (unsigned long long)A2, (unsigned long long)LD64(R(4)));
+    rt_backtrace(c, "seh");
     rt_exit((int)(uint32_t)A1);
 }
-void rt_backtrace(CPU* c, const char* tag);
 void rt_sj_jump(CPU* c, uint64_t jb, uint64_t val);
 HLE(RtlUnwind)
 {

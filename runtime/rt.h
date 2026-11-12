@@ -56,6 +56,37 @@ extern uint64_t MEM_SIZE;
 #else
 #define MEMB MEM
 #endif
+#ifdef UEW_THREADS
+/* guest threads on several cores: every guest access is a volatile one, so the compiler keeps x86's order of loads and
+   stores (code that publishes data with a plain store of a flag relies on it) and never caches memory in registers */
+typedef uint16_t __attribute__((aligned(1), may_alias)) u16u_;
+typedef uint32_t __attribute__((aligned(1), may_alias)) u32u_;
+typedef uint64_t __attribute__((aligned(1), may_alias)) u64u_;
+static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return *(volatile uint8_t*)(m + (uint32_t)a); }
+static inline uint64_t ld16_(uint8_t* m, uint64_t a) { return *(volatile u16u_*)(m + (uint32_t)a); }
+static inline uint64_t ld32_(uint8_t* m, uint64_t a) { return *(volatile u32u_*)(m + (uint32_t)a); }
+static inline uint64_t ld64_(uint8_t* m, uint64_t a) { return *(volatile u64u_*)(m + (uint32_t)a); }
+static inline void st8_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile uint8_t*)(m + (uint32_t)a) = (uint8_t)v; }
+static inline void st16_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u16u_*)(m + (uint32_t)a) = (uint16_t)v; }
+static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u32u_*)(m + (uint32_t)a) = (uint32_t)v; }
+static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u64u_*)(m + (uint32_t)a) = v; }
+static inline XMM xld_(uint8_t* m, uint64_t a, int n)
+{
+    XMM x; memset(&x, 0, 16);
+    if (n == 16) { x.q[0] = ld64_(m, a); x.q[1] = ld64_(m, a + 8); }
+    else if (n == 8) x.q[0] = ld64_(m, a);
+    else if (n == 4) x.d[0] = (uint32_t)ld32_(m, a);
+    else for (int i = 0; i < n; i++) x.b[i] = (uint8_t)ld8_(m, a + i);
+    return x;
+}
+static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n)
+{
+    if (n == 16) { st64_(m, a, x.q[0]); st64_(m, a + 8, x.q[1]); }
+    else if (n == 8) st64_(m, a, x.q[0]);
+    else if (n == 4) st32_(m, a, x.d[0]);
+    else for (int i = 0; i < n; i++) st8_(m, a + i, x.b[i]);
+}
+#else
 static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return m[(uint32_t)a]; }
 static inline uint64_t ld16_(uint8_t* m, uint64_t a) { uint16_t v; memcpy(&v, m + (uint32_t)a, 2); return v; }
 static inline uint64_t ld32_(uint8_t* m, uint64_t a) { uint32_t v; memcpy(&v, m + (uint32_t)a, 4); return v; }
@@ -66,6 +97,7 @@ static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { uint32_t t = (uin
 static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { memcpy(m + (uint32_t)a, &v, 8); }
 static inline XMM xld_(uint8_t* m, uint64_t a, int n) { XMM x; memset(&x, 0, 16); memcpy(&x, m + (uint32_t)a, n); return x; }
 static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n) { memcpy(m + (uint32_t)a, &x, n); }
+#endif
 #define LD8(a) ld8_(MEMB, (a))
 #define LD16(a) ld16_(MEMB, (a))
 #define LD32(a) ld32_(MEMB, (a))
@@ -256,7 +288,12 @@ static inline uint64_t CVTT64(double v) { return (v != v || v >= 922337203685477
 static inline uint64_t CVTR32(double v) { return CVTT32(nearbyint(v)); }
 static inline uint64_t CVTR64(double v) { return CVTT64(nearbyint(v)); }
 
+#ifdef UEW_THREADS
+/* a call site's cache, filled once: the target is published after the function (an atomic read on the fast path) */
+typedef struct IC { _Atomic uint64_t a; GuestFn f; } IC;
+#else
 typedef struct IC { uint64_t a; GuestFn f; } IC;
+#endif
 void rt_call(CPU* c, uint64_t target);
 void rt_call_ic(CPU* c, uint64_t target, IC* ic);
 void rt_jump(CPU* c, uint64_t target);

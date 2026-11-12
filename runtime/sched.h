@@ -23,6 +23,9 @@ typedef struct GThread {
     int frame_wait;                          /* blocked until the next browser frame */
     uint64_t stack;                          /* guest stack, freed when the thread is reaped */
     int prio;                                /* audio: runs as soon as its sleep ends, ahead of the others */
+    int carrier;                             /* real-thread builds: the host thread that runs it */
+    struct GThread* all_next;                /* real-thread builds: every thread, for lookups by id */
+    int lockd;                               /* real-thread builds: its depth in the global lock while switched out */
 } GThread;
 typedef int (*SchedCheck)(GThread* t);
 /* runs other threads until check(current) holds (1) or the deadline passes (0) */
@@ -67,3 +70,6 @@ void* host_ctx_main(void);
 void* host_ctx_new(void (*entry)(void*), void* arg, size_t stack);
 void host_ctx_switch(void* to);
 void host_ctx_free(void* ctx);
+/* the global lock around system calls and the scheduler (real-thread builds; nothing otherwise) */
+void rt_lock(void);
+void rt_unlock(void);
