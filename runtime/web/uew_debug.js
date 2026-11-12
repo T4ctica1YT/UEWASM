@@ -1,6 +1,7 @@
 // Debug panel: \ or Insert shows it. Live numbers, switches that apply on reload, and tools that save a log, dump the
 // green threads or capture a frame to a file.
 (() => {
+  if (typeof ENVIRONMENT_IS_PTHREAD != "undefined" && ENVIRONMENT_IS_PTHREAD) return;   // page-side only; worker threads skip it
   if (typeof window === "undefined" || typeof document === "undefined") return;
   const q = new URLSearchParams(location.search);
   if (q.get("capture") === "1") window.uewCaptureFrame = 1 << 30;

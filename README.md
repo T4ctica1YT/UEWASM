@@ -41,7 +41,8 @@ is implemented yet.
 4. **Runtime** (`runtime/`):
    - guest heap, files (game data fetched on demand; a separate save folder), Win32/USER32 windowing and input;
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
-     condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI;
+     condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI, or spread over
+     several cores with `--threads real`;
    - Direct3D 11/DXGI on WebGPU: DXBC shaders are translated to WGSL (`dxbc_wgsl.c`), including geometry shaders
      (emulated with compute), typed buffers read and written in their real formats, UAV-only passes, background
      pipeline compilation and GPU timestamp queries;
@@ -96,7 +97,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | --- | --- | --- |
 | `--priority` | `high` (default), `low` | How much of the PC the build uses; the result is identical. `high` is tuned to the PC (cores and free memory) for speed while running below normal priority; `low` uses about half the cores and a fifth of the memory at idle priority, so the PC stays usable. |
 | `--renderer` | `webgpu` (default), `webgl2` | WebGPU is faster and supports compute shaders. `webgl2` builds only the WebGL path. |
-| `--threads` | `coop` | Game threads run as green threads on one browser thread. (`real`, Web Workers, is not implemented yet.) |
+| `--threads` | `coop` (default), `real` | `coop`: game threads take turns on one browser thread; runs on any host. `real`: game threads run on several cores (Web Workers), with the render and audio threads on the page's own thread. Needs WebGPU and https or localhost; hosts that can't send the cross-origin isolation headers get them from a small service worker included in the build. |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
 | `--mem-mb` | number | Guest memory; browsers allow 4096 MB total. |
 | `--mem-limit-gb` | number (default `8`) | How much memory the built game may use when run, split between game memory, the download cache and video memory. |
@@ -104,6 +105,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--resolution` | e.g. `1280x720` | Render size. The page scales it to fit the window, so a lower value helps slow machines. |
 | `--part-mb` | number | Largest file in the output. The default of 16 stays under Cloudflare Pages' 25 MiB limit. |
 | `--compress` |N/A| Compress the game's files (audio excluded) for a smaller download. |
+| `--single-file` |N/A| Also write one `.html` file holding the whole game (code and files), which plays when opened straight from disk with no server. Cooperative threads only; best for smaller games, since the whole page is loaded at once. |
 | `--video-height` | e.g. `720` | Re-encode game videos taller than this, in their original codec family, so the game's own player still plays them. Unreal `.pak` files are rewritten with the new videos. `0` (default) keeps the originals. |
 | `--video-mode` | `fast`, `small` | `small` gives roughly 30% smaller videos but encodes about 10 times slower. Encodes are cached. |
 | `--sync-shaders` |N/A| Compile each shader when first drawn instead of in the background (exact first frames, but freezes while compiling). |
@@ -134,7 +136,8 @@ Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1
 
 `builds\MyGame\web` is a plain static site: upload the whole folder (Cloudflare Pages or any static host). It holds:
 
-- `index.html`, `game.js`, and the module, split into `game.wasm.0`, `game.wasm.1` and so on when large.
+- `index.html`, `game.js`, and the module, split into `game.wasm.0`, `game.wasm.1` and so on when large (the parts
+  download together and compile as they arrive).
 - `data/`: the game's files, cut into parts, plus `index.txt`. The browser downloads each part in 1 MiB blocks
   when the game reads it, merging neighbouring blocks into larger requests, and remembers what was read during
   boot so later launches fetch it ahead of time. HTTP Range support saves bandwidth; servers without it still work.
@@ -145,6 +148,7 @@ Saves and settings go to IndexedDB, so they survive reloads. Executables and deb
 
 ```
 python tests/run_tests.py          # C, C++ STL, threads, files: original exe vs native recompile vs wasm
+python tests/run_tests.py --threads real   # the same with guest threads on several cores
 python tests/gfx/run_gfx.py webgpu # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
 python tests/isa/run_isa.py --wasm # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
 python tests/web/run_web.py        # game files over HTTP (raw and deflated, with and without Range) and saved progress
@@ -156,8 +160,9 @@ Edge/Chrome).
 
 ## Known limitations
 
-- Everything runs on one browser thread, so CPU-heavy games are limited to roughly what one core can do through
-  the recompiled code. Real multithreading (Web Workers) is the next big step.
+- Cooperative builds run every game thread on one browser thread, so CPU-heavy games are limited to roughly what
+  one core can do. `--threads real` spreads them over several cores, but every system call still passes through one
+  lock, so the gain depends on the game.
 - Shaders compile the first time an effect appears, which can cause short stutters on a first run; browsers cache
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.

@@ -9,7 +9,7 @@ from pathlib import Path
 CHOICES = {
     "renderer": {"webgpu": "WebGPU (faster, compute shaders; Chrome/Edge/Safari 26+; falls back to WebGL 2)", "webgl2": "WebGL 2 only (smaller, works in every modern browser)"},
     "threads": {"coop": "Cooperative: all game threads share one core, no special hosting needed",
-                "real": "Real threads: Web Workers + SharedArrayBuffer, needs COOP/COEP headers (set up automatically)"},
+                "real": "Real threads: game threads on several cores (WebGPU only; needs https or localhost, isolation set up automatically)"},
     "opt": {"-O2": "Balanced build time and speed", "-O3": "Fastest code, slower build", "-Os": "Smallest download"},
 }
 
@@ -80,8 +80,11 @@ def cmd_recomp(a):
         web = build.build_wasm(out, opt=a.opt, threads=a.threads, renderer=a.renderer, game_root=root, exe_rel=exe_rel,
                                size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
-                               backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb)
+                               backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb,
+                               single_file=a.single_file)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
+        if a.single_file:
+            print(f"single-file build in {out / 'single'} (open the .html directly)")
 
 
 def cmd_coverage(a):
@@ -127,6 +130,8 @@ def main(argv=None):
     r.add_argument("--resolution", default="1280x720", help="render size; the page scales it to the window")
     r.add_argument("--part-mb", type=int, default=16, help="largest file written for the web host (Cloudflare Pages allows 25)")
     r.add_argument("--compress", action="store_true", help="compress game files (not audio) for a smaller download")
+    r.add_argument("--single-file", action="store_true",
+                   help="also write one .html holding the whole game, playable straight from disk with no server (cooperative threads only; best for small games)")
     r.add_argument("--sync-shaders", action="store_true", help="compile shaders when first drawn (exact first frames, but freezes while compiling)")
     r.add_argument("--fps", action="store_true", help="show an FPS counter in the page (Ctrl+Shift+F toggles it)")
     r.add_argument("--priority", choices=["high", "low"], default="high",

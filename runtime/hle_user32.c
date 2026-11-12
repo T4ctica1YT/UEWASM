@@ -258,10 +258,10 @@ HLE(DispatchMessageW)
     RET(call_wndproc(c, w, (uint32_t)LD32(A1 + 8), LD64(A1 + 16), LD64(A1 + 24)));
 }
 HLE(DispatchMessageA) { hle_DispatchMessageW(c); }
-HLE(PostMessageW) { post(A1 ? A1 : main_hwnd(), (uint32_t)A2, A3, A4); RET(1); }
+HLE(PostMessageW) { post(A1 ? A1 : main_hwnd(), (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
 HLE(SendMessageW) { RET(call_wndproc(c, wnd(A1), (uint32_t)A2, A3, A4)); }
 HLE(PostQuitMessage) { quit_posted = 1; RET(0); }
-HLE(PostThreadMessageW) { post(main_hwnd(), (uint32_t)A2, A3, A4); RET(1); }
+HLE(PostThreadMessageW) { post(main_hwnd(), (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
 STUB(WaitMessage, 1)
 STUB(MsgWaitForMultipleObjects, 0x102)
 STUB(GetQueueStatus, 0)

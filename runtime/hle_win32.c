@@ -8,18 +8,17 @@
 void hle_set_error(uint32_t e);
 const char* hle_csidl_path(int csidl);
 
-HLE(InterlockedIncrement) { uint32_t v = (uint32_t)LD32(A1) + 1; ST32(A1, v); RET((int64_t)(int32_t)v); }
-HLE(InterlockedDecrement) { uint32_t v = (uint32_t)LD32(A1) - 1; ST32(A1, v); RET((int64_t)(int32_t)v); }
-HLE(InterlockedExchange) { uint32_t old = (uint32_t)LD32(A1); ST32(A1, A2); RET(old); }
-HLE(InterlockedExchangeAdd) { uint32_t old = (uint32_t)LD32(A1); ST32(A1, old + (uint32_t)A2); RET(old); }
-HLE(InterlockedCompareExchange) { uint32_t old = (uint32_t)LD32(A1); if (old == (uint32_t)A3) ST32(A1, A2); RET(old); }
+/* the same atomic operations as the guest's own locked instructions (rt.h AT*) */
+HLE(InterlockedIncrement) { RET((int64_t)(int32_t)(ATADD32(A1, 1) + 1)); }
+HLE(InterlockedDecrement) { RET((int64_t)(int32_t)(ATADD32(A1, 0xFFFFFFFFu) - 1)); }
+HLE(InterlockedExchange) { RET(ATXCHG32(A1, A2)); }
+HLE(InterlockedExchangeAdd) { RET(ATADD32(A1, A2)); }
+HLE(InterlockedCompareExchange) { RET(ATCAS32(A1, A3, A2)); }
 /* (ptr, exchange lo/hi, comperand lo/hi) on the 32-bit stack; the old value comes back in edx:eax */
 HLE(InterlockedCompareExchange64)
 {
     uint64_t x = (uint32_t)A2 | ((uint64_t)(uint32_t)A3 << 32), cmp = (uint32_t)A4 | ((uint64_t)(uint32_t)ARG(5) << 32);
-    uint64_t old = LD64(A1);
-    if (old == cmp) ST64(A1, x);
-    RET(old);
+    RET(ATCAS64(A1, cmp, x));
 }
 
 HLE(IsBadWritePtr) { RET(0); }

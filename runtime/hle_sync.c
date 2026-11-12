@@ -23,7 +23,7 @@ HLE(CreateEventW) { hle_set_error(0); uint64_t h = new_obj(O_EVENT); Obj* o = ha
 HLE(CreateEventA) { hle_CreateEventW(c); }
 HLE(CreateEventExW) { hle_set_error(0); uint64_t h = new_obj(O_EVENT); Obj* o = handle_obj(h); o->manual = (A3 & 1) != 0; o->signaled = (A3 & 2) != 0; RET(h); }
 HLE(OpenEventW) { RET(0); }
-HLE(SetEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 1; RET(o != NULL); }
+HLE(SetEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 1; sched_notify(); RET(o != NULL); }
 /* completed overlapped I/O signals the OVERLAPPED's event */
 void hle_event_signal(uint64_t h) { Obj* o = handle_obj(h); if (o && o->type == O_EVENT) o->signaled = 1; }
 void sync_set_event(uint64_t h) { Obj* o = handle_obj(h); if (o && o->type == O_EVENT) o->signaled = 1; }
@@ -32,7 +32,7 @@ HLE(PulseEvent) { Obj* o = handle_obj(A1); if (o) o->signaled = 0; RET(o != NULL
 HLE(CreateSemaphoreW) { hle_set_error(0); uint64_t h = new_obj(O_SEM); Obj* o = handle_obj(h); o->count = (int32_t)A2; o->max = (int32_t)A3; RET(h); }
 HLE(CreateSemaphoreA) { hle_CreateSemaphoreW(c); }
 HLE(CreateSemaphoreExW) { hle_CreateSemaphoreW(c); }
-HLE(ReleaseSemaphore) { Obj* o = handle_obj(A1); if (!o) { RET(0); return; } if (A3) ST32(A3, (uint64_t)o->count); o->count += (int32_t)A2; RET(1); }
+HLE(ReleaseSemaphore) { Obj* o = handle_obj(A1); if (!o) { RET(0); return; } if (A3) ST32(A3, (uint64_t)o->count); o->count += (int32_t)A2; sched_notify(); RET(1); }
 static uint64_t new_mutex(int owned)
 {
     hle_set_error(0);
@@ -49,7 +49,7 @@ HLE(ReleaseMutex)
 {
     Obj* o = handle_obj(A1);
     if (!o || o->type != O_MUTEX || o->owner != sched_current_id()) { hle_set_error(288); RET(0); return; }
-    if (--o->count <= 0) { o->count = 0; o->owner = 0; }
+    if (--o->count <= 0) { o->count = 0; o->owner = 0; sched_notify(); }
     RET(1);
 }
 
@@ -163,13 +163,13 @@ HLE(WaitForMultipleObjects)
     RET(wait_many(c, n, hs, (int)A3, (uint32_t)A4));
 }
 HLE(WaitForMultipleObjectsEx) { hle_WaitForMultipleObjects(c); }
-HLE(SignalObjectAndWait) { Obj* o = handle_obj(A1); if (o && o->type == O_EVENT) o->signaled = 1; uint64_t h = A2; RET(wait_many(c, 1, &h, 0, (uint32_t)A3)); }
+HLE(SignalObjectAndWait) { Obj* o = handle_obj(A1); if (o && o->type == O_EVENT) o->signaled = 1; sched_notify(); uint64_t h = A2; RET(wait_many(c, 1, &h, 0, (uint32_t)A3)); }
 
 /* condition variables: the word counts wakes; a sleeper drops its lock and blocks until the count moves (waking
    every sleeper on WakeConditionVariable is allowed: callers must recheck, as wakeups may be spurious on Windows) */
 HLE(InitializeConditionVariable) { STP(A1, 0); RET(0); }
-HLE(WakeConditionVariable) { STP(A1, LDP(A1) + 4); RET(0); }
-HLE(WakeAllConditionVariable) { STP(A1, LDP(A1) + 4); RET(0); }
+HLE(WakeConditionVariable) { STP(A1, LDP(A1) + 4); sched_notify(); RET(0); }
+HLE(WakeAllConditionVariable) { STP(A1, LDP(A1) + 4); sched_notify(); RET(0); }
 static int cv_check(GThread* t) { return LDP(t->block_a) != t->block_b; }
 static int cv_sleep(CPU* c, uint64_t cv, uint32_t ms)
 {
@@ -227,7 +227,7 @@ HLE(RtlRunOnceExecuteOnce)
     RET((uint32_t)ok ? 0 : 0xC0000001);
 }
 HLE(InitOnceBeginInitialize) { ST32(A3, (LDP(A1) & 2) ? 0 : 1); if (A4) STP(A4, LDP(A1) & ~3ull); RET(1); }
-HLE(InitOnceComplete) { STP(A1, (A3 & ~3ull) | 2); RET(1); }
+HLE(InitOnceComplete) { STP(A1, (A3 & ~3ull) | 2); sched_notify(); RET(1); }
 static int addr_differs(GThread* t)
 {
     switch (t->block_n) {
@@ -249,8 +249,8 @@ HLE(WaitOnAddress)
     hle_set_error(1460);
     RET(0);
 }
-HLE(WakeByAddressSingle) { RET(0); }
-HLE(WakeByAddressAll) { RET(0); }
+HLE(WakeByAddressSingle) { sched_notify(); RET(0); }
+HLE(WakeByAddressAll) { sched_notify(); RET(0); }
 
 HLE(Sleep) { sched_sleep(c, (uint32_t)A1); RET(0); }
 HLE(SleepEx) { sched_sleep(c, (uint32_t)A1); RET(0); }
@@ -267,7 +267,7 @@ HLE(CreateThread)
     if (tid_out) ST32(tid_out, (uint64_t)t->tid);
     RET(h);
 }
-HLE(ResumeThread) { Obj* o = handle_obj(A1); if (o && o->thread) { o->thread->suspended = 0; } RET(o ? 1 : 0xFFFFFFFF); }
+HLE(ResumeThread) { Obj* o = handle_obj(A1); if (o && o->thread) { o->thread->suspended = 0; sched_notify(); } RET(o ? 1 : 0xFFFFFFFF); }
 HLE(SuspendThread) { RET(0); }
 HLE(ExitThread) { sched_exit_current(c, (uint32_t)A1); }
 HLE(FreeLibraryAndExitThread) { sched_exit_current(c, (uint32_t)A2); }

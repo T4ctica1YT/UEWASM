@@ -1,4 +1,5 @@
 import bisect
+import re
 from collections import Counter, defaultdict
 
 import iced_x86 as I
@@ -419,6 +420,7 @@ class Func:
         self.labels = prog.blocks[root]
         self.out = []
         self.ins = None
+        self.cas = False
 
     def emit(self, s):
         self.out.append("    " + s)
@@ -469,6 +471,8 @@ class Func:
                 return f"((R({n})>>8)&0xFF)"
             raise Unsupported("xmm as gpr")
         if k == OK.MEMORY:
+            if self.cas:
+                return "ov_"
             s = sz or self.size(i)
             return f"LD{s * 8}({self.addr()})"
         if k in IMM:
@@ -490,6 +494,9 @@ class Func:
             else:
                 self.emit(f"R({n}) = (R({n}) & ~{MASK[rsz]}) | ({UT[rsz]})({v});")
         elif k == OK.MEMORY:
+            if self.cas:
+                self.emit(f"nv_ = {v};")
+                return
             s = self.size(i)
             self.emit(f"ST{s * 8}({self.addr()}, {v});")
         else:
@@ -586,6 +593,8 @@ class Func:
         # brace open); the caller then emits the trap
         mark = len(self.out)
         try:
+            if locked and self.atomic(ins, m, mem0):
+                return
             if locked:
                 self.emit(f"{{ uint64_t lk_ = {self.addr()}; ATOMIC_BEGIN(lk_);")
             r = sse_fn(self, ins, m) if sse_fn else fn(ins)
@@ -595,6 +604,64 @@ class Func:
         except Unsupported:
             del self.out[mark:]
             raise
+
+    # read-modify-writes that can loop on a compare-and-swap: the body only reads the memory operand once (as ov_) and
+    # writes it once (nv_), and its flag updates come out the same when it runs again
+    CAS_LOOP = {"ADD", "SUB", "AND", "OR", "XOR", "INC", "DEC", "NOT", "NEG", "BTS", "BTR", "BTC"}
+
+    def atomic(self, ins, m, mem0):
+        """locked instructions as real atomic operations (AT* in rt.h: plain code in cooperative builds). False leaves
+        the instruction to the ATOMIC_BEGIN/END fallback"""
+        mi = 0 if mem0 else 1
+        s = self.size(mi)
+        if s not in (1, 2, 4, 8):
+            return False
+        b = s * 8
+        if m == "XCHG":
+            ri = 1 - mi
+            self.emit(f"{{ uint64_t o_ = ATXCHG{b}({self.addr()}, {self.rd(ri)});")
+            self.wr(ri, "o_")
+            self.emit("}")
+            return True
+        if m == "CMPXCHG":
+            acc = f"(R(0) & {MASK[s]})"
+            self.emit(f"{{ uint64_t e_ = {acc}, d_ = ATCAS{b}({self.addr()}, e_, {self.rd(1)}), r_ = (e_ - d_) & {MASK[s]}; "
+                      f"FL(F_SUB, {b}, e_, d_, r_);")
+            if s == 4:
+                self.emit("if (d_ != e_) R(0) = (uint32_t)d_; }")
+            elif s == 8:
+                self.emit("if (d_ != e_) R(0) = d_; }")
+            else:
+                self.emit(f"if (d_ != e_) R(0) = (R(0) & ~{MASK[s]}) | d_; }}")
+            return True
+        if m == "XADD":
+            self.emit(f"{{ uint64_t b_ = {self.rd(1)}, a_ = ATADD{b}({self.addr()}, b_), r_ = (a_ + b_) & {MASK[s]}; FL(F_ADD, {b}, a_, b_, r_);")
+            self.wr(1, "a_")
+            self.emit("}")
+            return True
+        if m in ("BTS", "BTR", "BTC") and ins.op_kind(1) == OK.REGISTER:
+            k, n, rs = self.reg(ins.op_register(1))
+            off = f"(int64_t)({ST[rs]})R({n})"
+            fn = {"BTS": "ATOR8", "BTR": "ATAND8", "BTC": "ATXOR8"}[m]
+            bit = "(1ull << n_)" if m != "BTR" else "~(1ull << n_)"
+            self.emit(f"{{ uint64_t ea_ = {self.addr()} + (({off}) >> 3); unsigned n_ = ({off}) & 7; uint64_t v_ = {fn}(ea_, {bit});")
+            self.emit("rt_setcf(&F, (v_ >> n_) & 1); }")
+            return True
+        if m in self.CAS_LOOP and mem0:
+            mark = len(self.out)
+            self.emit(f"{{ uint64_t lk_ = {self.addr()}, ov_, nv_; do {{ ov_ = LD{b}(lk_);")
+            self.cas = True
+            try:
+                getattr(self, "op_" + m)(ins)
+            finally:
+                self.cas = False
+            body = "\n".join(self.out[mark + 1:])
+            if body.count("nv_ = ") != 1 or re.search(r"\b(ST|LD)(8|16|32|64)\(", body):
+                del self.out[mark:]
+                return False
+            self.emit(f"}} while (!ATCASOK{b}(lk_, ov_, nv_)); }}")
+            return True
+        return False
 
     # ---- data movement
     def op_MOV(self, ins):

@@ -9,28 +9,18 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #include <sys/types.h>
 
 EM_JS_DEPS(uew_remote, "$stringToNewUTF8,$UTF8ToString");
-EM_JS(int, uew_rf_find, (const char* path, double* size, double* mtime), {
-    const f = Module.uewFiles && Module.uewFiles.lookup(UTF8ToString(path >>> 0));
-    if (!f) return -2;
-    HEAPF64[size >>> 3] = f.size || 0;
-    HEAPF64[mtime >>> 3] = f.mtime || 0;
-    return f.dir ? -1 : f.id;
-});
-EM_JS(char*, uew_rf_list, (const char* path), {
-    const s = Module.uewFiles && Module.uewFiles.list(UTF8ToString(path >>> 0));
-    return s == null ? 0 : stringToNewUTF8(s);
-});
-EM_JS(int, uew_rf_read_cached, (int id, double off, int len, uint8_t* dst), {
-    return Module.uewFiles.readCached(id, off, len, dst);
-});
+int uew_rf_find(const char* path, double* size, double* mtime);
+char* uew_rf_list(const char* path);
+int uew_rf_read_cached(int id, double off, int len, uint8_t* dst);
 EM_ASYNC_JS(int, uew_rf_read, (int id, double off, int len, uint8_t* dst), {
     return await Module.uewFiles.read(id, off, len, dst);
 });
-EM_JS(void, uew_rf_start, (int id, double off, int len), { Module.uewFiles.start(id, off, len); });
-EM_JS(int, uew_rf_ready, (int id, double off, int len), { return Module.uewFiles.ready(id, off, len); });
+void uew_rf_start(int id, double off, int len);
+int uew_rf_ready(int id, double off, int len);
 static int rf_ready(GThread* t) { return uew_rf_ready((int)t->block_a, (double)t->block_b, (int)t->block_n); }
 INIT_FN(rf_names) { sched_name_check(rf_ready, "file download", NULL); }
 
@@ -52,6 +42,10 @@ static ssize_t rf_read(void* p, char* buf, size_t n)
         sched_block_ext(sched_current_cpu(), rf_ready, ~0ull);
         r = uew_rf_read_cached(f->id, (double)f->pos, (int)n, (uint8_t*)buf);
     }
+#ifdef UEW_THREADS
+    /* the waiting read runs in the page's file cache, which only the page's thread can reach */
+    if (r < 0 && !emscripten_is_main_runtime_thread()) return -1;
+#endif
     if (r < 0) r = uew_rf_read(f->id, (double)f->pos, (int)n, (uint8_t*)buf);
     if (r < 0) return -1;
     f->pos += (uint64_t)r;

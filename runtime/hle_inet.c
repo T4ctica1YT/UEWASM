@@ -62,37 +62,10 @@ static void wstr(uint64_t p, char* out, size_t cap, int64_t len)
 /* ---- the page's handler ---- */
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-EM_JS(int, inet_claims, (const char* host), {
-    const n = Module.uewNet;
-    return n && n.http && (!n.claim || n.claim(UTF8ToString(host >>> 0))) ? 1 : 0;
-});
+int inet_claims(const char* host);
 /* runs the request; the answer waits in Module.uewNet.last until inet_take copies it */
-EM_JS(int, inet_request, (const char* method, const char* url, const char* headers, const uint8_t* body, int len, int* status, int* hlen), {
-    const n = Module.uewNet;
-    let r;
-    try {
-        r = n.http({ method: UTF8ToString(method >>> 0), url: UTF8ToString(url >>> 0), headers: UTF8ToString(headers >>> 0),
-                     body: HEAPU8.slice(body >>> 0, (body >>> 0) + len) });
-    } catch (e) { console.log("[net] handler failed: " + e); r = { status: 500, headers: {}, body: "" }; }
-    r = r || { status: 404, headers: {}, body: "" };
-    let b = r.body;
-    if (typeof b === "string") b = new TextEncoder().encode(b);
-    else if (b && !(b instanceof Uint8Array)) b = new TextEncoder().encode(JSON.stringify(b));
-    b = b || new Uint8Array(0);
-    let h = "";
-    const hs = Object.assign({ "Content-Length": String(b.length) }, r.headers || {});
-    for (const k in hs) h += k + ": " + hs[k] + "\r\n";
-    n.last = { h: new TextEncoder().encode(h), b };
-    HEAP32[(status >>> 0) >> 2] = r.status || 200;
-    HEAP32[(hlen >>> 0) >> 2] = n.last.h.length;
-    return b.length;
-});
-EM_JS(void, inet_take, (char* headers, uint8_t* body), {
-    const l = Module.uewNet.last;
-    HEAPU8.set(l.h, headers >>> 0);
-    HEAPU8.set(l.b, body >>> 0);
-    Module.uewNet.last = null;
-});
+int inet_request(const char* method, const char* url, const char* headers, const uint8_t* body, int len, int* status, int* hlen);
+void inet_take(char* headers, uint8_t* body);
 #else
 static int inet_claims(const char* host) { (void)host; return 0; }
 static int inet_request(const char* m, const char* u, const char* h, const uint8_t* b, int l, int* s, int* hl) { (void)m; (void)u; (void)h; (void)b; (void)l; *s = 0; *hl = 0; return 0; }

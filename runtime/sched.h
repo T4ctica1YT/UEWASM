@@ -70,6 +70,23 @@ void* host_ctx_main(void);
 void* host_ctx_new(void (*entry)(void*), void* arg, size_t stack);
 void host_ctx_switch(void* to);
 void host_ctx_free(void* ctx);
-/* the global lock around system calls and the scheduler (real-thread builds; nothing otherwise) */
+/* the global lock around system calls and the scheduler (real-thread builds; nothing otherwise). rt_unlock_all gives
+   it up entirely (guest code called back from a system call runs without it) and returns the depth for rt_relock.
+   sched_notify: something a blocked thread may wait for happened (event set, lock left...), so idle cores look again */
+#ifdef UEW_THREADS
 void rt_lock(void);
 void rt_unlock(void);
+int rt_unlock_all(void);
+void rt_relock(int depth);
+void sched_notify(void);
+#else
+static inline void rt_lock(void) {}
+static inline void rt_unlock(void) {}
+static inline int rt_unlock_all(void) { return 0; }
+static inline void rt_relock(int depth) { (void)depth; }
+static inline void sched_notify(void) {}
+#endif
+/* runs the guest's main thread: in place, or with real threads on a core of its own while this one serves the page */
+int sched_run_main(int (*fn)(void*), void* arg);
+/* a thread the game named (SetThreadDescription, or the name UE stores before starting it) */
+void sched_named(GThread* t);

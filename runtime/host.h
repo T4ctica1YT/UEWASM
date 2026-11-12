@@ -33,7 +33,11 @@ extern const FnEntry rt_fn_table[];
 extern const size_t rt_fn_count;
 extern const Thunk rt_thunks[];
 /* counts imported-function calls; at zero the scheduler checks the running thread's time slice */
+#ifdef UEW_THREADS
+extern _Thread_local int rt_hle_budget;
+#else
 extern int rt_hle_budget;
+#endif
 extern int rt_trace_on;
 void rt_trace_call(CPU* c, const char* name);
 void rt_hle_tick(CPU* c);

@@ -1,4 +1,4 @@
-mergeInto(LibraryManager.library, {
+const UEWG = {
   uewg_init__async: true,
   uewg_init: async function (canvasW, canvasH, ringPtr, ringSize) {
     // pointers above 2 GB arrive as negative numbers
@@ -1198,4 +1198,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     HEAPF64[out >>> 3] = v;
     return 1;
   },
-});
+};
+// with real threads the device lives on the page's thread: a call from another core runs there (async ones excepted)
+for (const k of Object.keys(UEWG))
+  if (k.startsWith("uewg_") && !k.includes("__") && typeof UEWG[k] == "function" && !UEWG[k + "__async"]) UEWG[k + "__proxy"] = "sync";
+mergeInto(LibraryManager.library, UEWG);

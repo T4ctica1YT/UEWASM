@@ -336,7 +336,6 @@ void rt_pause(CPU* c)
 }
 CPU* sched_current_cpu(void) { return current->cpu; }
 void sched_set_prio(void) { if (!current->prio) { current->prio = 1; nprio++; } }
-/* one host thread: nothing to lock */
-void rt_lock(void) {}
-void rt_unlock(void) {}
+void sched_named(GThread* t) { (void)t; }
+int sched_run_main(int (*fn)(void*), void* arg) { return fn(arg); }
 #endif

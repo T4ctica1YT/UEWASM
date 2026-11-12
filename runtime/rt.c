@@ -253,7 +253,11 @@ static const FnEntry* find_fn(uint64_t t)
 #define DYN_MAX 16384
 static Thunk dyn[DYN_MAX];
 static size_t ndyn;
+#ifdef UEW_THREADS
+_Thread_local int rt_hle_budget = 1024;
+#else
 int rt_hle_budget = 1024;
+#endif
 void sched_tick(CPU* c);
 void rt_hle_tick(CPU* c) { rt_hle_budget = 1024; sched_tick(c); }
 #include "dyn_tramp.inc"
@@ -369,22 +373,90 @@ void rt_trace_call(CPU* c, const char* name)
 }
 
 static void sj_jump32(CPU* c, uint64_t t);
+#ifdef UEW_THREADS
+/* system calls that only touch the calling thread's own state or the clock skip the global lock (they are the most
+   frequent ones: UE reads its thread-local slots and the clock all the time). 2: only for the first 64 TLS slots */
+static uint8_t* nolock;
+static void nolock_init(void)
+{
+    static const char* const names[] = { "TlsGetValue", "FlsGetValue", "GetCurrentThreadId", "GetCurrentThread", "GetCurrentProcess",
+        "GetCurrentProcessId", "QueryPerformanceCounter", "QueryPerformanceFrequency", "GetSystemTimeAsFileTime",
+        "GetSystemTimePreciseAsFileTime", "GetTickCount", "GetTickCount64", "GetLastError", "SetLastError",
+        "GetCurrentProcessorNumber", "GetCurrentProcessorNumberEx", "EnterCriticalSection", "LeaveCriticalSection",
+        "TryEnterCriticalSection" };
+    uint8_t* m = calloc(rt_thunk_count + 1, 1);
+    for (size_t k = 0; k < rt_thunk_count; k++) {
+        if (!rt_thunks[k].fn) continue;
+        for (size_t i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(rt_thunks[k].name, names[i])) m[k] = 1;
+        if (!strcmp(rt_thunks[k].name, "TlsSetValue") || !strcmp(rt_thunks[k].name, "FlsSetValue")) m[k] = 2;
+        /* the C runtime's pure functions: maths, and memory/string routines (bar the ones with hidden state) */
+        const char* n = rt_thunks[k].name;
+        static const char* const maths[] = { "pow", "log", "log10", "log2", "exp", "exp2", "trunc", "floor", "ceil", "sqrt", "sin", "cos",
+            "tan", "asin", "acos", "atan", "atan2", "fmod", "round", "lround", "fabs", "hypot", "cbrt", "modf", "frexp", "ldexp", "sinh",
+            "cosh", "tanh", "nearbyint", "rint", "lrint", "llrint", "llround", "remainder", "copysign", "fmin", "fmax", "log1p", "expm1" };
+        size_t nl = strlen(n);
+        for (size_t i = 0; i < sizeof maths / sizeof *maths; i++) {
+            size_t ml = strlen(maths[i]);
+            if (!strncmp(n, maths[i], ml) && (nl == ml || (nl == ml + 1 && n[ml] == 'f'))) m[k] = 1;
+        }
+        if (strstr(rt_thunks[k].dll, "crt-math") || ((!strncmp(n, "mem", 3) || !strncmp(n, "str", 3) || !strncmp(n, "wcs", 3)) &&
+            !strstr(n, "tok") && strcmp(n, "strerror") && strcmp(n, "strdup") && strcmp(n, "wcsdup") && strncmp(n, "str_", 4)))
+            m[k] = 1;
+    }
+    nolock = m;
+}
+#define THUNK_LOCKS(k) (!(nolock[k] == 1 || (nolock[k] == 2 && R(1) < 64)))
+/* ?lockstats=1: which system calls take the lock most, printed with each hitch report */
+static uint32_t* lock_calls;
+static int lock_stats = -1;
+void rt_lock_report(void)
+{
+    if (lock_stats <= 0 || !lock_calls) return;
+    char line[600];
+    int n = snprintf(line, sizeof line, "[lock] most locked calls:");
+    for (int r = 0; r < 12; r++) {
+        size_t best = 0;
+        for (size_t k = 1; k < rt_thunk_count; k++) if (lock_calls[k] > lock_calls[best]) best = k;
+        if (!lock_calls[best]) break;
+        n += snprintf(line + n, sizeof line - n, " %s %u,", rt_thunks[best].name, lock_calls[best]);
+        lock_calls[best] = 0;
+        if (n >= (int)sizeof line - 40) break;
+    }
+    memset(lock_calls, 0, rt_thunk_count * sizeof *lock_calls);
+    host_log("%s", line);
+}
+#else
+#define THUNK_LOCKS(k) 1
+#endif
 void rt_call(CPU* c, uint64_t t)
 {
     STACK_CHECK(c, t);
     if (t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn) {
         size_t k = (t - DYN_BASE) / 8;
+        rt_lock();
         if (RT_G32) rt_hle32(c, &dyn[k], dyn_pops[k]);
         else {
             dyn[k].fn(c);
             R(4) += 8;
         }
         if (--rt_hle_budget < 0) rt_hle_tick(c);
+        rt_unlock();
         return;
     }
     if (t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count) {
         size_t k = (t - THUNK_BASE) / 8;
         const Thunk* e = &rt_thunks[k];
+#ifdef UEW_THREADS
+        if (!nolock) nolock_init();
+#endif
+        int locks = THUNK_LOCKS(k);
+        if (locks) {
+            rt_lock();
+#ifdef UEW_THREADS
+            if (lock_stats < 0) { lock_stats = host_query_flag("lockstats"); lock_calls = calloc(rt_thunk_count + 1, 4); }
+            if (lock_stats) lock_calls[k]++;
+#endif
+        }
         if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL || host_query_flag("tracering");
         if (RT_G32) {
             if (trace_on) host_log("[hle] %s(%x, %x, %x, %x) ret=%x", e->name, (unsigned)LD32(R(4) + 4), (unsigned)LD32(R(4) + 8),
@@ -396,7 +468,10 @@ void rt_call(CPU* c, uint64_t t)
             else hle_missing(c, e);
             R(4) += 8;
         }
-        if (--rt_hle_budget < 0) rt_hle_tick(c);
+        if (locks) {
+            if (--rt_hle_budget < 0) rt_hle_tick(c);
+            rt_unlock();
+        } else if (--rt_hle_budget < 0) { rt_lock(); rt_hle_tick(c); rt_unlock(); }
         return;
     }
     const FnEntry* f = find_fn(t);
@@ -432,10 +507,25 @@ GuestFn rt_jump_fn(CPU* c, uint64_t t)
     return jump_slow;
 }
 
+/* a call site's cache: with real threads it is filled once (claimed, then the target published after the function),
+   so a reader that sees the address always sees its own function */
+static void ic_fill(IC* ic, uint64_t t, GuestFn f)
+{
+#ifdef UEW_THREADS
+    uint64_t z = 0;
+    if (!__atomic_compare_exchange_n((uint64_t*)&ic->a, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
+    ic->f = f;
+    __atomic_store_n((uint64_t*)&ic->a, t, __ATOMIC_RELEASE);
+#else
+    ic->f = f;
+    ic->a = t;
+#endif
+}
+
 GuestFn rt_ic_fn(CPU* c, uint64_t t, IC* ic)
 {
     GuestFn f = rt_jump_fn(c, t);
-    if (f != jump_slow) { ic->f = f; ic->a = t; }
+    if (f != jump_slow) ic_fill(ic, t, f);
     return f;
 }
 
@@ -444,20 +534,18 @@ void rt_call_ic(CPU* c, uint64_t t, IC* ic)
     STACK_CHECK(c, t);
     const FnEntry* f = (t >= IMAGE_LO && t < IMAGE_HI) ? find_fn(t) : NULL;
     if (f) {
-        ic->f = f->fn;
-        ic->a = t;
+        ic_fill(ic, t, f->fn);
         f->fn(c);
         return;
     }
-    if (!RT_G32 && t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn && (t - DYN_BASE) / 8 < DYN_TRAMPS) {
-        ic->f = dyn_tramp[(t - DYN_BASE) / 8];
-        ic->a = t;
-    }
+#ifndef UEW_THREADS
+    /* system calls straight from the call site (with real threads they go through rt_call, which takes the lock) */
+    if (!RT_G32 && t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn && (t - DYN_BASE) / 8 < DYN_TRAMPS)
+        ic_fill(ic, t, dyn_tramp[(t - DYN_BASE) / 8]);
     /* imported functions: cache the wrapper unless calls are being logged */
-    if (!RT_G32 && t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count && rt_thunks[(t - THUNK_BASE) / 8].call) {
-        ic->f = rt_thunks[(t - THUNK_BASE) / 8].call;
-        ic->a = t;
-    }
+    if (!RT_G32 && t >= THUNK_BASE && t < THUNK_BASE + 8ull * rt_thunk_count && rt_thunks[(t - THUNK_BASE) / 8].call)
+        ic_fill(ic, t, rt_thunks[(t - THUNK_BASE) / 8].call);
+#endif
     rt_call(c, t);
 }
 
@@ -471,7 +559,9 @@ static uint64_t invoke32(CPU* c, uint64_t fn, int n, const uint64_t* a)
     sp -= 4;
     ST32(sp, RET_SENTINEL);
     R(4) = sp;
+    int lockd = rt_unlock_all();
     rt_call(c, fn);
+    rt_relock(lockd);
     uint64_t ret = (uint32_t)R(0);
     static const int keep[] = { 3, 5, 6, 7 };
     for (int i = 0; i < 4; i++) c->r[keep[i]] = save[keep[i]];
@@ -496,7 +586,9 @@ uint64_t rt_invoke(CPU* c, uint64_t fn, int n, const uint64_t* a)
     sp -= 8;
     ST64(sp, RET_SENTINEL);
     R(4) = sp;
+    int lockd = rt_unlock_all();
     rt_call(c, fn);
+    rt_relock(lockd);
     uint64_t ret = R(0);
     static const int keep[] = { 3, 5, 6, 7, 12, 13, 14, 15 };
     for (int i = 0; i < 8; i++) c->r[keep[i]] = save[keep[i]];
@@ -520,8 +612,14 @@ void rt_detach_all(CPU* c)
 
 void rt_exit(int code)
 {
+#ifdef UEW_THREADS
+    /* any thread may end the process; the other cores' stacks can't be unwound to rt_main */
+    host_flush();
+    exit(code);
+#else
     exit_code = code;
     longjmp(exit_jmp, 1);
+#endif
 }
 
 void rt_trap(CPU* c, uint64_t pc, const char* what)
@@ -724,6 +822,7 @@ void rt_idiv64(CPU* c, uint64_t s) { if (!s) { DIV_ERR(); return; } __int128 n =
 #define F (*f)
 void rt_cmpxchg16b(CPU* c, Flags* f, uint64_t a)
 {
+    ATOMIC_BEGIN(a);
     uint64_t lo = LD64(a), hi = LD64(a + 8);
     if (lo == R(0) && hi == R(2)) {
         ST64(a, R(3));
@@ -734,6 +833,7 @@ void rt_cmpxchg16b(CPU* c, Flags* f, uint64_t a)
         R(2) = hi;
         rt_setzf(f, 0);
     }
+    ATOMIC_END(a);
 }
 
 static uint64_t ldn(uint64_t a, int n) { return n == 1 ? LD8(a) : n == 2 ? LD16(a) : n == 4 ? LD32(a) : LD64(a); }
@@ -930,6 +1030,11 @@ static int load_image(const char* path)
 uint64_t g_teb, g_peb, g_exe_base;
 
 void hle_vpx_init(void);
+static const ModuleInfo* main_exe;
+#if defined(UEW_THREADS) && defined(UEW_WEBGPU)
+void* gpu_wgpu_backend(void);
+#endif
+static int guest_main(void* arg);
 int rt_main(int argc, char** argv, const char* image_path)
 {
     MEM_SIZE = (uint64_t)GUEST_MEM_MB << 20;
@@ -973,7 +1078,20 @@ int rt_main(int argc, char** argv, const char* image_path)
     hle_init(argc, argv);
     hle_vpx_init();
     R(4) = (stack + stack_size - 64) & ~15ull;
+    main_exe = exe;
+#if defined(UEW_THREADS) && defined(UEW_WEBGPU)
+    /* the GPU device belongs to the page's thread: make it here, before the game's main thread moves to another core */
+    gpu_wgpu_backend();
+#endif
+    exit_code = sched_run_main(guest_main, c);
+    host_flush();
+    return exit_code;
+}
 
+static int guest_main(void* arg)
+{
+    CPU* c = arg;
+    const ModuleInfo* exe = main_exe;
     if (setjmp(exit_jmp) == 0) {
         for (size_t i = 0; i < rt_module_count; i++) {
             const ModuleInfo* m = &rt_modules[i];
@@ -991,7 +1109,6 @@ int rt_main(int argc, char** argv, const char* image_path)
         rt_call(c, exe->base + exe->entry_rva);
         exit_code = (int)R(0);
     }
-    host_flush();
     return exit_code;
 }
 

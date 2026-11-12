@@ -1,5 +1,6 @@
 // The save folder lives in IndexedDB so progress and settings survive reloads.
 (() => {
+  if (typeof ENVIRONMENT_IS_PTHREAD != "undefined" && ENVIRONMENT_IS_PTHREAD) return;   // page-side only; worker threads skip it
   const dir = Module.uewSave;
   if (!dir) return;
   let busy = false;

@@ -101,8 +101,9 @@ void host_idle(uint64_t ns) { Sleep((DWORD)(ns / 1000000)); }
 #include <emscripten/stack.h>
 typedef struct HCtx { int id; uintptr_t sp, top; void (*fn)(void*); void* arg; void* mem; } HCtx;
 void _emscripten_stack_restore(uintptr_t);
-static HCtx main_hctx;
-static HCtx* cur_hctx = &main_hctx;
+/* per host thread: with real threads every core switches its own coroutines */
+static _Thread_local HCtx main_hctx;
+static _Thread_local HCtx* cur_hctx;
 static int next_hctx = 1;
 
 EM_ASYNC_JS(void, uew_js_switch, (int from, int to, HCtx* target), {
@@ -128,7 +129,7 @@ void* host_ctx_new(void (*entry)(void*), void* arg, size_t stack)
     HCtx* c = calloc(1, sizeof *c);
     uint8_t* mem = malloc(stack);
     if (!c || !mem) return NULL;
-    c->id = next_hctx++;
+    c->id = __atomic_fetch_add(&next_hctx, 1, __ATOMIC_RELAXED);
     c->mem = mem;
     memset(mem, 0xA5, 256);     /* canary: a coroutine that runs off the bottom of its native stack overwrites it */
     c->top = ((uintptr_t)mem + stack - 64) & ~(uintptr_t)15;
@@ -187,38 +188,22 @@ void host_browser_turn(void)
     uew_js_yield();
     browser_turn = host_ticks_ns();
 }
-/* frames are counted, not handed out: every thread waiting for the next one wakes when the count moves */
-EM_JS(void, uew_js_frame_request, (void), {
-    if (!Module.uewWatchdog && typeof setInterval !== "undefined" && typeof document !== "undefined") {
-        // a game that stops presenting while the page is visible: log what every thread is doing, once per stall
-        let last = -1, since = performance.now(), dumped = false;
-        Module.uewWatchdog = setInterval(() => {
-            const n = Module.uewPresents || 0, now = performance.now();
-            if (n !== last || document.visibilityState !== "visible") { last = n; since = now; dumped = false; return; }
-            if (!dumped && n > 600 && now - since > 8000 && Module._uew_threads) {
-                dumped = true;
-                console.log("[watchdog] no frame for 8 s; threads:");
-                Module._uew_threads();
-            }
-        }, 1000);
-    }
-    if (Module.uewFramePending) return;
-    Module.uewFramePending = 1;
-    const go = () => {
-        Module.uewFramePending = 0;
-        Module.uewFrameSeq = (Module.uewFrameSeq | 0) + 1;
-        const w = Module.uewIdleWake;
-        if (w) { Module.uewIdleWake = null; w(); }
-    };
-    (typeof requestAnimationFrame !== "undefined" ? requestAnimationFrame : setTimeout)(go);
-});
-EM_JS(int, uew_js_frame_seq, (void), { return Module.uewFrameSeq | 0; });
+/* frames are counted, not handed out: every thread waiting for the next one wakes when the count moves. The page's
+   frame callback (uew_js_frame_request, uew_host.js) writes the count here, where every core can read it */
+void uew_js_frame_request(volatile uint32_t* seq);
+volatile uint32_t uew_frame_seq;
+volatile uint32_t uew_wake_word;
 /* waits up to ms, or until the animation frame fires; short waits use a message turn (setTimeout clamps nested
    calls to 4 ms) */
-EM_ASYNC_JS(void, uew_js_idle, (double ms), {
+EM_ASYNC_JS(void, uew_js_idle, (double ms, volatile uint32_t* wake), {
     await new Promise(r => {
         let done = false;
         const fin = () => { if (!done) { done = true; Module.uewIdleWake = null; r(); } };
+        // real threads: another core's notify (sched_notify) ends the wait too
+        if (wake && typeof SharedArrayBuffer != "undefined" && HEAP32.buffer instanceof SharedArrayBuffer) {
+            const w = Atomics.waitAsync(HEAP32, wake >>> 2, Atomics.load(HEAP32, wake >>> 2), ms);
+            if (w.async) w.value.then(fin);
+        }
         // a finished download, pipeline or readback ends the wait early (Module.uewWake)
         Module.uewIdleWake = fin;
         if (ms < 3) {
@@ -229,10 +214,14 @@ EM_ASYNC_JS(void, uew_js_idle, (double ms), {
         } else setTimeout(fin, ms - 1);
     });
 });
-void host_frame_request(void) { frame_pending = 1; uew_js_frame_request(); }
-uint32_t host_frame_seq(void) { return (uint32_t)uew_js_frame_seq(); }
+void host_frame_request(void) { frame_pending = 1; uew_js_frame_request(&uew_frame_seq); }
+uint32_t host_frame_seq(void) { return uew_frame_seq; }
 void host_frame_done(void) { frame_pending = 0; browser_turn = host_ticks_ns(); }
-void host_idle(uint64_t ns) { uew_js_idle((double)ns / 1e6 / speed); browser_turn = host_ticks_ns(); }
+#ifdef UEW_THREADS
+void host_idle(uint64_t ns) { uew_js_idle((double)ns / 1e6 / speed, &uew_wake_word); browser_turn = host_ticks_ns(); }
+#else
+void host_idle(uint64_t ns) { uew_js_idle((double)ns / 1e6 / speed, NULL); browser_turn = host_ticks_ns(); }
+#endif
 #else
 void* host_ctx_main(void) { return (void*)1; }
 void* host_ctx_new(void (*entry)(void*), void* arg, size_t stack) { (void)entry; (void)arg; (void)stack; return NULL; }

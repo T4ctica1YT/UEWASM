@@ -3,6 +3,7 @@
 // signs in to a local account and reaches its menus without Epic's servers. With Module.uewNetPlaceholders, files the
 // game fetches that aren't known here (images, JSON) come back as stand-ins with the right type instead of errors.
 (function () {
+  if (typeof ENVIRONMENT_IS_PTHREAD != "undefined" && ENVIRONMENT_IS_PTHREAD) return;   // page-side only; worker threads skip it
   const accountId = "a0f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5", displayName = localStorage.getItem("uewName") || "Player";
   const now = () => new Date().toISOString();
   const json = (body, status) => ({ status: status || 200, headers: { "Content-Type": "application/json" }, body });

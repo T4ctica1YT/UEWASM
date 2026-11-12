@@ -16,7 +16,7 @@ from . import __version__
 
 TITLE = "UEWASM"
 RENDERERS = {"WebGPU (recommended)": "webgpu", "WebGL 2 (works everywhere)": "webgl2"}
-THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (needs COOP/COEP headers)": "real"}
+THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (several cores; WebGPU, https or localhost)": "real"}
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
 RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540"]
 BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
@@ -228,6 +228,7 @@ class App:
         self.show_fps = tk.BooleanVar(value=prefs.get("show_fps", False))
         self.async_shaders = tk.BooleanVar(value=prefs.get("async_shaders", True))
         self.debug_panel = tk.BooleanVar(value=prefs.get("debug_panel", True))
+        self.single = tk.BooleanVar(value=prefs.get("single", False))
         ttk.Checkbutton(checks, text="Recompile the game's own DLLs", variable=self.game_dlls).pack(side="left")
         ttk.Checkbutton(checks, text="Recompile Microsoft runtime DLLs", variable=self.sys_dlls).pack(side="left", padx=14)
         ttk.Checkbutton(checks, text="Also build a native test .exe (needs Visual Studio)", variable=self.native).pack(side="left")
@@ -235,6 +236,8 @@ class App:
             row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(s, text="Shrink code with Binaryen (10% smaller, needs lots of RAM)", variable=self.wasm_opt).grid(
             row=4, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(s, text="Also make a single .html that plays straight from disk (no server; cooperative threads only)",
+                        variable=self.single).grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(s, text="Show an FPS counter (Ctrl+Shift+F toggles it in game)", variable=self.show_fps).grid(
             row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(s, text="Compile shaders in the background (shorter freezes when new effects first appear)",
@@ -404,7 +407,7 @@ class App:
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
                                     "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
                                     "backend": self.backend.get(), "placeholders": self.placeholders.get(), "aes_on": self.aes_on.get(),
-                                    "mem_limit": self.mem_limit.get()})
+                                    "mem_limit": self.mem_limit.get(), "single": self.single.get()})
 
     def start(self):
         exe = self.find_exe()
@@ -416,8 +419,10 @@ class App:
         except ValueError:
             messagebox.showerror(TITLE, "Resolution should look like 1280x720.")
             return
-        if THREADS[self.threads.get()] == "real":
-            messagebox.showinfo(TITLE, "Real-thread builds aren't finished yet; this build will use cooperative threading.")
+        if THREADS[self.threads.get()] == "real" and self.single.get():
+            messagebox.showerror(TITLE, "A single .html file can't use real threads (pages opened from disk can't be cross-origin isolated). "
+                                        "Pick cooperative threading, or untick the single-file option.")
+            return
         out = Path(self.out.get() or Path.home() / "UEWASM Builds" / exe.stem)
         from .recomp.upak import parse_key
         aes = parse_key(self.aes_key.get()) if self.aes_on.get() else None
@@ -427,7 +432,8 @@ class App:
         opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=(w, h), mem=int(self.mem.get()),
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
                     compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
-                    backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()))
+                    backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()),
+                    threads=THREADS[self.threads.get()], single=self.single.get())
         self.cancel.clear()
         self.clear_log()
         self.start_btn["state"] = "disabled"
@@ -476,7 +482,7 @@ class App:
                                    video_height=o["size"][1] if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
                                    wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
                                    backend=o.get("backend"), placeholders=o.get("placeholders", False), aes_key=o.get("aes"),
-                                   mem_limit_gb=o.get("mem_limit", 8))
+                                   mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False))
             self.est.remember()
             self.q.put(("done", str(web)))
         except Cancelled:

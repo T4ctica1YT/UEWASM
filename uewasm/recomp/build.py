@@ -105,16 +105,32 @@ VOLATILE = {0, 1, 2, 4, 8, 9, 10, 11}
 _WRITE = re.compile(r"\bR\((\d+)\)\s*(?:[-+&|^]|<<|>>)?=(?!=)")
 
 
+_XREF = re.compile(r"c->x\[(\d+)\]")
+_XWRITE = re.compile(r"&c->x\[(\d+)\]|c->x\[(\d+)\](?:\.\w+\[\d+\])?\s*(?:[-+*/&|^]|<<|>>)?=(?!=)")
+XVOLATILE = set(range(6))   # Win64: xmm6-15 survive calls
+
+
 def regs_local(body, bits=64):
     """expands SPILL/FILL/FILLV for one lifted function: spill only registers it writes, reload only ones it reads
-    (after a guest call, only those the callee may have changed; 32-bit code has no fixed convention to lean on)"""
+    (after a guest call, only those the callee may have changed; 32-bit code has no fixed convention to lean on).
+    XMM registers live in locals too (x<n>_), so SSE code stays in wasm registers instead of the CPU struct; functions
+    that hand the whole register file to the runtime (FXSAVE, setjmp) keep them in memory"""
     text = "\n".join(body)
     used = sorted({int(n) for n in re.findall(r"\bR\((\d+)\)", text)})
     wrote = sorted({int(n) for n in _WRITE.findall(text)})
     spill = "".join(f"c->r[{n}] = r{n}_; " for n in wrote) or ""
     fill = "".join(f"r{n}_ = c->r[{n}]; " for n in used)
     fillv = "".join(f"r{n}_ = c->r[{n}]; " for n in used if n in VOLATILE or bits == 32)
-    return [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
+    xused = []
+    if "rt_fxsave(" not in text and "rt_fxrstor(" not in text and "setjmp(" not in text:
+        xused = sorted({int(n) for n in _XREF.findall(text)})
+        xwrote = sorted({int(x or y) for x, y in _XWRITE.findall(text)})
+        spill += "".join(f"c->x[{n}] = x{n}_; " for n in xwrote)
+        fill += "".join(f"x{n}_ = c->x[{n}]; " for n in xused)
+        fillv += "".join(f"x{n}_ = c->x[{n}]; " for n in xused if n in XVOLATILE or bits == 32)
+        body = [_XREF.sub(lambda m: f"x{m.group(1)}_", l) for l in body]
+    out = [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
+    return out, xused
 
 
 def _init_worker(all_roots, comments, mode="high"):
@@ -145,9 +161,11 @@ def _lift_chunk(args):
         bad += fn.lift()
         out.append(f"void F_{r:x}(CPU* __restrict c) {{")
         entry = "2" if prog.func_start(r) or not prog.flags_live(r) else "rt_xfl"
-        body = regs_local(fn.out, prog.bits)
+        body, xused = regs_local(fn.out, prog.bits)
         used = sorted({int(n) for l in body for n in re.findall(r"\bR\((\d+)\)", l)})
         decl = (" uint64_t " + ", ".join(f"r{n}_ = c->r[{n}]" for n in used) + ";") if used else ""
+        if xused:
+            decl += " XMM " + ", ".join(f"x{n}_ = c->x[{n}]" for n in xused) + ";"
         out.append(f"    uint8_t* const mem_ = MEM; Flags F = {{0}}; F.fop = F_RAW; F.rawfl = {entry}; F.fsz = 64;{decl}")
         if any("setjmp(" in l for l in body):
             # a frame that holds a host setjmp can't be replaced by a tail call
@@ -390,22 +408,31 @@ SHELL = """<!doctype html>
     onRuntimeInitialized: () => { status.textContent = ""; },
   };
   if (parts.length) {
+    // the parts download together and are fed in order to a streaming compile, which runs while they arrive
     Module.instantiateWasm = (imports, done) => {
-      (async () => {
-        let got = 0;
-        const bufs = await Promise.all(parts.map(async u => {
-          const b = new Uint8Array(await (await fetch(u)).arrayBuffer());
-          got += b.length;
-          status.textContent = `Loading code ${Math.round(got / 1048576)} MB`;
-          return b;
-        }));
-        const all = new Uint8Array(bufs.reduce((n, b) => n + b.length, 0));
-        let o = 0;
-        for (const b of bufs) { all.set(b, o); o += b.length; }
-        status.textContent = "Compiling…";
-        const r = await WebAssembly.instantiate(all, imports);
-        done(r.instance, r.module);
-      })().catch(e => { status.textContent = "Failed to load: " + e.message; });
+      let got = 0;
+      const res = parts.map(u => fetch(u));
+      const body = new ReadableStream({
+        async start(ctl) {
+          for (let i = 0; i < res.length; i++) {
+            const r = await res[i];
+            if (!r.ok) throw new Error(`HTTP ${r.status} for ${parts[i]}`);
+            const rd = r.body.getReader();
+            for (;;) {
+              const { done: end, value } = await rd.read();
+              if (end) break;
+              got += value.length;
+              status.textContent = `Loading code ${Math.round(got / 1048576)} MB`;
+              ctl.enqueue(value);
+            }
+          }
+          status.textContent = "Compiling…";
+          ctl.close();
+        }
+      });
+      WebAssembly.instantiateStreaming(new Response(body, { headers: { "Content-Type": "application/wasm" } }), imports)
+        .then(r => done(r.instance, r.module))
+        .catch(e => { status.textContent = "Failed to load: " + e.message; });
       return {};
     };
   }
@@ -446,8 +473,40 @@ def memory_split(limit_gb, guest_mb):
     return cache, gpu
 
 
+COI_SW = """// Real-thread builds need cross-origin isolation (SharedArrayBuffer). Hosts that can't send the headers get them from
+// this service worker, which adds them to every response of the page.
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", e => e.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", e => {
+  const r = e.request;
+  if (r.cache === "only-if-cached" && r.mode !== "same-origin") return;
+  e.respondWith(fetch(r).then(res => {
+    if (res.status === 0) return res;
+    const h = new Headers(res.headers);
+    h.set("Cross-Origin-Embedder-Policy", "require-corp");
+    h.set("Cross-Origin-Opener-Policy", "same-origin");
+    h.set("Cross-Origin-Resource-Policy", "cross-origin");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+  }));
+});
+"""
+
+COI_LOAD = """<script>
+  // real threads: start once the page is cross-origin isolated (headers from the host, or coi-sw.js)
+  if (self.crossOriginIsolated) document.write('<script src="game.js"><\\/script>');
+  else if (navigator.serviceWorker && window.isSecureContext) {
+    status.textContent = "Setting up threads…";
+    navigator.serviceWorker.register("coi-sw.js").then(() => navigator.serviceWorker.ready).then(() => {
+      if (sessionStorage.getItem("uewCoi") === location.href) status.textContent = "This host blocks the isolation real threads need; rebuild with cooperative threads.";
+      else { sessionStorage.setItem("uewCoi", location.href); location.reload(); }
+    });
+  } else status.textContent = "Real threads need https (or localhost) to run.";
+</script>
+"""
+
+
 def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
-                placeholders=False, cache_mb=640, gpu_mb=2048):
+                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop"):
     """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts"""
     import json
     wasm = web / "game.wasm"
@@ -469,6 +528,11 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
             .replace("__ASYNC__", "true" if async_shaders else "false")
             .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false")
             .replace("__CACHEMB__", str(int(cache_mb))).replace("__GPUMB__", str(int(gpu_mb))))
+    if threads == "real":
+        html = html.replace('<script src="game.js"></script>\n', COI_LOAD)
+        (web / "coi-sw.js").write_text(COI_SW, encoding="utf-8")
+    elif (web / "coi-sw.js").exists():
+        (web / "coi-sw.js").unlink()
     (web / "index.html").write_text(html, encoding="utf-8")
     # Cloudflare Pages reads this; other hosts ignore it
     (web / "_headers").write_text("\n".join([
@@ -476,6 +540,80 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
         "/game.wasm*", "  Content-Type: application/wasm", "",
         "/data/*", "  Content-Type: application/octet-stream", "  Cache-Control: public, max-age=3600, must-revalidate", ""]),
         encoding="utf-8")
+
+
+EMBED_JS = """<script>
+  // single-file build: the code and game files are in this page; each piece becomes a Blob (kept outside the script heap)
+  (() => {
+    const dec = s => Uint8Array.fromBase64 ? Uint8Array.fromBase64(s) : Uint8Array.from(atob(s), ch => ch.charCodeAt(0));
+    const parts = new Map(), wasm = [];
+    let index = "";
+    for (const el of [...document.querySelectorAll('script[type="application/x-uew"]')]) {
+      const n = el.dataset.n, t = el.textContent;
+      el.remove();
+      if (n == "index") index = t;
+      else if (n.startsWith("wasm.")) wasm[+n.slice(5)] = new Blob([dec(t)]);
+      else parts.set(n, new Blob([dec(t)]));
+    }
+    Module.uewEmbed = { index, part: n => parts.get(n) };
+    Module.instantiateWasm = (imports, done) => {
+      status.textContent = "Compiling…";
+      const code = new Response(new Blob(wasm).stream().pipeThrough(new DecompressionStream("gzip")), { headers: { "Content-Type": "application/wasm" } });
+      WebAssembly.instantiateStreaming(code, imports).then(r => { wasm.length = 0; done(r.instance, r.module); })
+        .catch(e => { status.textContent = "Failed to load: " + e.message; });
+      return {};
+    };
+  })();
+</script>
+"""
+
+
+def write_single_file(web, dest, log=print, chunk_mb=16):
+    """one .html holding the whole web build (code and game files), for opening straight from disk with no server.
+    Only for cooperative-thread builds: real threads need cross-origin isolation, which a file:// page can't have."""
+    import base64
+    import gzip
+    web, dest = Path(web), Path(dest)
+    html = (web / "index.html").read_text(encoding="utf-8")
+    if "game.js" not in html:
+        raise RuntimeError("not a web build: " + str(web))
+    ico = web / "favicon.ico"
+    if ico.exists():
+        html = html.replace('href="favicon.ico"', 'href="data:image/x-icon;base64,' + base64.b64encode(ico.read_bytes()).decode() + '"')
+    parts = sorted(web.glob("game.wasm.*"), key=lambda p: int(p.suffix[1:]))
+    code = b"".join(p.read_bytes() for p in parts) if parts else (web / "game.wasm").read_bytes()
+    data = web / "data"
+    js = (web / "game.js").read_text(encoding="utf-8").replace("</script", "<\\/script")
+    i = html.index('<script src="game.js"></script>')
+    tmp = dest.with_suffix(".tmp")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(html[:i])
+
+        def put(name, b):
+            f.write(f'<script type="application/x-uew" data-n="{name}">')
+            f.write(base64.b64encode(b).decode("ascii"))
+            f.write("</script>\n")
+        z = gzip.compress(code, 6)
+        step = chunk_mb << 20
+        for k in range(0, len(z), step):
+            put(f"wasm.{k // step}", z[k:k + step])
+        if (data / "index.txt").exists():
+            # script text isn't entity-decoded; only "</script" would end it early
+            f.write('<script type="application/x-uew" data-n="index">' + (data / "index.txt").read_text(encoding="utf-8")
+                    .replace("</script", "<\\/script") + "</script>\n")
+            for p in sorted(data.iterdir()):
+                if p.name != "index.txt":
+                    put(p.name, p.read_bytes())
+        f.write(EMBED_JS)
+        f.write("<script>\n" + js + "\n</script>\n")
+        f.write(html[i + len('<script src="game.js"></script>'):])
+    tmp.replace(dest)
+    mb = dest.stat().st_size / 1048576
+    log(f"single file: {dest} ({mb:.0f} MB; code {len(code) / 1048576:.0f} MB, {len(z) / 1048576:.0f} MB compressed)")
+    if mb > 1500:
+        log("note: browsers may not open a page this big; single-file builds suit smaller games")
+    return dest
 
 
 def mem_budget_mb():
@@ -526,7 +664,7 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
                wasm_opt=False, game_args=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
-               placeholders=False, aes_key=None, mem_limit_gb=8):
+               placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web"):
     """aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
     older-format ones are packaged decrypted, so they compress.
     wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
@@ -535,10 +673,16 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         raise ValueError("renderer must be webgpu or webgl2")
     if threads not in ("coop", "real"):
         raise ValueError("threads must be coop or real")
-    if threads == "real":
-        raise NotImplementedError("real (Web Worker) threading is not finished yet; use --threads coop")
+    if threads == "real" and renderer != "webgpu":
+        raise ValueError("real threads need the WebGPU renderer (WebGL only works from the page's own thread)")
+    if single_file and threads == "real":
+        raise ValueError("a single-file build can't use real threads (a page opened from disk can't be cross-origin isolated); use --threads coop")
+    if single_file:
+        compress = True
     out = Path(out)
-    obj = out / "wobj"
+    mt = threads == "real"
+    # real threads compile every file differently (shared memory, atomics), so their objects are kept apart
+    obj = out / ("wobj_mt" if mt else "wobj")
     obj.mkdir(exist_ok=True)
     env, emcc, _ = emsdk_env()
     # simd: wasm SIMD (every current browser) lets clang turn the emulated SSE lanes into real vector ops
@@ -547,6 +691,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     cflags += os.environ.get("UEW_EXTRA_CFLAGS", "").split()
     if renderer == "webgpu":
         cflags.append("-DUEW_WEBGPU")
+    if mt:
+        cflags += ["-pthread", "-DUEW_THREADS"]
     # generated code only depends on rt.h/sse.h and the opt level; the runtime is always rebuilt (it is small)
     stamp = obj / "flags.txt"
     key = " ".join(cflags)
@@ -589,7 +735,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
             jobs.append((src.name, [emcc, *cflags, *PORTS, *debug_defs, "-c", str(src), "-o", o], env, mb + 200))
     run_jobs(jobs, "wasm compile", progress)
     progress("link", 0, 0)
-    web = out / "web"
+    web = out / web_name
     web.mkdir(exist_ok=True)
     orsp = out / "emlink.rsp"
     orsp.write_text("\n".join(f'"{p.as_posix()}"' for p in obj.glob("*.o")), encoding="utf-8")
@@ -597,8 +743,14 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
             "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=64MB", "-sMAXIMUM_MEMORY=4GB", "-sSTACK_SIZE=16MB", "-sENVIRONMENT=web,node",
             "-sEXIT_RUNTIME=1", "-sMODULARIZE=0", "-sINVOKE_RUN=1", *PORTS,
             "-sMIN_WEBGL_VERSION=2", "-sMAX_WEBGL_VERSION=2", "-sSUPPORT_LONGJMP=wasm", "-sJSPI", "-sJSPI_EXPORTS=['uew_ctx_start']", "-sEXPORTED_FUNCTIONS=" + ",".join(exports)]
+    link += ["--js-library", str(RUNTIME / "web" / "uew_host.js")]
     if renderer == "webgpu":
         link += ["--js-library", str(RUNTIME / "web" / "uew_webgpu.js")]
+    if mt:
+        # one worker per core is started with the page (the scheduler's carriers), so none has to load mid-game
+        link += ["-pthread", "-sPTHREAD_POOL_SIZE=Math.min(4,(globalThis.navigator&&navigator.hardwareConcurrency)||4)",
+                 "-sPTHREAD_POOL_SIZE_STRICT=0"]
+        link[link.index("-sENVIRONMENT=web,node")] = "-sENVIRONMENT=web,worker,node"
     if names:
         link.append("--profiling-funcs")
     if game_root:
@@ -608,8 +760,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         if backend:
             link += ["--pre-js", str(RUNTIME / "web" / "backends" / BACKENDS[backend]["script"])]
     if node_fs:
-        link += ["-sNODERAWFS=1", "-sENVIRONMENT=node"]
-        link.remove("-sENVIRONMENT=web,node")
+        link = [x for x in link if not x.startswith("-sENVIRONMENT=")] + ["-sNODERAWFS=1", "-sENVIRONMENT=node"]
     elif embed:
         link += ["--embed-file", f"{out / 'image.bin'}@image.bin"]
     r = resources.run(link, env=env, capture_output=True, text=True)
@@ -646,7 +797,11 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         cache_mb, gpu_mb = memory_split(mem_limit_gb, guest)
         log(f"memory limit {mem_limit_gb} GB: {guest} MB game memory, {cache_mb} MB download cache, {gpu_mb} MB video memory")
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
-                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb)
+                    exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb,
+                    threads=threads)
+        if single_file:
+            name = re.sub(r'[<>:"/\\|?*]', "", title or Path(exe_rel).stem).strip() or "game"
+            write_single_file(web, out / "single" / f"{name}.html", log=log)
     log(f"wasm build: {web} ({renderer}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
     return web
 

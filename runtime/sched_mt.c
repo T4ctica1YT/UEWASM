@@ -39,9 +39,48 @@ static uint64_t report_last;
 static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t big_cv = PTHREAD_COND_INITIALIZER;
 static __thread int lock_depth;
+static int idle_n;                /* carriers waiting for work: only then do releases wake anyone */
+extern volatile uint32_t uew_wake_word;
+static GThread* main_thread;      /* the guest's main thread */
+static int base_is_guest = 1;     /* carrier 0's own context is the guest main thread (until sched_run_main moves it) */
+static void switch_to(GThread* t);
+static GThread* pick(void);
+static void sched_idle(uint64_t deadline);
+static void wake_carriers(void);
 
-void rt_lock(void) { if (lock_depth++ == 0) pthread_mutex_lock(&big_lock); }
+/* the page's thread never blocks: while it waits for the lock it runs the calls other cores sent it (browser
+   functions, uew_host.js), one of which may be what the holder is waiting for */
+void rt_lock_report(void);
+static uint64_t lock_wait_ns[MAX_CARRIERS];   /* time each carrier spent waiting for the lock, for the hitch report */
+void rt_lock(void)
+{
+    if (lock_depth++) return;
+    if (!pthread_mutex_trylock(&big_lock)) {
+        if (emscripten_is_main_runtime_thread()) emscripten_main_thread_process_queued_calls();
+        return;
+    }
+    uint64_t t0 = host_ticks_ns();
+    if (emscripten_is_main_runtime_thread())
+        while (pthread_mutex_trylock(&big_lock)) emscripten_main_thread_process_queued_calls();
+    else pthread_mutex_lock(&big_lock);
+    if (K) lock_wait_ns[K->id] += host_ticks_ns() - t0;
+}
 void rt_unlock(void) { if (--lock_depth == 0) pthread_mutex_unlock(&big_lock); }
+int rt_unlock_all(void)
+{
+    int d = lock_depth;
+    if (d) { lock_depth = 0; pthread_mutex_unlock(&big_lock); }
+    return d;
+}
+void rt_relock(int d) { if (d) { rt_lock(); lock_depth = d; } }
+void sched_notify(void)
+{
+    if (!__atomic_load_n(&idle_n, __ATOMIC_RELAXED)) return;
+    __atomic_fetch_add(&uew_wake_word, 1, __ATOMIC_SEQ_CST);
+    emscripten_futex_wake((void*)&uew_wake_word, 0x7FFFFFFF);
+    pthread_cond_broadcast(&big_cv);
+}
+
 
 /* waits up to ns with the lock fully released (another carrier, or a signal from outside, may make work) */
 static void lock_wait(uint64_t ns)
@@ -102,12 +141,68 @@ void uew_threads(void)
     rt_unlock();
 }
 unsigned sched_current_id(void) { return (unsigned)K->current->tid; }
-int sched_is_main(void) { return K->current == &carriers[0].base; }
+int sched_is_main(void) { return K->current == main_thread; }
 GThread* sched_current(void) { return K->current; }
 CPU* sched_current_cpu(void) { return K->current->cpu; }
 GThread* sched_by_tid(uint32_t tid) { for (GThread* t = all_threads; t; t = t->all_next) if ((uint32_t)t->tid == tid) return t; return NULL; }
 
 static int frame_check(GThread* t);
+/* the guest main thread on a core of its own; the page's thread then only serves the browser and the threads placed
+   on it */
+static int (*main_fn)(void*);
+static void* main_arg;
+static volatile int main_done, main_ret;
+static void main_entry(void* arg)
+{
+    GThread* t = arg;
+    rt_unlock();
+    int r = main_fn(main_arg);
+    rt_lock();
+    main_ret = r;
+    main_done = 1;
+    t->done = 1;
+    K->nthreads--;
+    total_threads--;
+    K->ndead++;
+    sched_notify();
+    wake_carriers();
+    for (;;) switch_to(&K->base);
+}
+int sched_run_main(int (*fn)(void*), void* arg)
+{
+    if (ncarriers < 2) { rt_unlock_all(); return fn(arg); }
+    Carrier* k0 = &carriers[0];
+    GThread* t = calloc(1, sizeof *t);
+    t->tid = k0->base.tid;
+    t->cpu = k0->base.cpu;
+    t->started = 1;
+    snprintf(t->name, sizeof t->name, "main");
+    /* carrier 0's own context becomes a scheduler-only one with a CPU of its own */
+    k0->base.cpu = calloc(1, sizeof(CPU));
+    k0->base.tid = 0x1000;
+    main_fn = fn;
+    main_arg = arg;
+    t->carrier = 1;
+    t->lockd = 1;
+    t->ctx = host_ctx_new(main_entry, t, 8u << 20);
+    Carrier* k = &carriers[1];
+    t->next = k->threads;
+    k->threads = t;
+    k->nthreads++;
+    t->all_next = all_threads;
+    all_threads = t;
+    main_thread = t;
+    base_is_guest = 0;
+    wake_carriers();
+    while (!main_done) {
+        GThread* n = pick();
+        if (n) switch_to(n);
+        else sched_idle(~0ull);
+    }
+    rt_unlock_all();
+    return main_ret;
+}
+
 static void* carrier_main(void* arg);
 
 void sched_init(CPU* cpu)
@@ -124,11 +219,14 @@ void sched_init(CPU* cpu)
     k0->nthreads = 1;
     k0->prio_next = ~0ull;
     all_threads = &k0->base;
+    main_thread = &k0->base;
     report_last = host_ticks_ns();
-    /* one carrier per core, the browser's main thread included */
-    int want = emscripten_num_logical_cores();
+    /* four carriers (the browser's thread included) measured fastest: more cores mostly add contention for the global
+       lock. ?carriers=N in the page address overrides */
+    int want = emscripten_num_logical_cores() < 4 ? emscripten_num_logical_cores() : 4;
     const char* env = getenv("UEW_CARRIERS");
     if (env && atoi(env) > 0) want = atoi(env);
+    if (host_query_int("carriers") > 0) want = host_query_int("carriers");
     if (want > MAX_CARRIERS) want = MAX_CARRIERS;
     if (want < 1) want = 1;
     rt_lock();
@@ -172,6 +270,7 @@ static void* carrier_main(void* arg)
     k->base.ctx = host_ctx_main();
     k->base.carrier = k->id;
     k->current = &k->base;
+    k->run_since = k->slice_start = host_ticks_ns();
     for (;;) {
         GThread* t = pick();
         if (t) switch_to(t);
@@ -179,6 +278,29 @@ static void* carrier_main(void* arg)
     }
     return NULL;
 }
+
+/* UE creates its threads suspended, with the FRunnableThread as the parameter and its name (an FString: pointer,
+   length with the terminator) already stored in it */
+static void ue_name(GThread* t, uint64_t obj)
+{
+    if (obj < 0x10000 || obj + 0x200 > MEM_SIZE) return;
+    for (uint64_t off = 8; off < 0x200; off += 8) {
+        uint64_t p = LD64(obj + off);
+        uint32_t n = (uint32_t)LD32(obj + off + 8);
+        if (p < 0x10000 || p + 128 > MEM_SIZE || n < 4 || n > 40) continue;
+        uint32_t i = 0;
+        for (; i < n - 1; i++) { uint16_t ch = (uint16_t)LD16(p + 2ull * i); if (ch < 0x20 || ch > 0x7E) break; }
+        if (i != n - 1 || LD16(p + 2ull * i)) continue;
+        for (i = 0; i < n - 1 && i < sizeof t->name - 1; i++) t->name[i] = (char)LD16(p + 2ull * i);
+        t->name[i] = 0;
+        return;
+    }
+}
+static int on_page(const char* n)
+{
+    return strstr(n, "RenderThread") || strstr(n, "RHIThread") || strstr(n, "RHISubmission") || strstr(n, "Audio");
+}
+void sched_named(GThread* t) { (void)t; }
 
 GThread* sched_create(uint64_t start, uint64_t param, int suspended)
 {
@@ -197,9 +319,12 @@ GThread* sched_create(uint64_t start, uint64_t param, int suspended)
     t->stack = stack;
     t->cpu->gsbase = rt_make_teb(stack, stack_size, t->tid);
     t->cpu->r[4] = (stack + stack_size - 64) & ~15ull;
-    /* the carrier with the fewest threads; the browser's own thread (carrier 0) keeps only what starts there */
+    /* the carrier with the fewest threads. Threads that talk to the browser all the time (rendering, audio) go on
+       carrier 0, the page's own thread, where those calls are direct; the rest share the other cores */
+    ue_name(t, param);
     int best = ncarriers > 1 ? 1 : 0;
     for (int i = 1; i < ncarriers; i++) if (carriers[i].nthreads < carriers[best].nthreads) best = i;
+    if (on_page(t->name)) best = 0;
     t->carrier = best;
     t->lockd = 1;
     t->ctx = host_ctx_new(thread_entry, t, 4u << 20);
@@ -261,7 +386,7 @@ static GThread* pick(void)
     if (k->nprio)
         for (GThread* t = k->threads; t; t = t->next) if (t->prio && t != cur && runnable(t, now)) return t;
     /* the carrier's base context is only a place to wait (carrier 0's base is the guest main thread, a real one) */
-    int base_runs = k->id == 0;
+    int base_runs = k->id == 0 && base_is_guest;
     if (cur->done || (cur == &k->base && !base_runs)) {
         for (GThread* t = k->threads; t; t = t->next) if (t != cur && (t != &k->base || base_runs) && runnable(t, now)) return t;
         return NULL;
@@ -286,10 +411,12 @@ static void sched_idle(uint64_t deadline)
     }
     if (until > now + 4000000ull) until = now + 4000000ull;
     k->current->cpu_ns += now - k->run_since;
+    __atomic_fetch_add(&idle_n, 1, __ATOMIC_SEQ_CST);
     if (k->id == 0) {
-        /* the browser's thread: let its event loop run (downloads, frames, audio) */
+        /* the browser's thread: let its event loop run (downloads, frames, audio, calls from other cores) */
         unlocked_call(host_idle, until > now ? until - now : 0);
     } else lock_wait(until > now ? until - now : 0);
+    __atomic_fetch_sub(&idle_n, 1, __ATOMIC_SEQ_CST);
     k->run_since = host_ticks_ns();
     k->idle_ns += k->run_since - now;
     idle_by[17] += k->run_since - now;
@@ -331,10 +458,15 @@ void sched_frame_report(void)
             if (n >= (int)sizeof line) break;
             best->cpu_ns = 0;
         }
+        if (n < (int)sizeof line) n += snprintf(line + n, sizeof line - n, " lock waits:");
+        for (int i = 0; i < ncarriers && n < (int)sizeof line; i++)
+            if (lock_wait_ns[i] > 1000000ull) n += snprintf(line + n, sizeof line - n, " c%d %.0f ms", i, lock_wait_ns[i] / 1e6);
         host_log("%s", line);
+        rt_lock_report();
         reports++;
     }
     memset(idle_by, 0, sizeof idle_by);
+    memset(lock_wait_ns, 0, sizeof lock_wait_ns);
     for (GThread* t = all_threads; t; t = t->all_next) t->cpu_ns = 0;
     report_last = now;
 }
@@ -403,7 +535,7 @@ void sched_sleep(CPU* c, uint32_t ms)
 void sched_exit_current(CPU* c, uint32_t code)
 {
     Carrier* k = K;
-    if (k->current == &carriers[0].base) {
+    if (k->current == main_thread) {
         rt_exit((int)code);
         return;
     }

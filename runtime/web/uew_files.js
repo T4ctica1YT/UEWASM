@@ -1,6 +1,7 @@
 // Game files fetched on demand in 1 MB blocks (host_remote.c). data/index.txt lists every file;
 // data/<id> is its first part and data/<id>.<n> the rest.
 (() => {
+  if (typeof ENVIRONMENT_IS_PTHREAD != "undefined" && ENVIRONMENT_IS_PTHREAD) return;   // page-side only; worker threads skip it
   const BLOCK = 1 << 20;
   const F = Module.uewFiles = {
     base: Module.uewDataUrl || "data/", part: 16 << 20, cacheMax: (Module.uewCacheMB || 640) << 20,
@@ -67,7 +68,20 @@
       F.cacheBytes -= v0.byteLength;
     }
   };
-  const url = (id, part) => F.base + (part ? `${id}.${part}` : `${id}`);
+  const name = (id, part) => part ? `${id}.${part}` : `${id}`;
+  const url = (id, part) => F.base + name(id, part);
+  // bytes [from, to) of one part (all of it when from is null): over HTTP, or from the page itself in a single-file build
+  const E = Module.uewEmbed;
+  const fetchPart = async (id, part, from, to) => {
+    if (E) {
+      const b = E.part(name(id, part));
+      if (!b) throw new Error(`missing embedded part ${name(id, part)}`);
+      return { status: from == null ? 200 : 206, buf: new Uint8Array(await (from == null ? b : b.slice(from, to)).arrayBuffer()) };
+    }
+    const r = await fetch(url(id, part), from == null ? {} : { headers: { Range: `bytes=${from}-${to - 1}` } });
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url(id, part)}`);
+    return { status: r.status, buf: new Uint8Array(await r.arrayBuffer()) };
+  };
 
   // where each block of a file sits: raw files are plain slices, deflated ones follow the size list in the index
   const layout = f => {
@@ -103,9 +117,8 @@
         const t0 = performance.now();
         F.inflight = (F.inflight || 0) + 1;
         F.maxInflight = Math.max(F.maxInflight || 0, F.inflight);
-        const r = await fetch(url(f.id, e.part), whole ? {} : { headers: { Range: `bytes=${e.off}-${e.off + e.len - 1}` } });
-        if (!r.ok) throw new Error(`HTTP ${r.status} for ${url(f.id, e.part)}`);
-        let buf = new Uint8Array(await r.arrayBuffer());
+        const r = await fetchPart(f.id, e.part, whole ? null : e.off, e.off + e.len);
+        let buf = r.buf;
         F.fetched += buf.length;
         F.requests = (F.requests || 0) + 1;
         F.inflight--;
@@ -159,9 +172,8 @@
         for (let attempt = 0; ; attempt++) {
           try {
             const t0 = performance.now();
-            const r = await fetch(url(f.id, first.part), { headers: { Range: `bytes=${from}-${to - 1}` } });
-            if (!r.ok) throw new Error(`HTTP ${r.status} for ${url(f.id, first.part)}`);
-            let buf = new Uint8Array(await r.arrayBuffer());
+            const r = await fetchPart(f.id, first.part, from, to);
+            let buf = r.buf;
             // a server without Range support sends the whole part
             if (r.status == 200 && buf.length >= to) buf = buf.slice(from, to);
             if (buf.length != to - from) throw new Error(`HTTP ${r.status}: ${buf.length} bytes for ${url(f.id, first.part)}`);
@@ -242,7 +254,10 @@
     T.key = "uewBoot:" + location.pathname + ":" + F.files.length + ":" + F.files.reduce((a, f) => (a + f.size) % 1e15, 0);
     let saved = "";
     try { saved = localStorage.getItem(T.key) || ""; } catch (e) {}
-    T.plan = saved ? saved.split(",").map(r => r.split(":").map(Number)) : [];
+    // the game image is read whole at startup: fetch it now, alongside the code download and compile
+    const img = !E && F.byPath.get("/image.bin");
+    if (img && !saved) blocks(img.id, 0, Math.floor((img.size - 1) / BLOCK));
+    T.plan = saved && !E ? saved.split(",").map(r => r.split(":").map(Number)) : [];
     pump();
     const t = setInterval(() => { if ((Module.uewPresents | 0) >= 300) { clearInterval(t); save(); } }, 1000);
   };
@@ -314,8 +329,7 @@
   };
 
   // the index (and the boot plan's downloads) start now, alongside the wasm download and compile
-  const index = fetch(F.base + "index.txt")
-    .then(r => r.ok ? r.text() : null)
+  const index = (E ? Promise.resolve(E.index) : fetch(F.base + "index.txt").then(r => r.ok ? r.text() : null))
     .then(t => { if (t) { F.load(t); F.boot(); } else err("[files] no data/index.txt, game files unavailable"); })
     .catch(e => err(`[files] ${e.message}`));
   Module.preRun = [].concat(Module.preRun || []);

@@ -20,8 +20,13 @@ HLE(QueryPerformanceCounter)
 {
     static uint64_t last;
     uint64_t v = host_ticks_ns() / 100;
+#ifdef UEW_THREADS
+    uint64_t l = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    do { if (v <= l) v = l + 1; } while (!__atomic_compare_exchange_n(&last, &l, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+#else
     if (v <= last) v = last + 1;
     last = v;
+#endif
     ST64(A1, v);
     RET(1);
 }
@@ -79,15 +84,21 @@ HLE(FlsSetValue) { hle_TlsSetValue(c); }
 #define CS_REC(cs) ((cs) + (RT_G32 ? 8 : 12))
 #define CS_OWNER(cs) ((cs) + (RT_G32 ? 12 : 16))
 static int cs_free(GThread* t) { uint64_t o = LDP(CS_OWNER(t->block_a)); return !o || o == (uint64_t)t->tid; }
+/* the owner is claimed with a compare-and-swap, so with real threads the uncontended case needs no global lock */
+static int cs_claim(uint64_t cs, uint64_t me)
+{
+    return RT_G32 ? ATCAS32(CS_OWNER(cs), 0, me) == 0 : ATCAS64(CS_OWNER(cs), 0, me) == 0;
+}
 void cs_enter(CPU* c, uint64_t cs)
 {
     uint64_t me = sched_current_id();
     uint64_t owner = LDP(CS_OWNER(cs));
-    if (owner && owner != me) {
+    if (owner != me && !cs_claim(cs, me)) {
+        rt_lock();
         sched_current()->block_a = cs;
-        while (!cs_free(sched_current())) sched_block(c, cs_free, ~0ull);
+        while (!cs_claim(cs, me)) sched_block(c, cs_free, ~0ull);
+        rt_unlock();
     }
-    STP(CS_OWNER(cs), me);
     ST32(CS_REC(cs), LD32(CS_REC(cs)) + 1);
 }
 /* like Windows, any thread may leave (some code hands a section from one thread to another) */
@@ -97,7 +108,8 @@ void cs_leave(uint64_t cs)
     uint32_t r = LD32(CS_REC(cs));
     if (r > 1) { ST32(CS_REC(cs), r - 1); return; }
     ST32(CS_REC(cs), 0);
-    STP(CS_OWNER(cs), 0);
+    if (RT_G32) ATXCHG32(CS_OWNER(cs), 0); else ATXCHG64(CS_OWNER(cs), 0);
+    sched_notify();
 }
 static void cs_init(uint64_t cs) { memset(G2H(cs), 0, RT_G32 ? 24 : 40); ST32(cs + GP, 0xFFFFFFFF); }
 HLE(InitializeCriticalSection) { cs_init(A1); RET(0); }
@@ -108,8 +120,7 @@ HLE(LeaveCriticalSection) { cs_leave(A1); RET(0); }
 HLE(TryEnterCriticalSection)
 {
     uint64_t owner = LDP(CS_OWNER(A1)), me = sched_current_id();
-    if (owner && owner != me) { RET(0); return; }
-    STP(CS_OWNER(A1), me);
+    if (owner != me && !cs_claim(A1, me)) { RET(0); return; }
     ST32(CS_REC(A1), LD32(CS_REC(A1)) + 1);
     RET(1);
 }
@@ -156,6 +167,7 @@ void srw_release(uint64_t l, int shared)
     uint64_t v = LDP(l);
     if (shared) STP(l, v >= 2 ? v - 2 : 0);
     else STP(l, 0);
+    sched_notify();
 }
 HLE(InitializeSRWLock) { STP(A1, 0); RET(0); }
 HLE(AcquireSRWLockExclusive) { srw_acquire(c, A1, 0); RET(0); }

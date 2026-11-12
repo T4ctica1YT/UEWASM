@@ -26,55 +26,12 @@ typedef struct Sock {
    Module.uewNet.open(name, port) -> { send(Uint8Array), close() } which answers through Module.uewNetPush */
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-EM_JS(int, net_claim, (const char* name), {
-    const n = Module.uewNet;
-    if (!n || !n.claim) return 0;
-    const s = UTF8ToString(name >>> 0);
-    if (!n.claim(s)) return 0;
-    n.names = n.names || [""];
-    let i = n.names.indexOf(s);
-    if (i < 0) { i = n.names.length; n.names.push(s); }
-    return i;
-});
-EM_JS(int, net_open, (int route, int port), {
-    const n = Module.uewNet;
-    const c = n && n.open ? n.open(n.names[route], port) : null;
-    if (!c) return 0;
-    n.conns = n.conns || [null];
-    const id = n.conns.length;
-    c.q = []; c.qlen = 0; c.closed = false;
-    c.push = data => { if (data && data.length) { c.q.push(data); c.qlen += data.length; } };
-    c.end = () => { c.closed = true; };
-    n.conns.push(c);
-    return id;
-});
-EM_JS(void, net_send, (int id, const uint8_t* p, int n), {
-    const c = Module.uewNet.conns[id];
-    if (c && c.send) c.send(HEAPU8.slice(p >>> 0, (p >>> 0) + n));
-});
-EM_JS(int, net_avail, (int id), {
-    const c = Module.uewNet && Module.uewNet.conns ? Module.uewNet.conns[id] : null;
-    if (!c) return -1;
-    return c.qlen ? c.qlen : c.closed ? -1 : 0;
-});
-EM_JS(int, net_recv, (int id, uint8_t* p, int cap), {
-    const c = Module.uewNet.conns[id];
-    if (!c) return -1;
-    if (!c.qlen) return c.closed ? -1 : 0;
-    let n = 0;
-    while (n < cap && c.q.length) {
-        const d = c.q[0], k = Math.min(cap - n, d.length);
-        HEAPU8.set(d.subarray(0, k), (p >>> 0) + n);
-        n += k;
-        if (k == d.length) c.q.shift(); else c.q[0] = d.subarray(k);
-    }
-    c.qlen -= n;
-    return n;
-});
-EM_JS(void, net_close, (int id), {
-    const c = Module.uewNet && Module.uewNet.conns ? Module.uewNet.conns[id] : null;
-    if (c) { if (c.close) c.close(); Module.uewNet.conns[id] = null; }
-});
+int net_claim(const char* name);
+int net_open(int route, int port);
+void net_send(int id, const uint8_t* p, int n);
+int net_avail(int id);
+int net_recv(int id, uint8_t* p, int cap);
+void net_close(int id);
 #else
 static int net_claim(const char* name) { (void)name; return 0; }
 static int net_open(int route, int port) { (void)route; (void)port; return 0; }

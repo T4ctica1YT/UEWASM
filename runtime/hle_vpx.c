@@ -44,86 +44,14 @@ static uint64_t orig(const Dec* d, int off) { return ifaces[d ? d->iface : 0].or
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 
-EM_JS(int, uew_vpx_available, (void), {
-    if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") return 0;
-    if (typeof location !== "undefined" && /[?&]swvideo=1/.test(location.search)) return 0;
-    return Module.uewHwVideo === false ? 0 : 1;
-});
-EM_JS(int, uew_vpx_open, (int vp9), {
-    const V = Module.uewVpx || (Module.uewVpx = { n: 0, s: new Map() });
-    const id = ++V.n, s = { vp9, ready: [], err: false, ts: 0 };
-    try {
-        s.dec = new VideoDecoder({
-            output: f => {
-                const rect = f.visibleRect, cs = f.colorSpace || {}, fmt = f.format;
-                if (fmt !== "I420" && fmt !== "NV12") {
-                    if (!V.fmtLogged) { V.fmtLogged = 1; console.log("[video] decoder gives " + fmt + " pictures; using the software decoder"); }
-                    f.close(); s.err = true; return;
-                }
-                let buf;
-                try { buf = new Uint8Array(f.allocationSize({ rect })); } catch (e) { f.close(); s.err = true; return; }
-                const item = { buf, layout: null, fmt, w: rect.width, h: rect.height, matrix: cs.matrix || "", full: !!cs.fullRange };
-                s.ready.push(item);
-                f.copyTo(buf, { rect }).then(layout => { item.layout = layout; f.close(); }, () => { f.close(); s.err = true; });
-            },
-            error: e => { s.err = true; if (!V.errLogged) { V.errLogged = 1; console.log("[video] hardware decoder failed (" + e.message + "); using the software decoder"); } },
-        });
-    } catch (e) { return 0; }
-    V.s.set(id, s);
-    return id;
-});
-EM_JS(int, uew_vpx_decode, (int id, const uint8_t* p, int n, int key), {
-    const s = Module.uewVpx.s.get(id);
-    if (!s || s.err) return -1;
-    try {
-        if (s.dec.state === "unconfigured") {
-            if (!key) return -1;
-            s.dec.configure({ codec: s.vp9 ? "vp09.00.10.08" : "vp8", optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
-        }
-        p >>>= 0;
-        s.dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ++s.ts, data: HEAPU8.slice(p, p + n) }));
-        return 0;
-    } catch (e) { s.err = true; return -1; }
-});
+int uew_vpx_available(void);
+int uew_vpx_open(int vp9);
+int uew_vpx_decode(int id, const uint8_t* p, int n, int key);
 /* 0 nothing yet, 1 a picture is ready to take, 2 the decoder failed */
-EM_JS(int, uew_vpx_poll, (int id), {
-    const s = Module.uewVpx.s.get(id);
-    if (!s || s.err) return 2;
-    return s.ready.length && s.ready[0].layout ? 1 : 0;
-});
-EM_JS(int, uew_vpx_info, (int id, int* out), {
-    const s = Module.uewVpx.s.get(id), f = s && s.ready[0];
-    if (!f) return 0;
-    out >>>= 2;
-    HEAP32[out] = f.w; HEAP32[out + 1] = f.h;
-    HEAP32[out + 2] = f.matrix === "bt709" ? 2 : f.matrix === "bt470bg" ? 1 : f.matrix === "smpte170m" ? 3 : f.matrix === "smpte240m" ? 4 : f.matrix.startsWith("bt2020") ? 5 : f.matrix === "rgb" ? 7 : 0;
-    HEAP32[out + 3] = f.full ? 1 : 0;
-    return 1;
-});
-EM_JS(void, uew_vpx_take, (int id, uint8_t* y, int ys, uint8_t* u, int us, uint8_t* v, int vs), {
-    const s = Module.uewVpx.s.get(id), f = s && s.ready.shift();
-    if (!f) return;
-    const L = f.layout, b = f.buf, w = f.w, h = f.h, cw = (w + 1) >> 1, ch = (h + 1) >> 1, H = HEAPU8;
-    y >>>= 0; u >>>= 0; v >>>= 0;
-    for (let r = 0; r < h; r++) H.set(b.subarray(L[0].offset + r * L[0].stride, L[0].offset + r * L[0].stride + w), y + r * ys);
-    if (f.fmt === "I420") {
-        for (let r = 0; r < ch; r++) {
-            H.set(b.subarray(L[1].offset + r * L[1].stride, L[1].offset + r * L[1].stride + cw), u + r * us);
-            H.set(b.subarray(L[2].offset + r * L[2].stride, L[2].offset + r * L[2].stride + cw), v + r * vs);
-        }
-    } else {
-        for (let r = 0; r < ch; r++) {
-            let o = L[1].offset + r * L[1].stride, du = u + r * us, dv = v + r * vs;
-            for (let x = 0; x < cw; x++, o += 2) { H[du + x] = b[o]; H[dv + x] = b[o + 1]; }
-        }
-    }
-});
-EM_JS(void, uew_vpx_close, (int id), {
-    const V = Module.uewVpx, s = V && V.s.get(id);
-    if (!s) return;
-    try { if (s.dec.state !== "closed") s.dec.close(); } catch (e) {}
-    V.s.delete(id);
-});
+int uew_vpx_poll(int id);
+int uew_vpx_info(int id, int* out);
+void uew_vpx_take(int id, uint8_t* y, int ys, uint8_t* u, int us, uint8_t* v, int vs);
+void uew_vpx_close(int id);
 #else
 static int uew_vpx_available(void) { return 0; }
 static int uew_vpx_open(int vp9) { (void)vp9; return 0; }

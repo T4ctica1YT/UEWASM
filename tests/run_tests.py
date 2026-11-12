@@ -42,6 +42,7 @@ def main():
     ap.add_argument("names", nargs="*")
     ap.add_argument("--no-wasm", action="store_true")
     ap.add_argument("--x86", action="store_true", help="build the tests as 32-bit programs")
+    ap.add_argument("--threads", choices=["coop", "real"], default="coop", help="web build threading (real: guest threads on several cores)")
     a = ap.parse_args()
     env = build.msvc_env("x86" if a.x86 else "x64")
     srcs = sorted(p for p in HERE.iterdir() if p.suffix in FLAGS and (not a.names or p.stem in a.names))
@@ -61,7 +62,7 @@ def main():
         args = ["--image", str(out / "image.bin"), "--root", str(exe.parent), "--exe", exe.name, "--save", str(save)]
         got = {"native": run([str(native), *args])}
         if not a.no_wasm:
-            build.build_wasm(out, log=lambda *_: None, node_fs=True)
+            build.build_wasm(out, log=lambda *_: None, node_fs=True, threads=a.threads)
             node = build.emsdk_env()[2]
             got["wasm"] = run([node, *build.jspi_flag(node), "game.js", *args], cwd=out / "web")
         ok = True

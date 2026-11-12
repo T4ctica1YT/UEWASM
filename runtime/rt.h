@@ -134,6 +134,50 @@ void rt_atomic_end(uint64_t a);
 #define ATOMIC_END(a) ((void)0)
 #endif
 
+/* locked xchg / cmpxchg / xadd / or / and / xor on 1-8 bytes, returning the old value. Real threads use the hardware's
+   atomics when the address is aligned (wasm traps on unaligned ones) and the address-stripe lock otherwise */
+#ifdef UEW_THREADS
+#define AT_OP(N, T, name, body_atomic, body_plain) \
+static inline uint64_t at_##name##N(uint8_t* m, uint64_t a, uint64_t x, uint64_t y) { \
+    T* p = (T*)(m + (uint32_t)a); (void)y; \
+    if (!((uint32_t)a & (sizeof(T) - 1))) return (uint64_t)(body_atomic); \
+    rt_atomic_begin(a); T o; memcpy(&o, p, sizeof o); { T n_ = (body_plain); memcpy(p, &n_, sizeof n_); } rt_atomic_end(a); return o; }
+#else
+#define AT_OP(N, T, name, body_atomic, body_plain) \
+static inline uint64_t at_##name##N(uint8_t* m, uint64_t a, uint64_t x, uint64_t y) { \
+    T* p = (T*)(m + (uint32_t)a); (void)y; T o; memcpy(&o, p, sizeof o); { T n_ = (body_plain); memcpy(p, &n_, sizeof n_); } return o; }
+#endif
+#define AT_ALL(N, T) \
+    AT_OP(N, T, xchg, __atomic_exchange_n(p, (T)x, __ATOMIC_SEQ_CST), (T)x) \
+    AT_OP(N, T, add, __atomic_fetch_add(p, (T)x, __ATOMIC_SEQ_CST), (T)(o + (T)x)) \
+    AT_OP(N, T, or, __atomic_fetch_or(p, (T)x, __ATOMIC_SEQ_CST), (T)(o | (T)x)) \
+    AT_OP(N, T, and, __atomic_fetch_and(p, (T)x, __ATOMIC_SEQ_CST), (T)(o & (T)x)) \
+    AT_OP(N, T, xor, __atomic_fetch_xor(p, (T)x, __ATOMIC_SEQ_CST), (T)(o ^ (T)x)) \
+    AT_OP(N, T, cas, ({ T e_ = (T)x; __atomic_compare_exchange_n(p, &e_, (T)y, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); e_; }), (o == (T)x ? (T)y : o))
+AT_ALL(8, uint8_t)
+AT_ALL(16, uint16_t)
+AT_ALL(32, uint32_t)
+AT_ALL(64, uint64_t)
+#define ATXCHG8(a, v) at_xchg8(MEMB, (a), (v), 0)
+#define ATXCHG16(a, v) at_xchg16(MEMB, (a), (v), 0)
+#define ATXCHG32(a, v) at_xchg32(MEMB, (a), (v), 0)
+#define ATXCHG64(a, v) at_xchg64(MEMB, (a), (v), 0)
+#define ATADD8(a, v) at_add8(MEMB, (a), (v), 0)
+#define ATADD16(a, v) at_add16(MEMB, (a), (v), 0)
+#define ATADD32(a, v) at_add32(MEMB, (a), (v), 0)
+#define ATADD64(a, v) at_add64(MEMB, (a), (v), 0)
+#define ATOR8(a, v) at_or8(MEMB, (a), (v), 0)
+#define ATAND8(a, v) at_and8(MEMB, (a), (v), 0)
+#define ATXOR8(a, v) at_xor8(MEMB, (a), (v), 0)
+#define ATCAS8(a, e, n) at_cas8(MEMB, (a), (e), (n))
+#define ATCAS16(a, e, n) at_cas16(MEMB, (a), (e), (n))
+#define ATCAS32(a, e, n) at_cas32(MEMB, (a), (e), (n))
+#define ATCAS64(a, e, n) at_cas64(MEMB, (a), (e), (n))
+#define ATCASOK8(a, e, n) (at_cas8(MEMB, (a), (e), (n)) == (uint8_t)(e))
+#define ATCASOK16(a, e, n) (at_cas16(MEMB, (a), (e), (n)) == (uint16_t)(e))
+#define ATCASOK32(a, e, n) (at_cas32(MEMB, (a), (e), (n)) == (uint32_t)(e))
+#define ATCASOK64(a, e, n) (at_cas64(MEMB, (a), (e), (n)) == (uint64_t)(e))
+
 #define XLANE8(x, i) ((uint64_t)(x).b[i])
 #define XLANE16(x, i) ((uint64_t)(x).w[i])
 #define XLANE32(x, i) ((uint64_t)(x).d[i])
