@@ -71,14 +71,14 @@ This project is in its early stages, meaning **not all games work**.
 
 Here are the games used for Testing and some screenshots of the tool working
 
-| Game | Status | FPS | UE Version |
-|---|---|---|---|
-| Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 |
+| Game | Status | FPS In Game | UE Version | UEWASM Version |
+|---|---|---|---|---|
+| Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 | PR 0.1.1 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 |
-| Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? |
-| Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 |
-| Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 |
-|Dead as Disco| ➖ Gets in game (intro scenes) | 30-60 FPS| UE 5.7.4 |
+| Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? | PR 0.1.0 |
+| Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 | PR 0.1.2 |
+| Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 | PR 0.1.2 |
+| Dead as Disco | ➖ Gets in game (Tutorial, Crashes mid way through) | 30-50 FPS | UE 5.7.4 | PR 0.1.3 (Unreleased) |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
