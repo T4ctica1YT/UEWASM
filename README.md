@@ -71,7 +71,7 @@ This project is in its early stages, meaning **not all games work**.
 
 Here are the games used for Testing and some screenshots of the tool working
 
-| Game | Status | FPS In Game | UE Version | UEWASM Version |
+| Game | Status | FPS In Game | UE Version | UEWASM Version Used |
 |---|---|---|---|---|
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 | PR 0.1.1 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 | PR 0.1.0 |
