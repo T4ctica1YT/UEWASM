@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import pe as pemod
 from . import resources
-from .lift import Func, Program
+from .lift import SETJMP, Func, Program
 from .link import THUNK_BASE, Linker
 
 RUNTIME = Path(__file__).resolve().parents[2] / "runtime"
@@ -180,8 +180,16 @@ def _lift_chunk(args):
                             'jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);', 1)
     if "rt_xfl" in text:
         text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + XFL_DECL, 1)
+    # declare only the functions this file calls: funcs.h names every function in the game (tens of MB on big
+    # titles), and parsing it was over a third of each file's compile time
+
+    called = sorted(set(_FREF.findall(text)))
+    text = text.replace('#include "funcs.h"', "".join(f"void F_{n}(CPU* __restrict);\n" for n in called).rstrip("\n"), 1)
     write_if_changed(out_path, text)
     return dict(prog.unsupported), {k: [hex(a) for a in v] for k, v in prog.unsupported_at.items()}, bad
+
+
+_FREF = re.compile(r"\bF_([0-9a-f]+)\b")
 
 
 def _lifted(ex, tasks, progress):
@@ -198,16 +206,7 @@ def nop_progress(stage, done, total):
     pass
 
 
-def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, search=(), extra=(), system_dlls=True, progress=nop_progress):
-    """progress(stage, done, total) is called as work completes; total 0 means the stage has no measurable size"""
-    out = Path(out)
-    gen = out / "gen"
-    gen.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    hle = implemented_hle()
-    link = Linker(exe, search=search, hle_names=hle, recompile_system=system_dlls, extra=extra)
-    images = link.images()
-
+def _lift_python(link, gen, comments, jobs, log, progress, t0):
     progs = []
     all_roots = set()
     sizes = [m.pe.image_size for m in link.order]
@@ -220,12 +219,6 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
         log(f"  {m.name}: {len(prog.blocks)} functions at 0x{m.base:x}")
     roots = sorted(all_roots)
     log(f"{len(link.order)} modules, {len(roots)} functions ({time.time() - t0:.1f}s)")
-
-    span = bytearray(link.end - link.order[0].base)
-    lo = link.order[0].base
-    for m, img in images:
-        span[m.base - lo:m.base - lo + len(img)] = img
-    (out / "image.bin").write_bytes(bytes(span))
     write_if_changed(gen / "funcs.h", '#pragma once\n#include "rt.h"\n' + "".join(f"void F_{r:x}(CPU* __restrict);\n" for r in roots))
 
     tasks = []
@@ -254,7 +247,92 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
             for k, v in at.items():
                 where.setdefault(k, v)
             bad += b
-    log(f"lifted into {len(tasks)} C files ({time.time() - t0:.1f}s), {bad} instructions unsupported")
+    return roots, len(tasks), unsupported, where, bad
+
+
+RUST_DIR = Path(__file__).resolve().parents[2] / "rustlift"
+
+
+def rust_lifter(log=print):
+    """the Rust lifter's executable, built with cargo the first time it is wanted; None without a Rust toolchain"""
+    exe = RUST_DIR / "target" / "release" / ("uewlift.exe" if os.name == "nt" else "uewlift")
+    srcs = list((RUST_DIR / "src").glob("*.rs")) + [RUST_DIR / "Cargo.toml"]
+    if exe.exists() and exe.stat().st_mtime >= max(p.stat().st_mtime for p in srcs):
+        return exe
+    cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo"))
+    if not Path(cargo).exists():
+        return None
+    log("building the Rust lifter (first use)")
+    r = resources.run([cargo, "build", "--release", "--manifest-path", str(RUST_DIR / "Cargo.toml")], capture_output=True, text=True)
+    if r.returncode or not exe.exists():
+        raise RuntimeError("could not build the Rust lifter:\n" + r.stderr[-2000:])
+    return exe
+
+
+def _lift_rust(link, out, gen, lo, log, progress, t0):
+    """discovery and lifting in uewlift (rustlift/): the same C as the Python lifter, far faster"""
+    exe = rust_lifter(log)
+    if exe is None:
+        raise RuntimeError("the Rust lifter needs a Rust toolchain (https://rustup.rs); or use the Python lifter")
+    mods = []
+    for m in link.order:
+        pe = m.pe
+        exports = [v for v in list(pe.exports.values()) + list(pe.exports_ord.values()) if isinstance(v, int)]
+        sj = [m.base + i.iat_rva for i in pe.imports if i.name in SETJMP] if pe.bits == 64 else []
+        mods.append({"base": m.base, "bits": pe.bits, "image_size": pe.image_size, "entry_rva": pe.entry_rva,
+                     "sections": [[s.rva, s.vsize, s.executable] for s in pe.sections], "functions": [list(f) for f in pe.functions],
+                     "unwind": list(pe.unwind), "family": [[b, r] for b, r in pe.family.items()], "exports": exports,
+                     "tls_callbacks": list(pe.tls_callbacks), "relocs": list(pe.relocs), "sj_slots": sj})
+    job = out / "lift_job.json"
+    job.write_text(json.dumps({"image": str(out / "image.bin"), "lo": lo, "gen": str(gen), "runtime": str(RUNTIME), "chunk": CHUNK,
+                               "modules": mods}), encoding="utf-8")
+    progress("analyze", 0, 0)
+    r = resources.run([str(exe), str(job)], capture_output=True, text=True)
+    job.unlink()
+    if r.returncode:
+        raise RuntimeError("the Rust lifter failed:\n" + (r.stderr or r.stdout)[-3000:])
+    res = json.loads(r.stdout)
+    all_roots = set()
+    for m, mr in zip(link.order, res["modules"]):
+        all_roots.update(mr["roots"])
+        log(f"  {m.name}: {len(mr['roots'])} functions at 0x{m.base:x}")
+    roots = sorted(all_roots)
+    log(f"{len(link.order)} modules, {len(roots)} functions ({time.time() - t0:.1f}s; Rust lifter: discovery {res['seconds'][0]:.1f}s, "
+        f"lifting {res['seconds'][1]:.1f}s)")
+    write_if_changed(gen / "funcs.h", '#pragma once\n#include "rt.h"\n' + "".join(f"void F_{r:x}(CPU* __restrict);\n" for r in roots))
+    unsupported, where, bad = Counter(), {}, 0
+    for ch in res["chunks"]:
+        unsupported.update(ch["u"])
+        for k, v in ch["at"].items():
+            where.setdefault(k, v)
+        bad += ch["bad"]
+    progress("lift", 1, 1)
+    return roots, res["files"], unsupported, where, bad
+
+
+def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, search=(), extra=(), system_dlls=True, progress=nop_progress,
+              lifter="python"):
+    """progress(stage, done, total) is called as work completes; total 0 means the stage has no measurable size.
+    lifter: "python" (default) or "rust" (rustlift/, built with cargo on first use; far faster on big games)"""
+    out = Path(out)
+    gen = out / "gen"
+    gen.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    hle = implemented_hle()
+    link = Linker(exe, search=search, hle_names=hle, recompile_system=system_dlls, extra=extra)
+    images = link.images()
+
+    lo = link.order[0].base
+    span = bytearray(link.end - lo)
+    for m, img in images:
+        span[m.base - lo:m.base - lo + len(img)] = img
+    (out / "image.bin").write_bytes(bytes(span))
+    del span
+    if lifter == "rust" and not comments:
+        roots, ntasks, unsupported, where, bad = _lift_rust(link, out, gen, lo, log, progress, t0)
+    else:
+        roots, ntasks, unsupported, where, bad = _lift_python(link, gen, comments, jobs, log, progress, t0)
+    log(f"lifted into {ntasks} C files ({time.time() - t0:.1f}s), {bad} instructions unsupported")
 
     lines = ['#include "host.h"', '#include "funcs.h"', ""]
     lines.append(f"const uint64_t IMAGE_LO = 0x{lo:x}ull, IMAGE_HI = 0x{link.end:x}ull, GUEST_MEM_MB = {mem_mb}ull;")
@@ -290,7 +368,7 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
     lines.append("    {0, NULL}};")
     lines.append(f"const size_t rt_fn_count = {len(roots)};")
     write_if_changed(gen / "meta.c", "\n".join(lines) + "\n")
-    keep = {Path(t[5]).name for t in tasks} | {"meta.c", "funcs.h"}
+    keep = {f"funcs_{i:04d}.c" for i in range(ntasks)} | {"meta.c", "funcs.h"}
     for f in gen.iterdir():
         if f.name not in keep:
             f.unlink()
@@ -397,6 +475,7 @@ SHELL = """<!doctype html>
     canvas: document.getElementById("canvas"),
     arguments: __ARGS__.concat(new URLSearchParams(location.search).getAll("arg")),
     uewSave: __SAVE__,
+    uewSeed: __SEED__,
     uewAsyncShaders: __ASYNC__,
     uewDebugPanel: __DEBUG__,
     uewNetPlaceholders: __PLACEHOLDERS__,
@@ -464,6 +543,23 @@ def default_args(exe):
     return ["-dx11"] if b"D3D11RHI" in data and b"D3D12RHI" in data else []
 
 
+QUALITY = {"low": 0, "medium": 1, "high": 2, "epic": 3}
+SCALABILITY = ("ShadowQuality", "PostProcessQuality", "EffectsQuality", "FoliageQuality", "ViewDistanceQuality", "AntiAliasingQuality",
+               "ReflectionQuality", "GlobalIlluminationQuality", "ShadingQuality", "LandscapeQuality")
+
+
+def quality_files(exe_rel, quality):
+    """Unreal scalability groups for the page to put in the game's own settings file (GameUserSettings.ini, where the
+    game's options menu keeps them); textures are left alone. UE5 reads Saved/Config/Windows, UE4 .../WindowsNoEditor"""
+    parts = Path(exe_rel).parts
+    if quality not in QUALITY or "Binaries" not in parts or parts.index("Binaries") < 1:
+        return {}
+    project = parts[parts.index("Binaries") - 1]
+    text = "[ScalabilityGroups]\n" + "".join(f"sg.{g}={QUALITY[quality]}\n" for g in SCALABILITY)
+    base = f"Users/Player/AppData/Local/{project}/Saved/Config"
+    return {f"{base}/{p}/GameUserSettings.ini": text for p in ("Windows", "WindowsNoEditor")}
+
+
 def memory_split(limit_gb, guest_mb):
     """how a running game's memory limit is shared: the wasm heap (guest memory plus ~700 MB of runtime), the file
     download cache, and the rest for the GPU (reported to the game as video memory)"""
@@ -506,7 +602,7 @@ COI_LOAD = """<script>
 
 
 def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
-                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop"):
+                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop", seed=None):
     """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts"""
     import json
     wasm = web / "game.wasm"
@@ -523,7 +619,7 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
     from .icon import write_favicon
     icon = write_favicon(web, exe) or "data:,"
     html = (SHELL.replace("__ICON__", icon).replace("__TITLE__", title).replace("__W__", str(size[0])).replace("__H__", str(size[1]))
-            .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save))
+            .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save)).replace("__SEED__", json.dumps(seed or {}))
             .replace("__FPS__", "true" if show_fps else "false")
             .replace("__ASYNC__", "true" if async_shaders else "false")
             .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false")
@@ -631,6 +727,7 @@ def run_jobs(jobs, what, progress=nop_progress):
     running, used = [], 0
     total = sum(j[3] for j in jobs) or 1
     done = 0
+    started, times = {}, []
     progress(what, 0, total)
     try:
         while pending or running:
@@ -638,6 +735,7 @@ def run_jobs(jobs, what, progress=nop_progress):
                 name, cmd, env, mb = pending.pop(0)
                 log_f = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
                 running.append((subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT, **resources.proc_flags()), name, mb, log_f))
+                started[name] = time.time()
                 used += mb
             time.sleep(0.05)
             for job in running[:]:
@@ -645,6 +743,7 @@ def run_jobs(jobs, what, progress=nop_progress):
                 if p.poll() is None:
                     continue
                 running.remove(job)
+                times.append((time.time() - started[name], name))
                 used -= mb
                 done += mb
                 progress(what, done, total)
@@ -655,6 +754,9 @@ def run_jobs(jobs, what, progress=nop_progress):
     finally:
         for p, *_ in running:
             p.kill()
+        # developer hook: UEW_TIMES=<file> records how long each job took (slowest first)
+        if os.environ.get("UEW_TIMES") and times:
+            Path(os.environ["UEW_TIMES"]).write_text("".join(f"{t:8.1f} {n}\n" for t, n in sorted(times, reverse=True)), encoding="utf-8")
 
 
 # emscripten ports the runtime links (native stand-ins for game DLLs); fetched into the emsdk cache on first use
@@ -663,7 +765,7 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
-               wasm_opt=False, game_args=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
+               wasm_opt=False, game_args=None, quality=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
                placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web"):
     """aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
     older-format ones are packaged decrypted, so they compress.
@@ -682,7 +784,9 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     out = Path(out)
     mt = threads == "real"
     # real threads compile every file differently (shared memory, atomics), so their objects are kept apart
-    obj = out / ("wobj_mt" if mt else "wobj")
+    # developer hook: UEW_LTO=thin builds with ThinLTO (small lifted functions inlined across files) into its own objects
+    lto = os.environ.get("UEW_LTO") == "thin"
+    obj = out / (("wobj_mt" if mt else "wobj") + ("_lto" if lto else ""))
     obj.mkdir(exist_ok=True)
     env, emcc, _ = emsdk_env()
     # simd: wasm SIMD (every current browser) lets clang turn the emulated SSE lanes into real vector ops
@@ -693,6 +797,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         cflags.append("-DUEW_WEBGPU")
     if mt:
         cflags += ["-pthread", "-DUEW_THREADS"]
+    if lto:
+        cflags.append("-flto=thin")
     # generated code only depends on rt.h/sse.h and the opt level; the runtime is always rebuilt (it is small)
     stamp = obj / "flags.txt"
     key = " ".join(cflags)
@@ -739,7 +845,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     web.mkdir(exist_ok=True)
     orsp = out / "emlink.rsp"
     orsp.write_text("\n".join(f'"{p.as_posix()}"' for p in obj.glob("*.o")), encoding="utf-8")
-    link = [emcc, opt if wasm_opt else "-O1", "-mtail-call", *(["-msimd128"] if simd else []), f"@{orsp}", "-o", str(web / "game.js"),
+    link = [emcc, opt if wasm_opt else "-O1", *(["-flto=thin", "-Wl,--lto-O2", f"-Wl,--thinlto-jobs={resources.plan()['compile_jobs']}"] if lto else []), "-mtail-call", *(["-msimd128"] if simd else []), f"@{orsp}", "-o", str(web / "game.js"),
             "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=64MB", "-sMAXIMUM_MEMORY=4GB", "-sSTACK_SIZE=16MB", "-sENVIRONMENT=web,node",
             "-sEXIT_RUNTIME=1", "-sMODULARIZE=0", "-sINVOKE_RUN=1", *PORTS,
             "-sMIN_WEBGL_VERSION=2", "-sMAX_WEBGL_VERSION=2", "-sSUPPORT_LONGJMP=wasm", "-sJSPI", "-sJSPI_EXPORTS=['uew_ctx_start']", "-sEXPORTED_FUNCTIONS=" + ",".join(exports)]
@@ -798,7 +904,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         log(f"memory limit {mem_limit_gb} GB: {guest} MB game memory, {cache_mb} MB download cache, {gpu_mb} MB video memory")
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
                     exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb,
-                    threads=threads)
+                    threads=threads, seed=quality_files(exe_rel, quality))
         if single_file:
             name = re.sub(r'[<>:"/\\|?*]', "", title or Path(exe_rel).stem).strip() or "game"
             write_single_file(web, out / "single" / f"{name}.html", log=log)

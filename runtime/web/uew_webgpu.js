@@ -653,6 +653,33 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] bind group " + e.message); return 0; }
   },
 
+  // the same from a packed entry list (7 ints each: binding, kind, id, offset, size, dim, return type), no JSON
+  uewg_bindgroup_bin: function (layoutId, group, ptr, n) {
+    const g = Module.uewg;
+    g.stat.bg++;
+    const layout = layoutId < 0 ? g.emptyLayout : g.o[layoutId].bgls[group];
+    const dims = { 2: "1d", 5: "3d", 6: "cube", 7: "2d-array", 8: "2d-array", 9: "2d-array", 10: "cube-array" };
+    const rets = ["float", "sint", "uint", "depth"];
+    const dummies = [null, null, null, "buf", "sbuf", "stex"];
+    const entries = [];
+    for (let i = 0, p = ptr >>> 2; i < n; i++, p += 7) {
+      const b = HEAP32[p], kind = HEAP32[p + 1], id = HEAP32[p + 2];
+      if (kind == 0) entries.push({ binding: b, resource: g.o[id] });
+      else if (kind == 1) entries.push({ binding: b, resource: { buffer: g.o[id], offset: HEAPU32[p + 3], size: HEAPU32[p + 4] } });
+      else {
+        const x = g.dummy(kind == 2 ? `${dims[HEAP32[p + 5]] || "2d"}:${rets[HEAP32[p + 6]] || "float"}` : dummies[kind]);
+        entries.push({ binding: b, resource: x instanceof GPUBuffer ? { buffer: x } : x });
+      }
+    }
+    try {
+      const bg = g.device.createBindGroup({ layout, entries });
+      if (g.capFrame) bg.__r = entries.map((e, i) => e.resource && e.resource.__tex ? e.resource.__tex.__id : e.resource && e.resource.buffer
+        ? (HEAP32[(ptr >>> 2) + 7 * i + 1] == 1 ? `b${HEAP32[(ptr >>> 2) + 7 * i + 2]}@${e.resource.offset}+${e.resource.size}` : "b") : e.resource instanceof GPUSampler ? "s" : "?");
+      return g.add(bg);
+    }
+    catch (e) { if (g.errors++ < 40) console.log("[webgpu] bind group " + e.message); return 0; }
+  },
+
   // like release, but the id is never handed out again (cached bind groups may still name it)
   uewg_retire: function (id) {
     const g = Module.uewg, x = g.o[id];

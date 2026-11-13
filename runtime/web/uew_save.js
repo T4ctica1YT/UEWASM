@@ -24,6 +24,17 @@
         FS.mkdirTree(p.slice(0, p.lastIndexOf("/")));
         FS.writeFile(p, a);
       }
+      // settings the build asks for (Unreal quality, say): a marked block put back at the end of the file on each start.
+      // A repeated key's last value wins, so it outranks what the game saved there itself
+      for (const [rel, text] of Object.entries(Module.uewSeed || {})) {
+        const p = dir + "/" + rel, b = "; UEWASM begin\n", e = "; UEWASM end\n";
+        let old = "";
+        try { old = FS.readFile(p, { encoding: "utf8" }).replace(/\r\n/g, "\n"); } catch (_) {}
+        const i = old.indexOf(b), j = old.indexOf(e);
+        if (i >= 0 && j > i) old = old.slice(0, i) + old.slice(j + e.length);
+        FS.mkdirTree(p.slice(0, p.lastIndexOf("/")));
+        FS.writeFile(p, old + (old && !old.endsWith("\n") ? "\n" : "") + b + text + e);
+      }
       removeRunDependency("uew-save");
       setInterval(flush, 5000);
       addEventListener("pagehide", flush);

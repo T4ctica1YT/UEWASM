@@ -25,6 +25,7 @@ int uewg_layout_create(const char* json);
 int uewg_render_pipeline_create(const char* json);
 int uewg_compute_pipeline_create(int layout, int cs);
 int uewg_bindgroup_create(int layout, int group, const char* json);
+int uewg_bindgroup_bin(int layout, int group, const void* ents, int n);
 void uewg_release(int id);
 void uewg_retire(int id);
 void uewg_begin_pass(const char* json);
@@ -207,6 +208,7 @@ typedef struct WTex {
     /* last copy of this constant buffer in the ring: reused while the contents and frame are the same */
     uint32_t cb_serial, cb_version, cb_first, cb_size, cb_off;
     uint8_t* shadow;        /* last uploaded contents of a big CPU-written buffer: only changed bytes go up again */
+    int gpu_written;        /* bound as a UAV or cleared since that upload: the shadow no longer matches the GPU copy */
 } WTex;
 
 enum { WV_MAX = 6 };
@@ -300,11 +302,25 @@ static Buf jb;
 static WTex* T(GpuRes* r) { return r ? (WTex*)r->backend : NULL; }
 static WView* V(GpuView* v) { return v ? (WView*)v->backend : NULL; }
 
+/* 64-bit hash of a key, 8 bytes a step with full mixing (caches trust it to tell keys apart) */
 static uint64_t fnv(const void* p, size_t n, uint64_t h)
 {
     const uint8_t* b = p;
-    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
-    return h;
+    h ^= n * 0x9E3779B97F4A7C15ull;
+    for (; n >= 8; b += 8, n -= 8) {
+        uint64_t w;
+        memcpy(&w, b, 8);
+        h = (h ^ w) * 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 31;
+    }
+    if (n) {
+        uint64_t w = 0;
+        memcpy(&w, b, n);
+        h = (h ^ w) * 0x94D049BB133111EBull;
+        h ^= h >> 29;
+    }
+    h *= 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 32);
 }
 
 void uewg_submit(int ring_used);
@@ -343,7 +359,7 @@ static int ring_live(uint32_t gen, uint32_t off)
     return gen == ring_gen;
 }
 
-static uint64_t st_bg_rc, st_cb_same, st_ring_bytes, st_cb_hit, st_cb_miss, st_gs, st_static, st_bg_memo, st_bg_hash, st_bg_new, st_ind, st_iid_ind, st_iid_lost;
+static uint64_t st_bg_rc, st_cb_same, st_ring_bytes, st_cb_hit, st_cb_miss, st_cb_dedup, st_gs, st_static, st_bg_memo, st_bg_hash, st_bg_new, st_ind, st_iid_ind, st_iid_lost;
 static uint32_t ring_put(const void* p, uint32_t n, uint32_t pad_to)
 {
     st_ring_bytes += pad_to > n ? pad_to : n;
@@ -533,6 +549,29 @@ static void res_destroy(GpuRes* r)
 static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint32_t n)
 {
     if (!t->id || !n) return;
+    /* ?bufdebug=1: every 600 frames, the buffers that took the most upload bytes */
+    static int dbg = -1;
+    static struct { GpuRes* r; uint64_t bytes; uint32_t writes; } top[64];
+    static uint32_t last_serial;
+    if (dbg < 0) dbg = host_query_flag("bufdebug");
+    if (dbg) {
+        int k = 0;
+        while (k < 64 && top[k].r && top[k].r != r) k++;
+        if (k < 64) { top[k].r = r; top[k].bytes += n; top[k].writes++; }
+        if (g_serial / 600 != last_serial / 600) {
+            last_serial = g_serial;
+            for (int j = 0; j < 8; j++) {
+                int best = -1;
+                for (int i = 0; i < 64; i++) if (top[i].r && (best < 0 || top[i].bytes > top[best].bytes)) best = i;
+                if (best < 0 || !top[best].bytes) break;
+                GpuRes* b = top[best].r;
+                host_log("[buf] %u bytes, usage %u, bind %x, misc %x, stride %u: %.0f KB/frame in %.1f writes/frame", (unsigned)b->width,
+                         (unsigned)b->usage, (unsigned)b->bind, (unsigned)b->misc, (unsigned)b->stride, top[best].bytes / 600.0 / 1024.0, top[best].writes / 600.0);
+                top[best].bytes = 0;
+            }
+            memset(top, 0, sizeof top);
+        }
+    }
     if (t->used == g_serial) {
         uint32_t ro = ring_put(p, n, (n + 3) & ~3u);
         uewg_buffer_copy_ring((int)ro, t->id, (int)(off & ~3u), (int)((n + 3) & ~3u), (int)ring_used);
@@ -564,13 +603,21 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
     WTex* t = T(r);
     if (!t) return;
     t->version++;
-    if (r->type == RES_BUFFER && !box && r->width >= 65536 && !(r->bind & 0x80) && t->id) {
+    /* a UAV buffer the GPU wrote since its last upload goes up whole (and refreshes the shadow) */
+    if (r->type == RES_BUFFER && !box && r->width >= 65536 && (r->bind & 0x80) && t->id && t->shadow && t->gpu_written) {
+        memcpy(t->shadow, G2H(src), r->width);
+        t->gpu_written = 0;
+        buffer_put(r, t, 0, G2H(src), r->width);
+        return;
+    }
+    if (r->type == RES_BUFFER && !box && r->width >= 65536 && t->id) {
         /* games remap whole dynamic buffers every frame but rewrite a little of them */
         const uint8_t* p = G2H(src);
         uint32_t n = r->width;
         if (!t->shadow) {
             t->shadow = malloc(n);
             if (t->shadow) memcpy(t->shadow, p, n);
+            t->gpu_written = 0;
             buffer_put(r, t, 0, p, n);
             return;
         }
@@ -1179,7 +1226,9 @@ static int merged_buffer(GpuCtx* c, Variant* v, int stage, uint32_t* total)
 
 /* ---- bind groups ---- */
 
-typedef struct BgEnt { struct BgEnt* next; uint64_t h; int id; int nids; int ids[]; } BgEnt;
+typedef struct BgEnt { struct BgEnt* next; uint64_t h; uint64_t bloom[4]; int id; int nids; int ids[]; } BgEnt;
+/* a 256-bit filter of the ids a group names: the sweep only searches groups whose filter meets the dead ids' */
+static inline void bloom_add(uint64_t* b, int id) { uint32_t k = (uint32_t)id * 0x9E3779B1u >> 24; b[k >> 6] |= 1ull << (k & 63); }
 /* ids of resources and views destroyed this frame: groups naming them can never be used again and are freed after the frame,
    since games that make a buffer per frame (feedback buffers) would otherwise fill the browser's descriptor heaps */
 static int dead_ids[4096], ndead, dead_over;
@@ -1204,10 +1253,13 @@ static void bg_sweep(void)
     if (dead_over) { bg_clear(); ndead = 0; dead_over = 0; return; }
     if (!ndead) return;
     qsort(dead_ids, (size_t)ndead, sizeof *dead_ids, cmp_int);
+    uint64_t dead[4] = { 0 };
+    for (int i = 0; i < ndead; i++) bloom_add(dead, dead_ids[i]);
     int freed = 0;
     for (int i = 0; i < 4096; i++)
         for (BgEnt** pe = &bg_cache[i]; *pe;) {
             BgEnt* e = *pe;
+            if (!((e->bloom[0] & dead[0]) | (e->bloom[1] & dead[1]) | (e->bloom[2] & dead[2]) | (e->bloom[3] & dead[3]))) { pe = &e->next; continue; }
             int hit = 0;
             for (int k = 0; k < e->nids && !hit; k++) hit = bsearch(&e->ids[k], dead_ids, (size_t)ndead, sizeof *dead_ids, cmp_int) != NULL;
             if (hit) { *pe = e->next; uewg_release(e->id); free(e); bg_count--; freed++; }
@@ -1378,6 +1430,7 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
         if (t && t->id) {
             t->used = g_serial;
             t->version++;
+            t->gpu_written = 1;
             if (view->res->type == RES_BUFFER) {
                 WView* vw = V(view);
                 uint32_t stride = view->res->stride && (u->structured) ? view->res->stride : !u->raw && src_bpb(view->format) >= 4 ? src_bpb(view->format) : 4;
@@ -1434,15 +1487,16 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
     /* a full cache is emptied after the frame: groups already handed to this draw must stay alive */
     /* every live bind group holds descriptors in the browser's D3D12 heaps; too many and the device is lost */
     if (bg_count > 8192) bg_full = 1;
-    breset(&rb);
-    bp(&rb, "[");
-    ent_json(&rb, ents, n);
-    bp(&rb, "]");
     BgEnt* e = malloc(sizeof *e + sizeof(int) * (size_t)n);
     e->h = h;
     e->nids = 0;
-    for (int k = 0; k < n; k++) if ((ents[k].kind == E_ID && ents[k].b < 160) || ents[k].kind == E_BUF || ents[k].b >= 176) if (ents[k].id) e->ids[e->nids++] = ents[k].id;
-    e->id = uewg_bindgroup_create(p->layout, group, rb.p);
+    memset(e->bloom, 0, sizeof e->bloom);
+    for (int k = 0; k < n; k++) if ((ents[k].kind == E_ID && ents[k].b < 160) || ents[k].kind == E_BUF || ents[k].b >= 176) if (ents[k].id) {
+        e->ids[e->nids++] = ents[k].id;
+        bloom_add(e->bloom, ents[k].id);
+    }
+    _Static_assert(sizeof(Ent) == 7 * sizeof(int), "Ent is read as 7 ints by uewg_bindgroup_bin");
+    e->id = uewg_bindgroup_bin(p->layout, group, ents, n);
     e->next = *slot;
     *slot = e;
     bg_count++;
@@ -1479,6 +1533,25 @@ static int cb_offsets(GpuCtx* c, Program* p, Variant* v, int stage, int s, int32
             t->cb_version = t->version;
             out[n++] = (int32_t)t->cb_off;
             st_cb_same++;
+            continue;
+        }
+        /* the same contents already copied this frame from another buffer (per-draw constants often repeat): reuse that
+           copy. Found by the size and first bytes, then compared whole */
+        if (src && have) {
+            static struct { uint64_t key; uint32_t gen, off, want, have; } seen[4096];
+            uint64_t key = fnv(src, have < 64 ? have : 64, ((uint64_t)want << 32) | have);
+            uint32_t slot = (uint32_t)(key >> 52) & 4095;
+            if (seen[slot].key == key && seen[slot].want == want && seen[slot].have == have && ring_live(seen[slot].gen, seen[slot].off)
+                && !memcmp(src, ring + seen[slot].off, have)) {
+                out[n++] = (int32_t)seen[slot].off;
+                st_cb_dedup++;
+                if (t) { t->cb_serial = seen[slot].gen; t->cb_version = t->version; t->cb_first = first; t->cb_size = want; t->cb_off = seen[slot].off; }
+                continue;
+            }
+            st_cb_miss++;
+            out[n++] = (int32_t)ring_put(src, have, want);
+            seen[slot].key = key; seen[slot].gen = ring_gen; seen[slot].off = (uint32_t)out[n - 1]; seen[slot].want = want; seen[slot].have = have;
+            if (t) { t->cb_serial = ring_gen; t->cb_version = t->version; t->cb_first = first; t->cb_size = want; t->cb_off = (uint32_t)out[n - 1]; }
             continue;
         }
         st_cb_miss++;
@@ -2533,8 +2606,8 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
         int o = snprintf(m, sizeof m, "%u drawn", drawn), dropped = 0;
         for (int i = 0; i < 7; i++) if (drops[i]) { o += snprintf(m + o, sizeof m - o, ", %u dropped (%s)", drops[i], drop_why[i]); dropped = 1; }
         if (dropped) host_log("[webgpu] last 600 frames: %s", m);
-        host_log("[webgpu] per frame: %u draws, %u GS draws, CB ring %.0f KB (%llu hits, %llu unchanged, %llu copies), %llu per-draw CB groups, res groups %llu memo / %llu cached / %llu hashed / %llu new, %d live",
-                 drawn / 600, (unsigned)(st_gs / 600), st_ring_bytes / 600 / 1024.0, (unsigned long long)(st_cb_hit / 600), (unsigned long long)(st_cb_same / 600), (unsigned long long)(st_cb_miss / 600),
+        host_log("[webgpu] per frame: %u draws, %u GS draws, CB ring %.0f KB (%llu hits, %llu unchanged, %llu shared, %llu copies), %llu per-draw CB groups, res groups %llu memo / %llu cached / %llu hashed / %llu new, %d live",
+                 drawn / 600, (unsigned)(st_gs / 600), st_ring_bytes / 600 / 1024.0, (unsigned long long)(st_cb_hit / 600), (unsigned long long)(st_cb_same / 600), (unsigned long long)(st_cb_dedup / 600), (unsigned long long)(st_cb_miss / 600),
                  (unsigned long long)(st_static / 600), (unsigned long long)(st_bg_memo / 600), (unsigned long long)(st_bg_rc / 600), (unsigned long long)(st_bg_hash / 600), (unsigned long long)(st_bg_new / 600), bg_count);
         if (st_ind || st_iid_lost) host_log("[webgpu] per frame: %.1f indirect draws (%.1f read SV_InstanceID), %.1f direct draws lost their start instance",
                                             st_ind / 600.0, st_iid_ind / 600.0, st_iid_lost / 600.0);
@@ -2553,7 +2626,7 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
             if (o) host_log("[webgpu] pass breaks per frame by source line:%s", m);
             memset(brk_n, 0, sizeof brk_n);
         }
-        st_bg_rc = st_ring_bytes = st_cb_hit = st_cb_same = st_cb_miss = st_gs = st_static = st_bg_memo = st_bg_hash = st_bg_new = 0;
+        st_bg_rc = st_ring_bytes = st_cb_hit = st_cb_same = st_cb_dedup = st_cb_miss = st_gs = st_static = st_bg_memo = st_bg_hash = st_bg_new = 0;
         memset(drops, 0, sizeof drops);
         drawn = 0;
     }
@@ -2581,6 +2654,7 @@ static void clear_uav(GpuView* v, const uint32_t* val, int is_float)
     WTex* t = v ? T(v->res) : NULL;
     if (!g_ok || !w || !t || !t->id) return;
     t->version++;
+    t->gpu_written = 1;
     if (v->res->type == RES_BUFFER) {
         uint32_t stride = v->res->stride ? v->res->stride : 4;
         uint32_t off = w->first_elem * stride, size = w->num_elem * stride;

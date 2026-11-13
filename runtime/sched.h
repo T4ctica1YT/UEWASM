@@ -20,6 +20,7 @@ typedef struct GThread {
     uint32_t block_n;
     int block_all;
     uint64_t cpu_ns;                         /* run time since the last frame, for the hitch report */
+    uint64_t acc_ns;                         /* run time over the ?perf=1 report period */
     int frame_wait;                          /* blocked until the next browser frame */
     uint64_t stack;                          /* guest stack, freed when the thread is reaped */
     int prio;                                /* audio: runs as soon as its sleep ends, ahead of the others */

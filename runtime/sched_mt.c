@@ -19,11 +19,12 @@ typedef struct Carrier {
     GThread base;                 /* the carrier's own context (carrier 0: the guest main thread) */
     GThread* threads;             /* its green threads */
     GThread* current;
-    int nthreads, ndead, nprio, nframe_waiters;
+    int nthreads, ndead, nprio, nframe_waiters, load;
     uint64_t prio_next, run_since, idle_ns, nswitch, slice_start;
 } Carrier;
 
 static Carrier carriers[MAX_CARRIERS];
+static int weight(const char* n);
 static int ncarriers = 1;
 static __thread Carrier* K;
 static GThread* all_threads;      /* every thread, through all_next */
@@ -97,6 +98,7 @@ static void lock_wait(uint64_t ns)
 /* runs f with the lock fully released, then takes it back at the same depth */
 static void unlocked_call(void (*f)(uint64_t), uint64_t arg)
 {
+    if (!lock_depth) { f(arg); return; }
     int d = lock_depth;
     lock_depth = 0;
     pthread_mutex_unlock(&big_lock);
@@ -120,7 +122,10 @@ void sched_note_wait(CPU* c, uint32_t n, uint64_t h, uint32_t ms)
 __attribute__((used, visibility("default")))
 void uew_threads(void)
 {
-    rt_lock();
+    /* called from the page's watchdog timer: waiting for the lock there would stop the page's event loop, which the
+       holder may need, so a busy lock means a best-effort read without it */
+    int locked = !lock_depth && pthread_mutex_trylock(&big_lock) == 0;
+    if (locked) lock_depth = 1;
     uint64_t now = host_ticks_ns();
     for (GThread* t = all_threads; t; t = t->all_next) {
         if (t->done) continue;
@@ -138,7 +143,7 @@ void uew_threads(void)
         host_log("[thr] %u c%d %-24s %s%s, %.1f s, start=%llx ret=%llx", (unsigned)t->tid, t->carrier, t->name, st, what,
                  t->wait_n ? (now - t->wait_since) / 1e9 : 0.0, (unsigned long long)t->start, (unsigned long long)t->wait_ret);
     }
-    rt_unlock();
+    if (locked) { lock_depth = 0; pthread_mutex_unlock(&big_lock); }
 }
 unsigned sched_current_id(void) { return (unsigned)K->current->tid; }
 int sched_is_main(void) { return K->current == main_thread; }
@@ -162,6 +167,7 @@ static void main_entry(void* arg)
     main_done = 1;
     t->done = 1;
     K->nthreads--;
+    K->load -= weight(t->name);
     total_threads--;
     K->ndead++;
     sched_notify();
@@ -186,6 +192,7 @@ int sched_run_main(int (*fn)(void*), void* arg)
     t->lockd = 1;
     t->ctx = host_ctx_new(main_entry, t, 8u << 20);
     Carrier* k = &carriers[1];
+    k->load += weight("GameThread");
     t->next = k->threads;
     k->threads = t;
     k->nthreads++;
@@ -255,6 +262,7 @@ static void thread_entry(void* arg)
     t->exit_code = (uint32_t)t->cpu->r[0];
     t->done = 1;
     K->nthreads--;
+    K->load -= weight(t->name);
     total_threads--;
     K->ndead++;
     wake_carriers();
@@ -296,9 +304,22 @@ static void ue_name(GThread* t, uint64_t obj)
         return;
     }
 }
+/* threads that call the browser all the time stay on the page's thread. The rendering thread too: moved to another
+   core (?rtoffpage=1, when there is an RHI thread) its own calls got slower than the core it freed (Dead as Disco) */
+static int has_rhi_thread;
+/* how busy a new thread is likely to be, by name: threads stay on the carrier they start on, so the few that run all
+   the time (Unreal's workers and render thread, audio mixers) are spread out first; the many that mostly wait count little */
+static int weight(const char* n)
+{
+    static const char* busy[] = { "Worker", "RenderThread", "FMOD mixer", "Mixer", "TaskGraph", "GameThread" };
+    for (size_t i = 0; i < sizeof busy / sizeof *busy; i++) if (strstr(n, busy[i])) return 16;
+    return 1;
+}
 static int on_page(const char* n)
 {
-    return strstr(n, "RenderThread") || strstr(n, "RHIThread") || strstr(n, "RHISubmission") || strstr(n, "Audio");
+    if (strstr(n, "RHIThread") || strstr(n, "RHISubmission")) { has_rhi_thread = 1; return 1; }
+    if (strstr(n, "RenderThread")) return !has_rhi_thread || !host_query_flag("rtoffpage");
+    return strstr(n, "Audio") != NULL;
 }
 void sched_named(GThread* t) { (void)t; }
 
@@ -323,7 +344,7 @@ GThread* sched_create(uint64_t start, uint64_t param, int suspended)
        carrier 0, the page's own thread, where those calls are direct; the rest share the other cores */
     ue_name(t, param);
     int best = ncarriers > 1 ? 1 : 0;
-    for (int i = 1; i < ncarriers; i++) if (carriers[i].nthreads < carriers[best].nthreads) best = i;
+    for (int i = 1; i < ncarriers; i++) if (carriers[i].load < carriers[best].load) best = i;
     if (on_page(t->name)) best = 0;
     t->carrier = best;
     t->lockd = 1;
@@ -333,6 +354,7 @@ GThread* sched_create(uint64_t start, uint64_t param, int suspended)
         return t;
     }
     Carrier* k = &carriers[best];
+    k->load += weight(t->name);
     t->next = k->threads;
     k->threads = t;
     k->nthreads++;
@@ -465,6 +487,38 @@ void sched_frame_report(void)
         rt_lock_report();
         reports++;
     }
+    /* ?perf=1: every 5 s, the average frame: each thread's run time and core, each core's idle time and lock waits */
+    static int perf = -1;
+    static uint64_t perf_t0, perf_frames, perf_lock[MAX_CARRIERS], perf_idle0[MAX_CARRIERS];
+    if (perf < 0) { perf = host_query_flag("perf"); perf_t0 = now; for (int i = 0; i < ncarriers; i++) perf_idle0[i] = carriers[i].idle_ns; }
+    if (perf) {
+        perf_frames++;
+        for (int i = 0; i < ncarriers; i++) perf_lock[i] += lock_wait_ns[i];
+        for (GThread* t = all_threads; t; t = t->all_next) t->acc_ns += t->cpu_ns;
+        if (now - perf_t0 >= 5000000000ull) {
+            char line[900];
+            double fr = (double)perf_frames;
+            int n = snprintf(line, sizeof line, "[perf] %.1f fps, %.1f ms/frame;", fr * 1e9 / (now - perf_t0), (now - perf_t0) / 1e6 / fr);
+            for (int i = 0; i < ncarriers && n < (int)sizeof line - 80; i++) {
+                n += snprintf(line + n, sizeof line - n, " c%d idle %.1f lock %.1f,", i, (carriers[i].idle_ns - perf_idle0[i]) / 1e6 / fr, perf_lock[i] / 1e6 / fr);
+                perf_idle0[i] = carriers[i].idle_ns;
+                perf_lock[i] = 0;
+            }
+            for (int k = 0; k < 8; k++) {
+                GThread* best = NULL;
+                for (GThread* t = all_threads; t; t = t->all_next)
+                    if (t->acc_ns && (!best || t->acc_ns > best->acc_ns)) best = t;
+                if (!best || n >= (int)sizeof line - 60) break;
+                n += snprintf(line + n, sizeof line - n, " %s(c%d) %.1f,", best->name[0] ? best->name : "thread", best->carrier, best->acc_ns / 1e6 / fr);
+                best->acc_ns = 0;
+            }
+            host_log("%s", line);
+            rt_lock_report();
+            for (GThread* t = all_threads; t; t = t->all_next) t->acc_ns = 0;
+            perf_t0 = now;
+            perf_frames = 0;
+        }
+    }
     memset(idle_by, 0, sizeof idle_by);
     memset(lock_wait_ns, 0, sizeof lock_wait_ns);
     for (GThread* t = all_threads; t; t = t->all_next) t->cpu_ns = 0;
@@ -542,6 +596,7 @@ void sched_exit_current(CPU* c, uint32_t code)
     k->current->exit_code = code;
     k->current->done = 1;
     k->nthreads--;
+    k->load -= weight(k->current->name);
     total_threads--;
     k->ndead++;
     sched_yield(c);

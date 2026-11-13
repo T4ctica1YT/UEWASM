@@ -49,7 +49,11 @@ is implemented yet.
    - XAudio2 2.7 (mixer, submixes, reverb, X3DAudio) and WASAPI on an AudioWorklet; Ogg Vorbis and VP8/VP9 video
      are decoded natively or by the browser's hardware decoder where the game ships libvorbis/libvpx.
 
-To build the desktop app: `pip install pyinstaller`, then `python build_exe.py` (writes `dist/UEWASM.exe`).
+Desktop apps:
+
+- `app/` (Rust, egui): `cargo build --release --target x86_64-pc-windows-msvc` in `app/`. It runs the build through the
+  command line (`uewasm-cli.exe` beside it, or `uewasm.py` with Python) and serves finished builds itself.
+- The original Tkinter app: `pip install pyinstaller`, then `python build_exe.py` (writes `dist/UEWASM.exe`).
 
 ## Requirements
 
@@ -99,6 +103,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--renderer` | `webgpu` (default), `webgl2` | WebGPU is faster and supports compute shaders. `webgl2` builds only the WebGL path. |
 | `--threads` | `coop` (default), `real` | `coop`: game threads take turns on one browser thread; runs on any host. `real`: game threads run on several cores (Web Workers), with the render and audio threads on the page's own thread. Needs WebGPU and https or localhost; hosts that can't send the cross-origin isolation headers get them from a small service worker included in the build. |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
+| `--lifter` | `python` (default), `rust` | Which recompiler turns the machine code into C. `rust` (`rustlift/`) produces the same output several times faster; it needs a Rust toolchain and is built automatically the first time. |
 | `--mem-mb` | number | Guest memory; browsers allow 4096 MB total. |
 | `--mem-limit-gb` | number (default `8`) | How much memory the built game may use when run, split between game memory, the download cache and video memory. |
 | `--aes-key` | `0x` + 64 hex digits | Decrypt AES-encrypted `.pak` files with your own key so the browser can read them. The key is checked before the build starts; a wrong key stops the build. |
@@ -109,6 +114,8 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--video-height` | e.g. `720` | Re-encode game videos taller than this, in their original codec family, so the game's own player still plays them. Unreal `.pak` files are rewritten with the new videos. `0` (default) keeps the originals. |
 | `--video-mode` | `fast`, `small` | `small` gives roughly 30% smaller videos but encodes about 10 times slower. Encodes are cached. |
 | `--sync-shaders` |N/A| Compile each shader when first drawn instead of in the background (exact first frames, but freezes while compiling). |
+| `--quality` | `game` (default), `low`, `medium`, `high`, `epic` | Unreal games: graphics quality for every scalability group except textures, added to the game's own settings file (`GameUserSettings.ini`) each time it starts, so it also overrides what the game saved there. Translated draw calls cost CPU time here, so lower settings run faster (Dead as Disco, single-threaded: about 10% at `low`). A game that picks its settings with a hardware check on its very first start keeps that pick for that one session. |
+| `--game-arg` | any | Extra launch argument for the game, added after the automatic ones (such as `-dx11`); repeat for more. |
 | `--fps` |N/A| Show an FPS counter (Ctrl+Shift+F toggles it in game). |
 | `--no-debug-panel` |N/A| Leave the debug panel out of the build entirely (see below). |
 | `--wasm-opt` |N/A| Run Binaryen over the module: ~10% smaller, needs about 20x the module size in RAM. |

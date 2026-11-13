@@ -114,6 +114,8 @@ uint64_t rt_dyn_thunk(GuestFn fn, const char* name);
 /* nargs: stack arguments a 32-bit guest pushes (stdcall: the call pops them) */
 uint64_t rt_dyn_thunk_n(GuestFn fn, const char* name, int nargs);
 int host_query_flag(const char* name);
+/* a page parameter in hex (?name=1e3100000), 0 when absent */
+double host_query_hex(const char* name);
 int host_query_int(const char* name);
 uint64_t g_alloc_zero_aligned(uint64_t n, uint64_t align);
 uint64_t g_pages(uint64_t size);

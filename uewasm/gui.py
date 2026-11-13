@@ -18,6 +18,8 @@ TITLE = "UEWASM"
 RENDERERS = {"WebGPU (recommended)": "webgpu", "WebGL 2 (works everywhere)": "webgl2"}
 THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (several cores; WebGPU, https or localhost)": "real"}
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
+QUALITY = {"Game's own setting": "game", "Low (fastest here)": "low", "Medium": "medium", "High": "high", "Epic": "epic"}
+LIFTERS = {"Python (original)": "python", "Rust (same result, much faster; needs Rust installed)": "rust"}
 RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540"]
 BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
 PRIORITIES = {"High (fastest, tuned to this PC)": "high", "Low (keeps the PC usable while it builds)": "low"}
@@ -206,6 +208,8 @@ class App:
         self.renderer = combo(0, 0, "Renderer", RENDERERS, "renderer", "WebGPU (recommended)")
         self.threads = combo(1, 0, "Threading", THREADS, "threads", "Cooperative (no special hosting)")
         self.opt = combo(2, 0, "Optimisation", OPTS, "opt", "Balanced (-O2)")
+        self.lifter = combo(13, 0, "Recompiler", LIFTERS, "lifter", "Python (original)")
+        self.quality = combo(14, 0, "Graphics (Unreal)", QUALITY, "quality", "Game's own setting")
         ttk.Label(s, text="Resolution").grid(row=0, column=2, sticky="w")
         self.res = tk.StringVar(value=prefs.get("res", "1280x720"))
         ttk.Combobox(s, textvariable=self.res, values=RESOLUTIONS, width=14).grid(row=0, column=3, sticky="w", padx=6)
@@ -407,7 +411,7 @@ class App:
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
                                     "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
                                     "backend": self.backend.get(), "placeholders": self.placeholders.get(), "aes_on": self.aes_on.get(),
-                                    "mem_limit": self.mem_limit.get(), "single": self.single.get()})
+                                    "mem_limit": self.mem_limit.get(), "single": self.single.get(), "lifter": self.lifter.get(), "quality": self.quality.get()})
 
     def start(self):
         exe = self.find_exe()
@@ -433,7 +437,7 @@ class App:
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
                     compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
                     backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()),
-                    threads=THREADS[self.threads.get()], single=self.single.get())
+                    threads=THREADS[self.threads.get()], single=self.single.get(), lifter=LIFTERS[self.lifter.get()], quality=QUALITY[self.quality.get()])
         self.cancel.clear()
         self.clear_log()
         self.start_btn["state"] = "disabled"
@@ -472,7 +476,7 @@ class App:
             self.est = Estimator(stages, input_mb)
             log(f"{o['exe'].name}: {len(extra)} game DLLs, {input_mb:.0f} MB of machine code to translate")
             r = build.recompile(o["exe"], o["out"], mem_mb=o["mem"], extra=extra, search=sorted({str(d.parent) for d in extra}),
-                                system_dlls=o["sys_dlls"], log=log, progress=self.progress)
+                                system_dlls=o["sys_dlls"], log=log, progress=self.progress, lifter=o.get("lifter", "python"))
             log(f"{r['functions']} functions, {r['unsupported_total']} unsupported instructions, {len(r['missing_imports'])} Windows functions not implemented yet")
             (Path(o["out"]) / "options.json").write_text(json.dumps({"renderer": o["renderer"], "opt": o["opt"], "mem_mb": o["mem"]}, indent=2))
             if o["native"]:
@@ -482,7 +486,7 @@ class App:
                                    video_height=o["size"][1] if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
                                    wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
                                    backend=o.get("backend"), placeholders=o.get("placeholders", False), aes_key=o.get("aes"),
-                                   mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False))
+                                   mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False), quality=o.get("quality"))
             self.est.remember()
             self.q.put(("done", str(web)))
         except Cancelled:

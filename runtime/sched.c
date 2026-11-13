@@ -246,6 +246,34 @@ void sched_frame_report(void)
         host_log("%s", line);
         reports++;
     }
+    /* ?perf=1: every 5 s, the average frame split by thread (where the time goes in ordinary frames, not just hitches) */
+    static int perf = -1;
+    static uint64_t perf_t0, perf_frames, perf_idle, perf_switch;
+    if (perf < 0) { perf = host_query_flag("perf"); perf_t0 = now; }
+    if (perf) {
+        perf_frames++;
+        perf_idle += idle_ns;
+        perf_switch += nswitch;
+        for (GThread* t = threads; t; t = t->next) t->acc_ns += t->cpu_ns;
+        if (now - perf_t0 >= 5000000000ull) {
+            char line[700];
+            double fr = (double)perf_frames;
+            int n = snprintf(line, sizeof line, "[perf] %.1f fps, %.1f ms/frame: idle %.1f, %.0f switches;", fr * 1e9 / (now - perf_t0),
+                             (now - perf_t0) / 1e6 / fr, perf_idle / 1e6 / fr, perf_switch / fr);
+            for (int k = 0; k < 8; k++) {
+                GThread* best = NULL;
+                for (GThread* t = threads; t; t = t->next)
+                    if (t->acc_ns && (!best || t->acc_ns > best->acc_ns)) best = t;
+                if (!best || n >= (int)sizeof line - 60) break;
+                n += snprintf(line + n, sizeof line - n, " %s %.1f,", best->name[0] ? best->name : best == &main_thread ? "main" : "thread", best->acc_ns / 1e6 / fr);
+                best->acc_ns = 0;
+            }
+            host_log("%s", line);
+            for (GThread* t = threads; t; t = t->next) t->acc_ns = 0;
+            perf_t0 = now;
+            perf_frames = perf_idle = perf_switch = 0;
+        }
+    }
     memset(idle_by, 0, sizeof idle_by);
     for (GThread* t = threads; t; t = t->next) t->cpu_ns = 0;
     idle_ns = nswitch = 0;

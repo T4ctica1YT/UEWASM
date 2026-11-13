@@ -523,11 +523,15 @@ static int buf_unpack(int f, Str* b)
     return 0;
 }
 
+/* asked per draw for every typed buffer bound: worked out once per format (stored plus one; 0 = not known yet) */
 int dxbc_wgsl_buf_bpe(int fmt)
 {
+    static unsigned char known[256];
+    if (fmt >= 0 && fmt < 256 && known[fmt]) return known[fmt] - 1;
     Str b = { 0 };
     int n = buf_unpack(fmt, &b);
     free(b.p);
+    if (fmt >= 0 && fmt < 256) known[fmt] = (unsigned char)(n + 1);
     return n;
 }
 

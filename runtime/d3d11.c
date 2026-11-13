@@ -97,11 +97,15 @@ static uint64_t new_res(GpuRes* r, uint64_t desc, uint32_t desc_size, uint64_t i
     memcpy(G2H(PAY(o)), G2H(desc), desc_size);
     if (gpu->res_create) gpu->res_create(r, init);
     if (init) {
-        backing(r);
+        /* a CPU copy only where something reads it back: buffers (typed and merged views are built from it) and staging
+           resources. Other textures go straight to the GPU; a guest-memory mirror of every texture ran big games out of
+           memory, and D3D11 can't map them anyway (dynamic ones get memory when first mapped, for writing) */
+        if (r->type == RES_BUFFER || r->usage == 3) backing(r);
         for (int s = 0; s < (r->type == RES_BUFFER ? 1 : r->nsub); s++) {
             uint64_t src = LD64(init + 16ull * s);
             if (!src) continue;
             uint32_t pitch = (uint32_t)LD32(init + 16ull * s + 8), slice = (uint32_t)LD32(init + 16ull * s + 12);
+            if (!r->backing) { if (gpu->res_upload) gpu->res_upload(r, (uint32_t)s, NULL, src, pitch, slice); continue; }
             if (r->type == RES_BUFFER) memcpy(G2H(r->backing), G2H(src), (size_t)r->width);
             else {
                 uint32_t rows = r->sub_slice[s] / (r->sub_pitch[s] ? r->sub_pitch[s] : 1);

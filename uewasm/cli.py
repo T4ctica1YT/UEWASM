@@ -42,6 +42,13 @@ def find_exe(path):
 def cmd_recomp(a):
     from .recomp import build
     from .recomp.link import game_dlls
+    # --progress: machine-readable lines for front ends (the desktop app): @@progress stage done total, @@error, @@done
+    prog = build.nop_progress
+    if a.progress:
+        sys.stdout.reconfigure(line_buffering=True)
+
+        def prog(stage, done, total):
+            print(f"@@progress\t{stage}\t{done}\t{total}", flush=True)
     exe = find_exe(a.exe)
     if not a.yes and sys.stdin.isatty():
         for k in ("renderer", "threads", "opt"):
@@ -61,18 +68,23 @@ def cmd_recomp(a):
         if not aes:
             sys.exit("--aes-key should be 64 hex digits (0x optional) or base64 of 32 bytes")
         bad = [p.name for p in upak.encrypted_paks(root) if not upak.check_key(p, aes)]
+        if bad and a.progress:
+            print(f"@@error\twrongkey\tThe AES key is wrong for {', '.join(bad[:5])}.", flush=True)
         if bad:
             sys.exit(f"the AES key is wrong for {', '.join(bad[:5])}; give the game's own correct key")
     from .recomp import resources
     resources.set_mode(a.priority)
     resources.lower_this_process()
     print(resources.describe())
-    r = build.recompile(exe, out, mem_mb=a.mem_mb, comments=a.comments, extra=extra, search=search, system_dlls=not a.no_system_dlls)
+    print(f"{exe.name}: {len(extra)} game DLLs, {(exe.stat().st_size + sum(p.stat().st_size for p in extra)) / 1048576:.0f} MB "
+          "of machine code to translate")
+    r = build.recompile(exe, out, mem_mb=a.mem_mb, comments=a.comments, extra=extra, search=search, system_dlls=not a.no_system_dlls,
+                        lifter=a.lifter, progress=prog)
     print(f"{r['functions']} functions in {len(r['modules'])} modules, {r['unsupported_total']} unsupported instructions, "
           f"{len(r['missing_imports'])} imports not implemented yet (details in {out / 'coverage.json'})")
     (out / "options.json").write_text(json.dumps({k: getattr(a, k) for k in ("renderer", "threads", "opt", "mem_mb")}, indent=2))
     if a.native:
-        native = build.build_native(out, debug=a.debug)
+        native = build.build_native(out, debug=a.debug, progress=prog)
         if a.run:
             subprocess.run([str(native), "--image", str(out / "image.bin"), "--root", str(root), "--save", str(out / "save"), "--exe", exe_rel])
     if not a.native_only:
@@ -81,8 +93,11 @@ def cmd_recomp(a):
                                size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
                                backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb,
-                               single_file=a.single_file)
+                               single_file=a.single_file, progress=prog, quality=a.quality,
+                               game_args=[*build.default_args(root / exe_rel), *a.game_arg] if a.game_arg else None)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
+        if a.progress:
+            print(f"@@done\t{web}", flush=True)
         if a.single_file:
             print(f"single-file build in {out / 'single'} (open the .html directly)")
 
@@ -125,6 +140,8 @@ def main(argv=None):
     r.add_argument("--renderer", choices=list(CHOICES["renderer"]), default="webgpu")
     r.add_argument("--threads", choices=list(CHOICES["threads"]), default="coop")
     r.add_argument("--opt", choices=list(CHOICES["opt"]), default="-O2")
+    r.add_argument("--lifter", choices=["python", "rust"], default="python",
+                   help="python: the original lifter; rust: the same output many times faster (needs a Rust toolchain, built on first use)")
     r.add_argument("--mem-mb", type=int, default=3072, help="guest memory (the browser limit is 4096 total)")
     r.add_argument("--mem-limit-gb", type=float, default=8, help="most memory the running game may use in all (game, file cache, video memory)")
     r.add_argument("--resolution", default="1280x720", help="render size; the page scales it to the window")
@@ -133,6 +150,9 @@ def main(argv=None):
     r.add_argument("--single-file", action="store_true",
                    help="also write one .html holding the whole game, playable straight from disk with no server (cooperative threads only; best for small games)")
     r.add_argument("--sync-shaders", action="store_true", help="compile shaders when first drawn (exact first frames, but freezes while compiling)")
+    r.add_argument("--quality", choices=["game", "low", "medium", "high", "epic"], default="game",
+                   help="Unreal games: graphics quality (game: the game's own setting); lower settings run faster here")
+    r.add_argument("--game-arg", action="append", default=[], help="extra launch argument for the game (repeat for more)")
     r.add_argument("--fps", action="store_true", help="show an FPS counter in the page (Ctrl+Shift+F toggles it)")
     r.add_argument("--priority", choices=["high", "low"], default="high",
                    help="high: fastest, tuned to this PC; low: far less CPU and memory so the PC stays usable (same result)")
@@ -152,6 +172,7 @@ def main(argv=None):
     r.add_argument("--debug", action="store_true")
     r.add_argument("--comments", action="store_true", help="annotate generated C with the original instructions")
     r.add_argument("-y", "--yes", action="store_true", help="don't ask, use the given or default options")
+    r.add_argument("--progress", action="store_true", help="print machine-readable progress lines (for front ends)")
     c = sub.add_parser("coverage", help="show what's still missing for a build")
     c.add_argument("build")
     c.add_argument("--top", type=int, default=30)

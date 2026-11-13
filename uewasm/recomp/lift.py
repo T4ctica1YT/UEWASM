@@ -159,8 +159,9 @@ class Program:
                 self.roots.add(v)
         if self.bits == 32:
             self.data_pointers()
+        # address order throughout (not set order), so the result is the same every run and matches the Rust lifter
         self.starts = sorted(self.roots)
-        work = list(self.roots)
+        work = list(self.starts)
         seen = set()
         self.blocks = {}
         while work:
@@ -170,7 +171,7 @@ class Program:
             seen.add(r)
             labels, extra = self.scan(r)
             self.blocks[r] = labels
-            for t in extra:
+            for t in sorted(extra):
                 if t not in self.roots:
                     self.roots.add(t)
                     bisect.insort(self.starts, t)
@@ -183,7 +184,7 @@ class Program:
                 break
             for r in stale:
                 self.blocks[r], extra = self.scan(r)
-                work += [t for t in extra if t not in self.roots]
+                work += [t for t in sorted(extra) if t not in self.roots]
             while work:
                 r = work.pop()
                 if r in self.roots and r in self.blocks:
@@ -191,7 +192,7 @@ class Program:
                 self.roots.add(r)
                 bisect.insort(self.starts, r)
                 self.blocks[r], extra = self.scan(r)
-                work += [t for t in extra if t not in self.roots]
+                work += [t for t in sorted(extra) if t not in self.roots]
         return self
 
     def data_pointers(self):

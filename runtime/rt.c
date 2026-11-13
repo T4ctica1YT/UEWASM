@@ -77,12 +77,33 @@ static void units_take(uint64_t i, uint64_t n)
     units_used += n;
 }
 
+/* the highest run of n free units */
+static uint64_t units_scan_down(uint64_t n)
+{
+    uint64_t run = 0;
+    for (uint64_t i = unit_n; i-- > 0;) {
+        uint64_t w = unit_free[i >> 6];
+        if ((i & 63) == 63 && i >= 63 && (w == 0 || w == ~0ull)) {
+            run = w ? run + 64 : 0;
+            if (run >= n) return i - 63 + (run - n);
+            i -= 63;
+            continue;
+        }
+        run = BIT(unit_free, i) ? run + 1 : 0;
+        if (run == n) return i;
+    }
+    return ~0ull;
+}
+
+/* small blocks first-fit from the bottom, big ones (4 MB and up) from the top: the small long-lived ones stay packed
+   low instead of being strewn across the space, so a big contiguous block can still be found when most is in use
+   (Dead as Disco ran out of room for a 48 MB block with 400 MB free) */
 uint64_t g_pages(uint64_t size)
 {
     uint64_t n = (size + UNIT - 1) / UNIT;
     if (!n) n = 1;
-    uint64_t i = units_scan(unit_rover, unit_n, n);
-    if (i == ~0ull) i = units_scan(0, unit_n, n);
+    uint64_t i = n >= 64 ? units_scan_down(n) : units_scan(0, unit_n, n);
+    if (i == ~0ull) i = n >= 64 ? units_scan(0, unit_n, n) : units_scan_down(n);
     if (i == ~0ull) {
         host_log("[mem] out of guest memory (%llu bytes requested, %llu MB in use)", (unsigned long long)size,
                  (unsigned long long)(units_used * UNIT >> 20));
@@ -383,7 +404,8 @@ static void nolock_init(void)
         "GetCurrentProcessId", "QueryPerformanceCounter", "QueryPerformanceFrequency", "GetSystemTimeAsFileTime",
         "GetSystemTimePreciseAsFileTime", "GetTickCount", "GetTickCount64", "GetLastError", "SetLastError",
         "GetCurrentProcessorNumber", "GetCurrentProcessorNumberEx", "EnterCriticalSection", "LeaveCriticalSection",
-        "TryEnterCriticalSection" };
+        "TryEnterCriticalSection", "SwitchToThread", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "AcquireSRWLockShared",
+        "ReleaseSRWLockShared", "TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared" };
     uint8_t* m = calloc(rt_thunk_count + 1, 1);
     for (size_t k = 0; k < rt_thunk_count; k++) {
         if (!rt_thunks[k].fn) continue;
@@ -497,12 +519,31 @@ static _Thread_local uint64_t jump_pending;
 #endif
 static void jump_slow(CPU* c) { rt_call(c, jump_pending); }
 
+/* lifted function at a guest address, or NULL. Indirect calls that miss their call site's cache (virtual calls with
+   many targets) come here constantly; a small direct-mapped cache in front of the big table keeps them in the CPU's cache.
+   One host thread only: with real threads an entry could be read half-written */
+static GuestFn lookup_fn(uint64_t t)
+{
+    if (t < IMAGE_LO || t >= IMAGE_HI) return NULL;
+#ifndef UEW_THREADS
+    static struct { uint64_t a; GuestFn f; } jc[65536];
+    size_t k = (size_t)((t * 0x9E3779B97F4A7C15ull) >> 48);
+    if (jc[k].a == t) return jc[k].f;
+    const FnEntry* e = find_fn(t);
+    if (e) { jc[k].a = t; jc[k].f = e->fn; }
+    return e ? e->fn : NULL;
+#else
+    const FnEntry* e = find_fn(t);
+    return e ? e->fn : NULL;
+#endif
+}
+
 GuestFn rt_jump_fn(CPU* c, uint64_t t)
 {
     (void)c;
     STACK_CHECK(c, t);
-    const FnEntry* f = (t >= IMAGE_LO && t < IMAGE_HI) ? find_fn(t) : NULL;
-    if (f) return f->fn;
+    GuestFn f = lookup_fn(t);
+    if (f) return f;
     jump_pending = t;
     return jump_slow;
 }
@@ -532,10 +573,10 @@ GuestFn rt_ic_fn(CPU* c, uint64_t t, IC* ic)
 void rt_call_ic(CPU* c, uint64_t t, IC* ic)
 {
     STACK_CHECK(c, t);
-    const FnEntry* f = (t >= IMAGE_LO && t < IMAGE_HI) ? find_fn(t) : NULL;
+    GuestFn f = lookup_fn(t);
     if (f) {
-        ic_fill(ic, t, f->fn);
-        f->fn(c);
+        ic_fill(ic, t, f);
+        f(c);
         return;
     }
 #ifndef UEW_THREADS
@@ -820,9 +861,9 @@ void rt_idiv64(CPU* c, uint64_t s) { if (!s) { DIV_ERR(); return; } __int128 n =
 #endif
 
 #define F (*f)
+/* a locked one already holds its address's lock (lifted code takes it around the call) */
 void rt_cmpxchg16b(CPU* c, Flags* f, uint64_t a)
 {
-    ATOMIC_BEGIN(a);
     uint64_t lo = LD64(a), hi = LD64(a + 8);
     if (lo == R(0) && hi == R(2)) {
         ST64(a, R(3));
@@ -833,7 +874,6 @@ void rt_cmpxchg16b(CPU* c, Flags* f, uint64_t a)
         R(2) = hi;
         rt_setzf(f, 0);
     }
-    ATOMIC_END(a);
 }
 
 static uint64_t ldn(uint64_t a, int n) { return n == 1 ? LD8(a) : n == 2 ? LD16(a) : n == 4 ? LD32(a) : LD64(a); }
@@ -1050,7 +1090,6 @@ int rt_main(int argc, char** argv, const char* image_path)
     }
     build_fn_hash();
     units_init(IMAGE_HI);
-    if (!load_image(image_path)) return 1;
     const ModuleInfo* exe = NULL;
     for (size_t i = 0; i < rt_module_count; i++)
         if (!rt_modules[i].is_dll) exe = &rt_modules[i];
@@ -1072,9 +1111,12 @@ int rt_main(int argc, char** argv, const char* image_path)
     uint64_t stack_size = 16ull << 20;
     uint64_t stack = g_alloc(stack_size);
     c->tid = 0x1004;
+    /* the scheduler before the image: reading it may have to wait for its download, which blocks through the scheduler.
+       The TEB after it (its TLS blocks are copied from the image) */
+    sched_init(c);
+    if (!load_image(image_path)) return 1;
     g_teb = rt_make_teb(stack, stack_size, c->tid);
     c->gsbase = g_teb;
-    sched_init(c);
     hle_init(argc, argv);
     hle_vpx_init();
     R(4) = (stack + stack_size - 64) & ~15ull;
@@ -1186,6 +1228,24 @@ void rt_sj_jump(CPU* c, uint64_t jb, uint64_t val)
         longjmp(sj[i].host, 1);
     }
     rt_trap(c, LD64(jb + 80), "longjmp to an unknown setjmp buffer");
+}
+
+/* UEW_PTRCHECK builds: the first stores of pointer-shaped values with a stray bit 32, with the storing function and
+   the guest call stack */
+void rt_ptr_store(uint64_t a, uint64_t v, const char* fn)
+{
+    static int n;
+    /* sizes look the same; by default only a heap block's own address with bit 32 set counts. UEW_PTRVAL=<low 32 bits>
+       (or ?ptrval= on the page) narrows it to one value */
+    static int64_t want = -2;
+    if (want == -2) {
+        const char* e = getenv("UEW_PTRVAL");
+        want = e ? (int64_t)strtoull(e, NULL, 16) : host_query_hex("ptrval") ? (int64_t)host_query_hex("ptrval") : -1;
+    }
+    if (want >= 0 ? (uint32_t)v != (uint32_t)want : !(uint32_t)v || g_pages_query((uint32_t)v, NULL) != (uint32_t)v) return;
+    if (n++ >= 200) return;
+    host_log("[ptr] %s stores %llx at %llx (thread %u)", fn, (unsigned long long)v, (unsigned long long)a, sched_current_id());
+    if (n <= 40) rt_backtrace(sched_current_cpu(), "ptr");
 }
 
 /* UEW_STORE_CHECK builds: the first bad stores, with the lifted function that made them */

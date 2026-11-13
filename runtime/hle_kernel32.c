@@ -16,16 +16,26 @@ HLE(IsProcessorFeaturePresent)
 }
 /* strictly increasing: the browser's clock is coarse (0.1 ms or worse), and code that divides by the time between two
    reads would divide by zero where Windows' 100 ns counter always moves */
-HLE(QueryPerformanceCounter)
+#ifdef UEW_THREADS
+static uint64_t qpc_now(void)
 {
     static uint64_t last;
-    uint64_t v = host_ticks_ns() / 100;
-#ifdef UEW_THREADS
-    uint64_t l = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    uint64_t v = host_ticks_ns() / 100, l = __atomic_load_n(&last, __ATOMIC_RELAXED);
     do { if (v <= l) v = l + 1; } while (!__atomic_compare_exchange_n(&last, &l, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
-#else
+    return v;
+}
+#endif
+/* every read is real: code that times a stretch of work between two reads (Unreal's startup benchmark, which picks the
+   graphics quality) would otherwise see no time pass */
+HLE(QueryPerformanceCounter)
+{
+#ifndef UEW_THREADS
+    static uint64_t last;
+    uint64_t v = host_ticks_ns() / 100;
     if (v <= last) v = last + 1;
     last = v;
+#else
+    uint64_t v = qpc_now();
 #endif
     ST64(A1, v);
     RET(1);
@@ -131,42 +141,62 @@ static void cs_desc(GThread* t, char* out, int cap)
     snprintf(out, cap, " %llx owned by %llu (depth %u)", (unsigned long long)t->block_a, (unsigned long long)LDP(CS_OWNER(t->block_a)),
              (unsigned)LD32(CS_REC(t->block_a)));
 }
+/* SRW lock word: bit 0 held exclusively, bit 1 a writer is waiting, readers counted in steps of 4. Taking and leaving
+   are one atomic operation; only a thread that has to wait takes the global lock (real threads) and blocks. A waiting
+   writer makes new readers queue behind it, as on Windows, so readers can't starve it */
+static uint64_t srw_cas(uint64_t l, uint64_t e, uint64_t n) { return RT_G32 ? ATCAS32(l, e, n) : ATCAS64(l, e, n); }
+static int srw_try(uint64_t l, int shared)
+{
+    uint64_t v = LDP(l);
+    if (shared) return !(v & 3) && srw_cas(l, v, v + 4) == v;
+    return v == 0 && srw_cas(l, 0, 1) == 0;
+}
 static int srw_free(GThread* t);
 static void srw_desc(GThread* t, char* out, int cap)
 {
     uint64_t v = LDP(t->block_a);
-    snprintf(out, cap, " %llx wanted %s, held %s", (unsigned long long)t->block_a, t->block_b ? "shared" : "exclusive",
-             v == 1 ? "exclusive" : v ? "shared" : "by nobody");
+    snprintf(out, cap, " %llx wanted %s, held %s%s", (unsigned long long)t->block_a, t->block_b ? "shared" : "exclusive",
+             (v & 1) ? "exclusive" : (v >> 2) ? "shared" : "by nobody", (v & 2) ? ", writer waiting" : "");
 }
 INIT_FN(lock_names)
 {
     sched_name_check(cs_free, "critical section", cs_desc);
     sched_name_check(srw_free, "SRW lock", srw_desc);
 }
-/* a writer waiting on a lock makes new readers queue behind it, as on Windows, so readers can't starve it */
 static int srw_free(GThread* t)
 {
     uint64_t v = LDP(t->block_a);
-    if (!t->block_b) return v == 0;
-    return !(v & 1) && !sched_find_blocked(srw_free, t->block_a, 0);
+    return t->block_b ? !(v & 3) : !(v & ~2ull);
 }
 void srw_acquire(CPU* c, uint64_t l, int shared)
 {
+    if (srw_try(l, shared)) return;
+    rt_lock();
     GThread* t = sched_current();
     for (;;) {
         uint64_t v = LDP(l);
-        int ok = shared ? !(v & 1) && !sched_find_blocked(srw_free, l, 0) : v == 0;
-        if (ok) { STP(l, shared ? v + 2 : 1); return; }
+        if (shared ? !(v & 3) : !(v & ~2ull)) {
+            uint64_t n = v + 4;
+            if (!shared) {
+                /* keep the waiting mark while another writer still waits */
+                GThread* w = sched_find_blocked(srw_free, l, 0);
+                n = 1 | (w && w != t ? 2 : 0);
+            }
+            if (srw_cas(l, v, n) == v) break;
+            continue;
+        }
+        if (!shared && !(v & 2)) { srw_cas(l, v, v | 2); continue; }
         t->block_a = l;
         t->block_b = (uint64_t)shared;
         sched_block(c, srw_free, ~0ull);
+        t->block_a = 0;
     }
+    rt_unlock();
 }
 void srw_release(uint64_t l, int shared)
 {
-    uint64_t v = LDP(l);
-    if (shared) STP(l, v >= 2 ? v - 2 : 0);
-    else STP(l, 0);
+    if (shared) { if (RT_G32) ATADD32(l, (uint64_t)-4); else ATADD64(l, (uint64_t)-4); }
+    else for (uint64_t v = LDP(l); srw_cas(l, v, v & ~1ull) != v; v = LDP(l)) {}
     sched_notify();
 }
 HLE(InitializeSRWLock) { STP(A1, 0); RET(0); }
@@ -174,19 +204,36 @@ HLE(AcquireSRWLockExclusive) { srw_acquire(c, A1, 0); RET(0); }
 HLE(ReleaseSRWLockExclusive) { srw_release(A1, 0); RET(0); }
 HLE(AcquireSRWLockShared) { srw_acquire(c, A1, 1); RET(0); }
 HLE(ReleaseSRWLockShared) { srw_release(A1, 1); RET(0); }
-HLE(TryAcquireSRWLockExclusive) { if (LDP(A1) == 0) { STP(A1, 1); RET(1); } else RET(0); }
-HLE(TryAcquireSRWLockShared) { uint64_t v = LDP(A1); if (!(v & 1)) { STP(A1, v + 2); RET(1); } else RET(0); }
+HLE(TryAcquireSRWLockExclusive) { RET(srw_try(A1, 0)); }
+HLE(TryAcquireSRWLockShared) { RET(srw_try(A1, 1)); }
 
 HLE(VirtualAlloc)
 {
-    uint64_t addr = A1, size = A2;
-    if (!addr) { RET(g_pages(size)); return; }
-    if (g_pages_query(addr, NULL)) { RET(addr & ~0xFFFull); return; }
-    RET(g_pages_at(addr & ~0xFFFFull, size + (addr & 0xFFFF)));
+    uint64_t addr = A1, size = A2, r;
+    if (!addr) r = g_pages(size);
+    else if (g_pages_query(addr, NULL)) r = addr & ~0xFFFull;
+    else r = g_pages_at(addr & ~0xFFFFull, size + (addr & 0xFFFF));
+    /* ?memdebug=1: big reservations and failures */
+    static int dbg = -1, said;
+    if (dbg < 0) dbg = host_query_flag("memdebug");
+    static uint64_t watch = ~0ull;
+    if (watch == ~0ull) watch = (uint64_t)host_query_hex("memwatch");
+    if (watch && ((r && watch - r < size) || (addr && watch - addr < size)))
+        host_log("[memwatch] VirtualAlloc(%llx, %llx, %llx) = %llx from %llx thread %u", (unsigned long long)addr, (unsigned long long)size,
+                 (unsigned long long)A3, (unsigned long long)r, (unsigned long long)LDP(R(4)), sched_current_id());
+    if (dbg && (size >= (64u << 20) || !r) && said++ < 200)
+        host_log("[mem] VirtualAlloc(%llx, %llx, %llx, %llx) = %llx from %llx", (unsigned long long)addr, (unsigned long long)size,
+                 (unsigned long long)A3, (unsigned long long)A4, (unsigned long long)r, (unsigned long long)LDP(R(4)));
+    RET(r);
 }
 HLE(VirtualFree)
 {
     uint64_t len, base = g_pages_query(A1, &len);
+    static uint64_t watch = ~0ull;
+    if (watch == ~0ull) watch = (uint64_t)host_query_hex("memwatch");
+    if (watch && base && watch - base < len)
+        host_log("[memwatch] VirtualFree(%llx, %llx, %llx) in %llx+%llx from %llx thread %u", (unsigned long long)A1, (unsigned long long)A2,
+                 (unsigned long long)A3, (unsigned long long)base, (unsigned long long)len, (unsigned long long)LDP(R(4)), sched_current_id());
     if (!base) { RET(0); return; }
     if (A3 & 0x8000) g_pages_free(base);
     else if (A3 & 0x4000) {

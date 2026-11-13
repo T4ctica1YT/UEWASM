@@ -90,6 +90,13 @@ class PE:
             img[s.rva:s.rva + n] = self.data[s.raw:s.raw + n]
         delta = base - self.image_base
         f = "<Q" if self.bits == 64 else "<I"
+        # the header in memory names the base it was loaded at, as Windows' loader leaves it (code that adds offsets to
+        # the header's ImageBase would otherwise point into the preferred, unused range)
+        opt = struct.unpack_from("<I", img, 0x3C)[0] + 24
+        if self.bits == 64:
+            struct.pack_into("<Q", img, opt + 24, base)
+        else:
+            struct.pack_into("<I", img, opt + 28, base & 0xFFFFFFFF)
         for rva in self.relocs:
             v = struct.unpack_from(f, img, rva)[0]
             struct.pack_into(f, img, rva, (v + delta) & ((1 << self.bits) - 1))
@@ -175,13 +182,13 @@ def load(path):
     rva, size = d(5)
     p, end = rva, rva + size
     while rva and p < end:
-        page, bsize = struct.unpack_from("<II", data, pe.off(p))
+        o = pe.off(p)
+        page, bsize = struct.unpack_from("<II", data, o)
         if bsize < 8:
             break
-        for i in range((bsize - 8) // 2):
-            e = struct.unpack_from("<H", data, pe.off(p + 8 + 2 * i))[0]
-            if e >> 12 == (10 if bits == 64 else 3):
-                pe.relocs.append(page + (e & 0xFFF))
+        # a block's entries sit together in the file: read them in one go (big games have millions)
+        want = 10 if bits == 64 else 3
+        pe.relocs.extend(page + (e & 0xFFF) for e in struct.unpack_from(f"<{(bsize - 8) // 2}H", data, o + 8) if e >> 12 == want)
         p += bsize
 
     rva, size = d(3)

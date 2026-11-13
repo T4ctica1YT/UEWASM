@@ -152,11 +152,24 @@ addToLibrary({
     return 1;
 },
   host_query_flag__proxy: 'sync',
+  // exit from a worker thread unwinds its suspended stacks with these; they end the process, they aren't errors
+  host_query_flag__postset: "if (typeof process == 'object' && process.on) process.on('unhandledRejection', e => { if (e == 'unwind' || (e && e.name == 'ExitStatus')) return; throw e; });" +
+    "if (typeof addEventListener == 'function') addEventListener('unhandledrejection', e => { if (e.reason == 'unwind' || (e.reason && e.reason.name == 'ExitStatus')) e.preventDefault(); });" +
+    // a crash on another core reaches the page as a bare message; print the wasm stack (function names) from where it happened
+    "if (typeof ENVIRONMENT_IS_PTHREAD != 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self != 'undefined') self.addEventListener('error', e => { if (e.error && e.error.stack) err('[worker crash] ' + e.error.stack); });",
   host_query_flag__deps: ['$UTF8ToString', '$stringToNewUTF8'],
   host_query_flag: function (name) {
     if (typeof location === "undefined") return 0;
     return new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=1(&|$)").test(location.search) ? 1 : 0;
 },
+  host_query_hex__proxy: 'sync',
+  host_query_hex__deps: ['$UTF8ToString'],
+  host_query_hex__sig: 'dp',
+  host_query_hex: function (name) {
+    if (typeof location === "undefined") return 0;
+    const m = new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=([0-9a-fA-F]+)(&|$)").exec(location.search);
+    return m ? parseInt(m[1], 16) : 0;
+  },
   host_page_int__proxy: 'sync',
   host_page_int__deps: ['$UTF8ToString', '$stringToNewUTF8'],
   host_page_int: function (name) {

@@ -110,6 +110,14 @@ void rt_bad_store(uint64_t a, const char* fn);
 #define ST16(a, v) (SCHK(a), st16_(MEMB, (a), (v)))
 #define ST32(a, v) (SCHK(a), st32_(MEMB, (a), (v)))
 #define ST64(a, v) (SCHK(a), st64_(MEMB, (a), (v)))
+#elif defined(UEW_PTRCHECK) && defined(LIFTED)
+/* debug builds: 64-bit stores of values shaped like a guest pointer with a stray bit 32 (64 KB aligned, 4-8 GB) */
+void rt_ptr_store(uint64_t a, uint64_t v, const char* fn);
+static inline uint64_t pchk_(uint64_t a, uint64_t v, const char* fn) { if ((v >> 32) == 1 && !(v & 0xFFFF)) rt_ptr_store(a, v, fn); return v; }
+#define ST8(a, v) st8_(MEMB, (a), (v))
+#define ST16(a, v) st16_(MEMB, (a), (v))
+#define ST32(a, v) st32_(MEMB, (a), (v))
+#define ST64(a, v) st64_(MEMB, (a), pchk_((a), (v), __func__))
 #else
 #define ST8(a, v) st8_(MEMB, (a), (v))
 #define ST16(a, v) st16_(MEMB, (a), (v))

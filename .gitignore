@@ -15,3 +15,7 @@ __pycache__/
 
 # logs and scratch
 *.log
+
+# Rust lifter build output
+rustlift/target/
+app/target/
