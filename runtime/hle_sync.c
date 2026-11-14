@@ -255,12 +255,13 @@ HLE(WakeByAddressAll) { sched_notify(); RET(0); }
 HLE(Sleep) { sched_sleep(c, (uint32_t)A1); RET(0); }
 HLE(SleepEx) { sched_sleep(c, (uint32_t)A1); RET(0); }
 /* UE's workers spin on this while they wait for work. With real threads the other cores keep running anyway: only one
-   call in 16 really reschedules (and takes the global lock), the rest return at once */
+   call in 16 really reschedules (and takes the global lock), the rest return at once. The page's core is the exception:
+   the rendering threads share it, so one spinning for the other has to hand it over */
 HLE(SwitchToThread)
 {
 #ifdef UEW_THREADS
     static __thread unsigned n;
-    if (++n & 15) { RET(1); return; }
+    if ((++n & 15) && !sched_on_page()) { RET(1); return; }
     rt_lock();
     int r = sched_yield(c);
     rt_unlock();

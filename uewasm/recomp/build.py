@@ -257,7 +257,8 @@ def rust_lifter(log=print):
     """the Rust lifter's executable, built with cargo the first time it is wanted; None without a Rust toolchain"""
     exe = RUST_DIR / "target" / "release" / ("uewlift.exe" if os.name == "nt" else "uewlift")
     srcs = list((RUST_DIR / "src").glob("*.rs")) + [RUST_DIR / "Cargo.toml"]
-    if exe.exists() and exe.stat().st_mtime >= max(p.stat().st_mtime for p in srcs):
+    # the packaged app ships the lifter with its sources (unpacking doesn't keep file times)
+    if exe.exists() and (getattr(__import__("sys"), "frozen", False) or exe.stat().st_mtime >= max(p.stat().st_mtime for p in srcs)):
         return exe
     cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo"))
     if not Path(cargo).exists():
@@ -386,14 +387,10 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
 
 
 def emsdk_env():
-    here = Path(__file__).resolve()
-    cands = [os.environ.get("EMSDK"), Path.home() / "emsdk", here.parents[2] / ".toolchain/emsdk", here.parents[3] / ".toolchain/emsdk"]
-    for c in cands:
-        if c and (Path(c) / "upstream/emscripten").is_dir():
-            root = Path(c)
-            break
-    else:
-        raise RuntimeError("Emscripten SDK not found (set EMSDK)")
+    from ..deps import find_emsdk
+    root = find_emsdk()
+    if not root:
+        raise RuntimeError("Emscripten SDK not found (choose it in the app's Tools tab, pass --emsdk, or run 'uewasm install-emsdk')")
     env = dict(os.environ)
     env["EMSDK"] = str(root)
     env["EM_CONFIG"] = str(root / ".emscripten")
@@ -555,9 +552,16 @@ def quality_files(exe_rel, quality):
     if quality not in QUALITY or "Binaries" not in parts or parts.index("Binaries") < 1:
         return {}
     project = parts[parts.index("Binaries") - 1]
-    text = "[ScalabilityGroups]\n" + "".join(f"sg.{g}={QUALITY[quality]}\n" for g in SCALABILITY)
+    # shadows stay at least medium: with none, lights shine through everything and scenes look plainly wrong
+    text = "[ScalabilityGroups]\n" + "".join(f"sg.{g}={max(QUALITY[quality], 1) if g == 'ShadowQuality' else QUALITY[quality]}\n" for g in SCALABILITY)
     base = f"Users/Player/AppData/Local/{project}/Saved/Config"
-    return {f"{base}/{p}/GameUserSettings.ini": text for p in ("Windows", "WindowsNoEditor")}
+    files = {f"{base}/{p}/GameUserSettings.ini": text for p in ("Windows", "WindowsNoEditor")}
+    # low and medium post-processing turn off auto exposure (dark rooms come out far too dark) and the tonemapper's
+    # contrast and vignette (corners too bright); together they cost one small pass, so they stay on
+    if QUALITY[quality] < 2:
+        ea = "".join(f"[PostProcessQuality@{i}]\nr.EyeAdaptationQuality=2\nr.Tonemapper.Quality=5\n" for i in (0, 1))
+        files.update({f"{base}/{p}/Scalability.ini": ea for p in ("Windows", "WindowsNoEditor")})
+    return files
 
 
 def memory_split(limit_gb, guest_mb):

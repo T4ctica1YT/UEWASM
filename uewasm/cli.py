@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -93,7 +94,7 @@ def cmd_recomp(a):
                                size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
                                backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb,
-                               single_file=a.single_file, progress=prog, quality=a.quality,
+                               single_file=a.single_file, progress=prog, quality=a.quality, names=a.names,
                                game_args=[*build.default_args(root / exe_rel), *a.game_arg] if a.game_arg else None)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
         if a.progress:
@@ -113,22 +114,26 @@ def cmd_coverage(a):
 
 
 def cmd_doctor(a):
+    from .deps import status
     print(f"UEWASM python {sys.version.split()[0]}")
     try:
         import iced_x86  # noqa: F401
         print("  iced-x86: ok")
     except ImportError:
         print("  iced-x86: missing (pip install iced-x86)")
-    try:
-        from .recomp.build import msvc_env, tool
-        print(f"  MSVC (native verification builds): {tool(msvc_env(), 'cl')}")
-    except Exception as e:
-        print(f"  MSVC: not found ({e})")
-    try:
-        from .recomp.build import emsdk_env
-        print(f"  emscripten (web builds): {emsdk_env()[1]}")
-    except Exception as e:
-        print(f"  emscripten: not found ({e})")
+    st = status()
+    print(f"  emscripten (web builds): {st['emsdk'] or 'not found (uewasm install-emsdk, or --emsdk PATH)'}")
+    print(f"  binaryen (--wasm-opt): {'ok' if st['binaryen'] else 'not found'}")
+    print(f"  MSVC (--native test builds): {st['msvc'] or 'not found'}")
+    print(f"  Rust (--lifter rust): {st['rust'] or 'not found (https://rustup.rs)'}")
+    print(f"  imageio-ffmpeg (--videos): {'ok' if st['ffmpeg'] else 'missing (pip install imageio-ffmpeg)'}")
+    print(f"  pycryptodome (--aes-key): {'ok' if st['crypto'] else 'missing (pip install pycryptodome)'}")
+
+
+def cmd_install_emsdk(a):
+    from .deps import default_emsdk_dir, install_emsdk
+    root = install_emsdk(Path(a.dir) if a.dir else default_emsdk_dir())
+    print(f"Emscripten installed in {root}")
 
 
 def main(argv=None):
@@ -139,6 +144,7 @@ def main(argv=None):
     r.add_argument("-o", "--output")
     r.add_argument("--renderer", choices=list(CHOICES["renderer"]), default="webgpu")
     r.add_argument("--threads", choices=list(CHOICES["threads"]), default="coop")
+    r.add_argument("--emsdk", help="where the Emscripten SDK is (default: the app's choice, EMSDK, or %%USERPROFILE%%\\emsdk)")
     r.add_argument("--opt", choices=list(CHOICES["opt"]), default="-O2")
     r.add_argument("--lifter", choices=["python", "rust"], default="python",
                    help="python: the original lifter; rust: the same output many times faster (needs a Rust toolchain, built on first use)")
@@ -154,6 +160,7 @@ def main(argv=None):
                    help="Unreal games: graphics quality (game: the game's own setting); lower settings run faster here")
     r.add_argument("--game-arg", action="append", default=[], help="extra launch argument for the game (repeat for more)")
     r.add_argument("--fps", action="store_true", help="show an FPS counter in the page (Ctrl+Shift+F toggles it)")
+    r.add_argument("--names", action="store_true", help="keep function names in the module, so browser profiles name the game's functions")
     r.add_argument("--priority", choices=["high", "low"], default="high",
                    help="high: fastest, tuned to this PC; low: far less CPU and memory so the PC stays usable (same result)")
     r.add_argument("--backend", choices=["epic"], default=None,
@@ -183,11 +190,16 @@ def main(argv=None):
     t.add_argument("build")
     t.add_argument("--seconds", type=int, default=90)
     t.add_argument("--report")
-    sub.add_parser("doctor", help="check the toolchain")
+    d = sub.add_parser("doctor", help="check the toolchain")
+    d.add_argument("--emsdk", help="where the Emscripten SDK is")
+    e = sub.add_parser("install-emsdk", help="download and install the Emscripten SDK (about 2.5 GB)")
+    e.add_argument("dir", nargs="?", help="where to install it (default %%USERPROFILE%%\\emsdk)")
     sub.add_parser("gui", help="open the desktop app (the default with no arguments)")
     if argv is None and len(sys.argv) == 1:
         argv = ["gui"]
     a = ap.parse_args(argv)
+    if getattr(a, "emsdk", None):
+        os.environ["UEWASM_EMSDK"] = a.emsdk
     if a.cmd == "gui":
         from .gui import main as gui_main
         gui_main()
@@ -206,3 +218,5 @@ def main(argv=None):
         sys.exit(0 if res["passed"] else 1)
     elif a.cmd == "doctor":
         cmd_doctor(a)
+    elif a.cmd == "install-emsdk":
+        cmd_install_emsdk(a)

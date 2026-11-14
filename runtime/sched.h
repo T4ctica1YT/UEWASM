@@ -62,6 +62,7 @@ void sched_exit_current(CPU* c, uint32_t code);
 void sched_init(CPU* main_cpu);
 int sched_thread_count(void);
 unsigned sched_current_id(void);
+int sched_on_page(void);
 void host_sleep_ms(uint32_t ms);
 void host_browser_turn(void);
 void host_browser_turned(void);

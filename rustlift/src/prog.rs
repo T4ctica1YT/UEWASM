@@ -179,7 +179,12 @@ impl Program {
 
     pub fn discover(&mut self) {
         let base = self.m.base;
+        // a chained unwind entry (code the compiler moved out of its function: shrink-wrapped prologues, cold paths) is
+        // lifted inside the function it belongs to, not as a function of its own reached by tail calls
         for &(b, e) in &self.m.functions.clone() {
+            if *self.m.family.get(&b).unwrap_or(&b) != b {
+                continue;
+            }
             self.roots.insert(base + b);
             self.ends.insert(base + b, base + e);
         }
@@ -469,7 +474,8 @@ impl Program {
     }
 
     fn own(&self, r: u64, t: u64, end: u64) -> bool {
-        r <= t && t < end && (t == r || !self.roots.contains(&t))
+        let inside = (r <= t && t < end) || (self.fam(t).is_some() && self.fam(t) == self.fam(r));
+        inside && (t == r || !self.roots.contains(&t))
     }
 
     fn scan(&mut self, cache: &mut HashMap<u64, Instruction>, r: u64) -> (BTreeSet<u64>, BTreeSet<u64>) {

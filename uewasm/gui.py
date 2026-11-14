@@ -12,14 +12,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__
+from . import __version__, deps
 
 TITLE = "UEWASM"
 RENDERERS = {"WebGPU (recommended)": "webgpu", "WebGL 2 (works everywhere)": "webgl2"}
 THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (several cores; WebGPU, https or localhost)": "real"}
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
 QUALITY = {"Game's own setting": "game", "Low (fastest here)": "low", "Medium": "medium", "High": "high", "Epic": "epic"}
-LIFTERS = {"Python (original)": "python", "Rust (same result, much faster; needs Rust installed)": "rust"}
+LIFTERS = {"Python (original)": "python", "Rust (same result, much faster)": "rust"}
 RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540"]
 BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
 PRIORITIES = {"High (fastest, tuned to this PC)": "high", "Low (keeps the PC usable while it builds)": "low"}
@@ -132,6 +132,11 @@ class Estimator:
 
 
 ASSETS = Path(__file__).resolve().parent / "assets"
+# every optional tool, for the Tools tab: key, name, what needs it
+TOOLS = [("binaryen", "Binaryen", "Shrink code with Binaryen"), ("msvc", "Visual Studio C++ tools", "Native test .exe"),
+         ("rust", "Rust", "Rust recompiler"), ("ffmpeg", "ffmpeg (imageio-ffmpeg)", "Shrinking videos"),
+         ("crypto", "pycryptodome", "Decrypting AES content")]
+ALL_ON = dict(native=True, lifter="rust", wasm_opt=True, videos=True, aes=True)
 
 
 def load_logo():
@@ -141,12 +146,70 @@ def load_logo():
         return None
 
 
+def pick(values, saved, default):
+    """a saved choice, or the option it was renamed to (same first word)"""
+    if saved in values:
+        return saved
+    if saved:
+        for v in values:
+            if v.split()[0] == saved.split()[0]:
+                return v
+    return default
+
+
+class ScrollFrame(ttk.Frame):
+    """a tab page that scrolls when the window is too short for it"""
+    active = None
+
+    def __init__(self, parent, bg):
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0, background=bg)
+        self.sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas, padding=(12, 10))
+        self.win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.sb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.sb.grid(row=0, column=1, sticky="ns")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.inner.bind("<Configure>", self.fit)
+        self.canvas.bind("<Configure>", self.fit)
+        self.bind("<Enter>", lambda _: setattr(ScrollFrame, "active", self))
+        self.bind("<Leave>", lambda _: setattr(ScrollFrame, "active", None))
+        self.notes = []
+
+    def fit(self, _=None):
+        w = self.canvas.winfo_width()
+        self.canvas.itemconfigure(self.win, width=w)
+        if w > 1 and self.notes:
+            x = self.inner.grid_bbox(2, 0)[0] + 14
+            for n in self.notes:
+                n.configure(wraplength=max(160, w - x - 40))
+        h = self.inner.winfo_reqheight()
+        self.canvas.configure(scrollregion=(0, 0, self.inner.winfo_reqwidth(), h))
+        if h > self.canvas.winfo_height() + 1:
+            self.sb.grid()
+        else:
+            self.sb.grid_remove()
+            self.canvas.yview_moveto(0)
+
+    def scroll(self, e):
+        if self.sb.winfo_ismapped():
+            self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+    @staticmethod
+    def wheel(e):
+        if ScrollFrame.active:
+            ScrollFrame.active.scroll(e)
+        return "break"
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title(f"{TITLE} {__version__}")
-        root.minsize(760, 640)
-        root.geometry("860x720")
+        root.minsize(780, 640)
+        root.geometry("920x860")
         self.q = queue.Queue()
         self.worker = None
         self.cancel = threading.Event()
@@ -154,14 +217,25 @@ class App:
         self.est = None
         self.t0 = 0
         self.last_web = None
+        self.needs = {}
         prefs = load_json("settings.json", {})
 
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
         style.configure("Head.TLabel", font=("Segoe UI", 15, "bold"))
+        style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"))
         style.configure("Sub.TLabel", foreground="#555")
+        style.configure("Ok.TLabel", foreground="#1a7f37")
+        style.configure("Bad.TLabel", foreground="#b42318")
         style.configure("Big.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 6))
+        style.configure("TNotebook.Tab", padding=(12, 4))
+        style.configure("Dlg.TButton", padding=(10, 4))
+        bg = style.lookup("TFrame", "background") or "SystemButtonFace"
+        # wheel over a tab scrolls the tab instead of changing whichever list or number is under the pointer
+        root.bind_all("<MouseWheel>", ScrollFrame.wheel)
+        for cls in ("TCombobox", "TSpinbox"):
+            root.bind_class(cls, "<MouseWheel>", ScrollFrame.wheel)
 
         main = ttk.Frame(root, padding=14)
         main.pack(fill="both", expand=True)
@@ -193,86 +267,117 @@ class App:
         ttk.Button(g, text="Browse…", command=self.pick_out).grid(row=2, column=2, columnspan=2, sticky="ew", pady=(8, 0))
         self.game.trace_add("write", lambda *_: self.root.after(300, self.describe))
 
-        # settings
-        s = ttk.LabelFrame(main, text="Settings", padding=10)
-        s.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        for c in (1, 3):
-            s.columnconfigure(c, weight=1)
+        # settings, one tab per topic: a label, the control, and a grey note on what it does
+        nb = ttk.Notebook(main)
+        nb.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        main.rowconfigure(2, weight=1)
+        self.pages = []
 
-        def combo(row, col, label, values, key, default):
-            ttk.Label(s, text=label).grid(row=row, column=col, sticky="w", pady=3)
-            v = tk.StringVar(value=prefs.get(key, default) if prefs.get(key, default) in values else default)
-            ttk.Combobox(s, textvariable=v, values=list(values), state="readonly", width=34).grid(row=row, column=col + 1, sticky="ew", padx=(6, 16), pady=3)
+        def tab(title):
+            sf = ScrollFrame(nb, bg)
+            nb.add(sf, text=title)
+            self.pages.append(sf)
+            f = sf.inner
+            f.columnconfigure(1, minsize=260)
+            f.columnconfigure(2, weight=1)
+            return f
+
+        def note(f, row, text):
+            if text:
+                n = ttk.Label(f, text=text, style="Sub.TLabel", wraplength=330, justify="left")
+                n.grid(row=row, column=2, sticky="w", padx=(14, 0), pady=4)
+                f.master.master.notes.append(n)
+
+        def combo(f, label, values, key, default, hint=None, editable=False):
+            r = f.grid_size()[1]
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            v = tk.StringVar(value=prefs.get(key, default) if editable else pick(list(values), prefs.get(key), default))
+            ttk.Combobox(f, textvariable=v, values=list(values), state="normal" if editable else "readonly").grid(row=r, column=1, sticky="ew", pady=4)
+            note(f, r, hint)
             return v
 
-        self.renderer = combo(0, 0, "Renderer", RENDERERS, "renderer", "WebGPU (recommended)")
-        self.threads = combo(1, 0, "Threading", THREADS, "threads", "Cooperative (no special hosting)")
-        self.opt = combo(2, 0, "Optimisation", OPTS, "opt", "Balanced (-O2)")
-        self.lifter = combo(13, 0, "Recompiler", LIFTERS, "lifter", "Python (original)")
-        self.quality = combo(14, 0, "Graphics (Unreal)", QUALITY, "quality", "Game's own setting")
-        ttk.Label(s, text="Resolution").grid(row=0, column=2, sticky="w")
-        self.res = tk.StringVar(value=prefs.get("res", "1280x720"))
-        ttk.Combobox(s, textvariable=self.res, values=RESOLUTIONS, width=14).grid(row=0, column=3, sticky="w", padx=6)
-        ttk.Label(s, text="Guest memory (MB)").grid(row=1, column=2, sticky="w")
-        self.mem = tk.IntVar(value=prefs.get("mem", 3072))
-        ttk.Spinbox(s, from_=1024, to=3584, increment=256, textvariable=self.mem, width=12).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Label(s, text="Memory limit when run (GB)").grid(row=3, column=2, sticky="w", pady=(8, 0))
-        self.mem_limit = tk.DoubleVar(value=prefs.get("mem_limit", 8))
-        ttk.Spinbox(s, from_=4, to=32, increment=1, textvariable=self.mem_limit, width=12).grid(row=3, column=3, sticky="w", padx=6, pady=(8, 0))
-        ttk.Label(s, text="Largest file (MB)").grid(row=2, column=2, sticky="w")
-        self.part = tk.IntVar(value=prefs.get("part", 16))
-        ttk.Spinbox(s, from_=4, to=24, increment=4, textvariable=self.part, width=12).grid(row=2, column=3, sticky="w", padx=6)
-        checks = ttk.Frame(s)
-        checks.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.game_dlls = tk.BooleanVar(value=prefs.get("game_dlls", True))
-        self.sys_dlls = tk.BooleanVar(value=prefs.get("sys_dlls", True))
-        self.native = tk.BooleanVar(value=prefs.get("native", False))
-        self.compress = tk.BooleanVar(value=prefs.get("compress", False))
-        self.wasm_opt = tk.BooleanVar(value=prefs.get("wasm_opt", False))
-        self.show_fps = tk.BooleanVar(value=prefs.get("show_fps", False))
-        self.async_shaders = tk.BooleanVar(value=prefs.get("async_shaders", True))
-        self.debug_panel = tk.BooleanVar(value=prefs.get("debug_panel", True))
-        self.single = tk.BooleanVar(value=prefs.get("single", False))
-        ttk.Checkbutton(checks, text="Recompile the game's own DLLs", variable=self.game_dlls).pack(side="left")
-        ttk.Checkbutton(checks, text="Recompile Microsoft runtime DLLs", variable=self.sys_dlls).pack(side="left", padx=14)
-        ttk.Checkbutton(checks, text="Also build a native test .exe (needs Visual Studio)", variable=self.native).pack(side="left")
-        ttk.Checkbutton(s, text="Compress game files (smaller download)", variable=self.compress).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(s, text="Shrink code with Binaryen (10% smaller, needs lots of RAM)", variable=self.wasm_opt).grid(
-            row=4, column=2, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(s, text="Also make a single .html that plays straight from disk (no server; cooperative threads only)",
-                        variable=self.single).grid(row=12, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(s, text="Show an FPS counter (Ctrl+Shift+F toggles it in game)", variable=self.show_fps).grid(
-            row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(s, text="Compile shaders in the background (shorter freezes when new effects first appear)",
-                        variable=self.async_shaders).grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(s, text="UEWASM debug toggle (\\ or Insert opens the debug panel in game)",
-                        variable=self.debug_panel).grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(s, text="Build priority").grid(row=9, column=0, sticky="w", pady=(6, 0))
-        self.priority = tk.StringVar(value=prefs.get("priority") if prefs.get("priority") in PRIORITIES else next(iter(PRIORITIES)))
-        ttk.Combobox(s, textvariable=self.priority, values=list(PRIORITIES), state="readonly", width=34).grid(row=9, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
-        ttk.Label(s, text="Same result either way; Low uses far less CPU and memory", style="Sub.TLabel").grid(row=9, column=2, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(s, text="Online services").grid(row=10, column=0, sticky="w", pady=(6, 0))
-        self.backend = tk.StringVar(value=prefs.get("backend") if prefs.get("backend") in BACKENDS else next(iter(BACKENDS)))
-        ttk.Combobox(s, textvariable=self.backend, values=list(BACKENDS), state="readonly", width=34).grid(row=10, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
-        self.placeholders = tk.BooleanVar(value=prefs.get("placeholders", False))
-        ttk.Checkbutton(s, text="Stand-in files for what the servers would send (images, data)", variable=self.placeholders).grid(
-            row=10, column=2, columnspan=2, sticky="w", pady=(6, 0))
-        aes = ttk.Frame(s)
-        aes.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        aes.columnconfigure(1, weight=1)
-        self.aes_on = tk.BooleanVar(value=prefs.get("aes_on", False))
+        def spin(f, label, key, default, lo, hi, step, hint=None, kind=tk.IntVar):
+            r = f.grid_size()[1]
+            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            v = kind(value=prefs.get(key, default))
+            ttk.Spinbox(f, from_=lo, to=hi, increment=step, textvariable=v, width=12).grid(row=r, column=1, sticky="w", pady=4)
+            note(f, r, hint)
+            return v
+
+        def check(f, text, key, default, hint=None, command=None):
+            r = f.grid_size()[1]
+            v = tk.BooleanVar(value=prefs.get(key, default))
+            ttk.Checkbutton(f, text=text, variable=v, command=command).grid(row=r, column=0, columnspan=2, sticky="w", pady=4)
+            note(f, r, hint)
+            return v
+
+        b = tab("Build")
+        self.lifter = combo(b, "Recompiler", LIFTERS, "lifter", "Python (original)", "Rust translates a big game in seconds instead of minutes")
+        self.opt = combo(b, "Optimisation", OPTS, "opt", "Balanced (-O2)")
+        self.priority = combo(b, "Build priority", PRIORITIES, "priority", next(iter(PRIORITIES)), "Same result either way; Low uses far less CPU and memory")
+        self.game_dlls = check(b, "Recompile the game's own DLLs", "game_dlls", True)
+        self.sys_dlls = check(b, "Recompile Microsoft runtime DLLs", "sys_dlls", True)
+        self.wasm_opt = check(b, "Shrink code with Binaryen", "wasm_opt", False, "About 10% smaller; needs a lot of memory while building")
+        self.native = check(b, "Also build a native test .exe", "native", False, "For checking the translation on Windows; needs Visual Studio's C++ tools")
+
+        p = tab("Graphics & performance")
+        self.renderer = combo(p, "Renderer", RENDERERS, "renderer", "WebGPU (recommended)")
+        self.threads = combo(p, "Threading", THREADS, "threads", "Cooperative (no special hosting)", "Real threads use several CPU cores; the host must allow it (uewasm serve does)")
+        self.quality = combo(p, "Graphics (Unreal)", QUALITY, "quality", "Game's own setting", "Applied at every start; lower runs faster in the browser")
+        self.res = combo(p, "Resolution", RESOLUTIONS, "res", "1280x720", "Type any size, like 1366x768", editable=True)
+        self.mem = spin(p, "Guest memory (MB)", "mem", 3072, 1024, 3584, 256, "Memory the game itself can use")
+        self.mem_limit = spin(p, "Memory limit when run (GB)", "mem_limit", 8, 4, 32, 1, "All the browser tab may use, including downloads and video memory", tk.DoubleVar)
+        self.show_fps = check(p, "Show an FPS counter", "show_fps", False, "Ctrl+Shift+F toggles it in game")
+        self.async_shaders = check(p, "Compile shaders in the background", "async_shaders", True, "Shorter freezes when new effects first appear")
+        self.debug_panel = check(p, "UEWASM debug panel", "debug_panel", True, "\\ or Insert opens it in game")
+
+        f = tab("Game files")
+        self.videos = combo(f, "Videos", VIDEOS, "videos", "Keep original videos", "Smaller videos download faster and play smoother on slow PCs")
+        self.part = spin(f, "Largest file (MB)", "part", 16, 4, 24, 4, "Game data is split into files of at most this size")
+        self.compress = check(f, "Compress game files", "compress", False, "Smaller download")
+        self.single = check(f, "Also make a single .html", "single", False, "Plays straight from disk with no server; cooperative threads only")
+        self.aes_on = check(f, "Decrypt AES encrypted content", "aes_on", False, command=self.aes_changed)
+        r = f.grid_size()[1]
         self.aes_key = tk.StringVar()
-        ttk.Checkbutton(aes, text="Decrypt AES Encrypted content", variable=self.aes_on, command=self.aes_changed).grid(row=0, column=0, sticky="w")
-        self.aes_entry = ttk.Entry(aes, textvariable=self.aes_key, width=70)
-        self.aes_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        self.aes_note = ttk.Label(aes, text="", style="Sub.TLabel")
-        self.aes_note.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.aes_entry = ttk.Entry(f, textvariable=self.aes_key)
+        self.aes_entry.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 2))
+        self.aes_note = ttk.Label(f, text="", style="Sub.TLabel")
+        self.aes_note.grid(row=r + 1, column=0, columnspan=3, sticky="w")
         self.aes_key.trace_add("write", lambda *_: self.aes_changed())
-        ttk.Label(s, text="Videos").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        self.videos = tk.StringVar(value=prefs.get("videos") if prefs.get("videos") in VIDEOS else "Keep original videos")
-        ttk.Combobox(s, textvariable=self.videos, values=list(VIDEOS), state="readonly", width=34).grid(row=5, column=1, sticky="ew", padx=(6, 16), pady=(6, 0))
-        ttk.Label(s, text="Smaller videos download faster and play smoother on slow PCs", style="Sub.TLabel").grid(row=5, column=2, columnspan=2, sticky="w", pady=(6, 0))
+
+        o = tab("Online")
+        self.backend = combo(o, "Online services", BACKENDS, "backend", next(iter(BACKENDS)), "Answers the game's online sign-in without a server")
+        self.placeholders = check(o, "Stand-in files for what the servers would send", "placeholders", False, "Images and data the game would download")
+
+        t = tab("Tools")
+        t.columnconfigure(1, minsize=0, weight=1)
+        t.columnconfigure(2, weight=0)
+        ttk.Label(t, text="Emscripten SDK", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(t, text="Every build needs it. Choose the folder it's installed in (the one with emsdk.bat), or let UEWASM install it.",
+                  style="Sub.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        self.emsdk = tk.StringVar(value=prefs.get("emsdk", ""))
+        ttk.Label(t, text="Folder").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        ttk.Entry(t, textvariable=self.emsdk).grid(row=2, column=1, sticky="ew")
+        ttk.Button(t, text="Browse…", command=lambda: self.browse_emsdk(None)).grid(row=2, column=2, padx=(6, 0))
+        self.ems_install = ttk.Button(t, text="Install…", command=lambda: self.do_install(self.needs.get("emsdk") or self.emsdk_need()))
+        self.ems_install.grid(row=2, column=3, padx=(6, 0))
+        self.ems_status = ttk.Label(t, text="Checking…", style="Sub.TLabel")
+        self.ems_status.grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Separator(t).grid(row=4, column=0, columnspan=4, sticky="ew", pady=10)
+        ttk.Label(t, text="Needed only by some settings", style="Section.TLabel").grid(row=5, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self.tool_rows = {}
+        for i, (key, name, used) in enumerate(TOOLS):
+            r = 6 + i
+            ttk.Label(t, text=name).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=2)
+            lab = ttk.Label(t, text="", style="Sub.TLabel")
+            lab.grid(row=r, column=1, sticky="w", pady=2)
+            btn = ttk.Button(t, text="Install…", command=lambda k=key: self.do_install(self.needs[k]))
+            btn.grid(row=r, column=3, padx=(6, 0), pady=2)
+            btn.grid_remove()
+            self.tool_rows[key] = (lab, btn, used)
+        ttk.Button(t, text="Check again", command=self.check_tools).grid(row=6 + len(TOOLS), column=0, sticky="w", pady=(10, 0))
+        self.emsdk.trace_add("write", lambda *_: self.emsdk_changed())
+        self.emsdk_changed(check=False)
 
         # actions
         a = ttk.Frame(main)
@@ -289,7 +394,7 @@ class App:
         # progress
         p = ttk.LabelFrame(main, text="Progress", padding=10)
         p.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
-        main.rowconfigure(4, weight=1)
+        main.rowconfigure(4, weight=4, minsize=150)
         p.columnconfigure(0, weight=1)
         p.rowconfigure(3, weight=1)
         self.stage = ttk.Label(p, text="Ready")
@@ -304,7 +409,7 @@ class App:
         logf.grid(row=3, column=0, columnspan=2, sticky="nsew")
         logf.columnconfigure(0, weight=1)
         logf.rowconfigure(0, weight=1)
-        self.log = tk.Text(logf, height=10, wrap="word", font=("Consolas", 9), state="disabled", relief="flat", background="#fafafa")
+        self.log = tk.Text(logf, height=6, wrap="word", font=("Consolas", 9), state="disabled", relief="flat", background="#fafafa")
         self.log.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(logf, command=self.log.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -313,10 +418,18 @@ class App:
         self.toolchain = ttk.Label(main, text="", style="Sub.TLabel")
         self.toolchain.grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.aes_changed()
+        root.after(50, self.size_tabs)
         root.after(100, self.check_tools)
         root.after(100, self.describe)
         root.after(100, self.pump)
         root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def size_tabs(self):
+        """tabs as tall as the tallest page needs, up to a point; shorter windows scroll the page"""
+        self.root.update_idletasks()
+        h = min(max(sf.inner.winfo_reqheight() for sf in self.pages), 420)
+        for sf in self.pages:
+            sf.canvas.configure(height=h)
 
     # ---- inputs ----
 
@@ -355,21 +468,186 @@ class App:
         if not self.out.get():
             self.out.set(str(Path.home() / "UEWASM Builds" / exe.stem))
 
+    # ---- tools ----
+
+    def emsdk_changed(self, check=True):
+        v = self.emsdk.get().strip().strip('"')
+        if v:
+            os.environ["UEWASM_EMSDK"] = v
+        else:
+            os.environ.pop("UEWASM_EMSDK", None)
+        if check:
+            if getattr(self, "_ems_timer", None):
+                self.root.after_cancel(self._ems_timer)
+            self._ems_timer = self.root.after(500, self.check_tools)
+
     def check_tools(self):
         def run():
-            parts = []
             try:
-                from .recomp.build import emsdk_env
-                emsdk_env()
-                parts.append("Emscripten: found")
-            except Exception:
-                parts.append("Emscripten: NOT FOUND (install emsdk to %USERPROFILE%\\emsdk or set EMSDK)")
-            try:
-                import iced_x86  # noqa: F401
-            except ImportError:
-                parts.append("iced-x86 missing")
-            self.q.put(("tools", " · ".join(parts)))
+                self.q.put(("tools", deps.status(), {n.key: n for n in deps.missing(ALL_ON)}))
+            except Exception as e:
+                self.q.put(("log", f"tool check failed: {e}"))
         threading.Thread(target=run, daemon=True).start()
+
+    def show_tools(self, st, needs):
+        self.needs = needs
+        if st["emsdk"]:
+            self.ems_status.configure(text=f"Found: {st['emsdk']}", style="Ok.TLabel")
+        else:
+            typed = self.emsdk.get().strip()
+            self.ems_status.configure(style="Bad.TLabel", text=("No Emscripten SDK in that folder. " if typed else "Not found. ")
+                                      + "Choose the folder it's in, or press Install.")
+        found = {"binaryen": st["binaryen"], "msvc": st["msvc"], "rust": st["rust"], "ffmpeg": st["ffmpeg"], "crypto": st["crypto"]}
+        for key, (lab, btn, used) in self.tool_rows.items():
+            ok = found[key]
+            lab.configure(text=(f"Found{': ' + ok if isinstance(ok, str) and len(ok) < 70 else ''}" if ok else
+                                "Comes with Emscripten" if key == "binaryen" and not st["emsdk"] else f"Not found (needed by: {used})"),
+                          style="Ok.TLabel" if ok else "Sub.TLabel")
+            if not ok and key in needs and needs[key].install:
+                btn.grid()
+            else:
+                btn.grid_remove()
+        parts = ["Emscripten: found" if st["emsdk"] else "Emscripten: NOT FOUND (see the Tools tab)"]
+        try:
+            import iced_x86  # noqa: F401
+        except ImportError:
+            parts.append("iced-x86 missing")
+        self.toolchain["text"] = " · ".join(parts)
+
+    def emsdk_need(self):
+        return deps.Need("emsdk", "Emscripten", "", "", install=("Install Emscripten for me", None), browse=True)
+
+    def browse_emsdk(self, then):
+        """True when a usable SDK was chosen; False otherwise (or when an install was started instead)"""
+        d = filedialog.askdirectory(title="Emscripten SDK folder (the one with emsdk.bat)", initialdir=self.emsdk.get() or str(Path.home()))
+        if not d:
+            return False
+        r = deps.emsdk_at(d)
+        if r:
+            self.emsdk.set(str(r))
+            return True
+        if deps.emsdk_partial(d):
+            if messagebox.askyesno(TITLE, f"{d} has emsdk, but its compilers were never installed.\n\nInstall them now (about 2.5 GB)?"):
+                self.run_job("Emscripten", lambda log, cancel: deps.install_emsdk(d, log, cancel), "emsdk", then)
+            return False
+        messagebox.showerror(TITLE, f"There's no Emscripten SDK in {d}.\n\nChoose the emsdk folder (it holds emsdk.bat and an 'upstream' folder).")
+        return False
+
+    def ask_emsdk_dest(self):
+        dest = deps.default_emsdk_dir()
+        c = messagebox.askyesnocancel(TITLE, f"Install Emscripten into {dest}?\n\nIt takes about 2.5 GB of disk.\n\n"
+                                             "Yes: install there.   No: choose another folder.")
+        if c is None:
+            return None
+        if c:
+            return dest
+        d = filedialog.askdirectory(title="Where to install Emscripten")
+        return Path(d) if d else None
+
+    def do_install(self, need, then=None):
+        if self.busy():
+            return
+        if need.key == "emsdk":
+            dest = self.ask_emsdk_dest()
+            if not dest:
+                return
+            fn = lambda log, cancel: deps.install_emsdk(dest, log, cancel)
+        else:
+            fn = need.install[1]
+        self.run_job(need.name, fn, need.key, then)
+
+    def run_job(self, name, fn, key, then):
+        self.cancel.clear()
+        self.clear_log()
+        self.est = None
+        self.t0 = time.time()
+        self.start_btn["state"] = "disabled"
+        self.cancel_btn["state"] = "normal"
+        self.stage["text"] = f"Installing {name}…"
+        self.bar["value"] = 0
+        self.sbar["mode"] = "indeterminate"
+        self.sbar.start(15)
+
+        def work():
+            try:
+                r = fn(lambda m: self.q.put(("log", str(m))), self.cancel)
+                self.q.put(("installed", key, name, str(r) if r else "", then))
+            except InterruptedError:
+                self.q.put(("cancelled",))
+            except Exception as e:
+                self.q.put(("failed", f"Installing {name} failed: {e}"))
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def busy(self):
+        return bool(self.worker and self.worker.is_alive())
+
+    def ask_need(self, n):
+        """what to do about a missing tool: 'install', 'browse', 'off', or None to cancel"""
+        d = tk.Toplevel(self.root)
+        d.title(TITLE)
+        d.transient(self.root)
+        d.resizable(False, False)
+        f = ttk.Frame(d, padding=18)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text=n.title, style="Section.TLabel").pack(anchor="w")
+        ttk.Label(f, text=n.text, wraplength=480, justify="left").pack(anchor="w", pady=(8, 16))
+        res = {"v": None}
+
+        def choose(v):
+            res["v"] = v
+            d.destroy()
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        first = None
+        for label, v in ((n.install and n.install[0], "install"), (n.browse and "Choose its folder…", "browse"), (n.off, "off")):
+            if label:
+                btn = ttk.Button(row, text=label, style="Dlg.TButton", command=lambda v=v: choose(v))
+                btn.pack(side="left", padx=(0, 6))
+                first = first or btn
+        ttk.Button(row, text="Cancel", style="Dlg.TButton", command=lambda: choose(None)).pack(side="right")
+        if n.url:
+            ttk.Button(row, text="More info", style="Dlg.TButton", command=lambda: webbrowser.open(n.url)).pack(side="right", padx=6)
+        d.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        d.bind("<Escape>", lambda _: choose(None))
+        d.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - d.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - d.winfo_height()) // 3
+        d.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        if first:
+            first.focus_set()
+        d.grab_set()
+        d.wait_window()
+        return res["v"]
+
+    def turn_off(self, key):
+        if key == "binaryen":
+            self.wasm_opt.set(False)
+        elif key == "msvc":
+            self.native.set(False)
+        elif key == "rust":
+            self.lifter.set("Python (original)")
+        elif key == "ffmpeg":
+            self.videos.set("Keep original videos")
+        elif key == "crypto":
+            self.aes_on.set(False)
+            self.aes_changed()
+
+    def resolve_needs(self):
+        """stop before building when the chosen settings need a tool this PC lacks; True to go ahead"""
+        o = dict(native=self.native.get(), lifter=LIFTERS[self.lifter.get()], wasm_opt=self.wasm_opt.get(),
+                 videos=VIDEOS[self.videos.get()][0] != 0, aes=self.aes_on.get())
+        for n in deps.missing(o):
+            c = self.ask_need(n)
+            if c is None:
+                return False
+            if c == "install":
+                self.do_install(n, then=self.start)
+                return False
+            if c == "browse":
+                return self.browse_emsdk(self.start) and self.resolve_needs()
+            self.turn_off(n.key)
+        return True
 
     # ---- AES key ----
 
@@ -381,14 +659,14 @@ class App:
         text = self.aes_key.get().strip()
         ok = not on or parse_key(text) is not None
         if not on:
-            self.aes_note["text"] = ""
+            self.aes_note["text"] = "The game's AES key goes in the box above"
         elif not text:
             self.aes_note["text"] = "Enter the game's AES key (64 hex digits, 0x optional) to build"
         elif not ok:
             self.aes_note["text"] = "That isn't a 256-bit AES key (64 hex digits or base64)"
         else:
             self.aes_note["text"] = "Checked against the game's encrypted paks when the build starts"
-        if not (self.worker and self.worker.is_alive()):
+        if not self.busy():
             self.start_btn["state"] = "normal" if ok else "disabled"
 
     def ask_aes_key(self, why):
@@ -411,9 +689,12 @@ class App:
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
                                     "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
                                     "backend": self.backend.get(), "placeholders": self.placeholders.get(), "aes_on": self.aes_on.get(),
-                                    "mem_limit": self.mem_limit.get(), "single": self.single.get(), "lifter": self.lifter.get(), "quality": self.quality.get()})
+                                    "mem_limit": self.mem_limit.get(), "single": self.single.get(), "lifter": self.lifter.get(), "quality": self.quality.get(),
+                                    "emsdk": self.emsdk.get().strip()})
 
     def start(self):
+        if self.busy():
+            return
         exe = self.find_exe()
         if not exe:
             messagebox.showerror(TITLE, "Choose the game's install folder or .exe first.")
@@ -431,6 +712,8 @@ class App:
         from .recomp.upak import parse_key
         aes = parse_key(self.aes_key.get()) if self.aes_on.get() else None
         if self.aes_on.get() and not aes:
+            return
+        if not self.resolve_needs():
             return
         self.save_prefs()
         opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=(w, h), mem=int(self.mem.get()),
@@ -511,7 +794,16 @@ class App:
                 if kind == "log":
                     self.append(m[1])
                 elif kind == "tools":
-                    self.toolchain["text"] = m[1]
+                    self.show_tools(m[1], m[2])
+                elif kind == "installed":
+                    _, key, name, where, then = m
+                    self.finish(f"{name} installed", 1000)
+                    self.append(f"\n{name} installed" + (f" in {where}" if where else ""))
+                    if key == "emsdk" and where:
+                        self.emsdk.set(where)
+                    self.check_tools()
+                    if then:
+                        self.root.after(800, then)
                 elif kind == "progress":
                     _, stage, done, total = m
                     if self.est:
@@ -609,6 +901,7 @@ class App:
         if self.worker and self.worker.is_alive() and not messagebox.askyesno(TITLE, "A build is running. Stop it and quit?"):
             return
         self.cancel.set()
+        self.save_prefs()
         if self.server:
             self.server.shutdown()
         self.root.destroy()

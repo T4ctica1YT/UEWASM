@@ -144,7 +144,11 @@ class Program:
 
     def discover(self):
         pe = self.pe
+        # a chained unwind entry (code the compiler moved out of its function: shrink-wrapped prologues, cold paths) is
+        # lifted inside the function it belongs to, not as a function of its own reached by tail calls
         for b, e in pe.functions:
+            if pe.family.get(b, b) != b:
+                continue
             self.roots.add(self.base + b)
             self.ends[self.base + b] = self.base + e
         self.roots.add(self.base + pe.entry_rva)
@@ -337,7 +341,8 @@ class Program:
 
     def own(self, r, t, end):
         """t is lifted inside root r (else it is reached by a jump to another root)"""
-        return r <= t < end and (t == r or t not in self.roots)
+        inside = r <= t < end or (self.fam(t) is not None and self.fam(t) == self.fam(r))
+        return inside and (t == r or t not in self.roots)
 
     def scan(self, r):
         end = self.region_end(r)

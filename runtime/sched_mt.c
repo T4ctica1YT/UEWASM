@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include <pthread.h>
 #include <emscripten/threading.h>
 
@@ -37,8 +38,18 @@ static uint64_t report_last;
 
 /* the global lock: a plain mutex taken once per host thread, with a depth count (system calls nest through callbacks).
    Green threads on a carrier switch only while it is held, each keeping its own depth */
-static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t big_cv = PTHREAD_COND_INITIALIZER;
+/* a futex lock (0 free, 1 held, 2 held with sleepers): Emscripten's general mutex cost as much as the system calls it
+   guarded. Carriers waiting for work sleep on wake_seq, which every release that may make work bumps */
+static volatile int big_lock;
+static volatile uint32_t wake_seq;
+static int bl_try(void) { int z = 0; return __atomic_compare_exchange_n(&big_lock, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); }
+static void bl_lock(void)
+{
+    if (bl_try()) return;
+    while (__atomic_exchange_n(&big_lock, 2, __ATOMIC_ACQUIRE)) emscripten_futex_wait(&big_lock, 2, INFINITY);
+}
+static void bl_unlock(void) { if (__atomic_exchange_n(&big_lock, 0, __ATOMIC_RELEASE) == 2) emscripten_futex_wake(&big_lock, 1); }
+static void bl_broadcast(void) { __atomic_fetch_add(&wake_seq, 1, __ATOMIC_SEQ_CST); emscripten_futex_wake(&wake_seq, 0x7FFFFFFF); }
 static __thread int lock_depth;
 static int idle_n;                /* carriers waiting for work: only then do releases wake anyone */
 extern volatile uint32_t uew_wake_word;
@@ -56,21 +67,24 @@ static uint64_t lock_wait_ns[MAX_CARRIERS];   /* time each carrier spent waiting
 void rt_lock(void)
 {
     if (lock_depth++) return;
-    if (!pthread_mutex_trylock(&big_lock)) {
-        if (emscripten_is_main_runtime_thread()) emscripten_main_thread_process_queued_calls();
+    if (bl_try()) {
+        /* calls other cores sent to the page's thread; draining the queue costs about as much as the lock itself, and
+           spinning game code takes the lock thousands of times a frame, so one time in 16 is still prompt */
+        static unsigned n;
+        if (emscripten_is_main_runtime_thread() && !(++n & 15)) emscripten_main_thread_process_queued_calls();
         return;
     }
     uint64_t t0 = host_ticks_ns();
     if (emscripten_is_main_runtime_thread())
-        while (pthread_mutex_trylock(&big_lock)) emscripten_main_thread_process_queued_calls();
-    else pthread_mutex_lock(&big_lock);
+        while (!bl_try()) emscripten_main_thread_process_queued_calls();
+    else bl_lock();
     if (K) lock_wait_ns[K->id] += host_ticks_ns() - t0;
 }
-void rt_unlock(void) { if (--lock_depth == 0) pthread_mutex_unlock(&big_lock); }
+void rt_unlock(void) { if (--lock_depth == 0) bl_unlock(); }
 int rt_unlock_all(void)
 {
     int d = lock_depth;
-    if (d) { lock_depth = 0; pthread_mutex_unlock(&big_lock); }
+    if (d) { lock_depth = 0; bl_unlock(); }
     return d;
 }
 void rt_relock(int d) { if (d) { rt_lock(); lock_depth = d; } }
@@ -79,7 +93,7 @@ void sched_notify(void)
     if (!__atomic_load_n(&idle_n, __ATOMIC_RELAXED)) return;
     __atomic_fetch_add(&uew_wake_word, 1, __ATOMIC_SEQ_CST);
     emscripten_futex_wake((void*)&uew_wake_word, 0x7FFFFFFF);
-    pthread_cond_broadcast(&big_cv);
+    bl_broadcast();
 }
 
 
@@ -88,12 +102,10 @@ static void lock_wait(uint64_t ns)
 {
     if (ns > 4000000ull) ns = 4000000ull;
     if (ns < 50000ull) ns = 50000ull;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t t = (uint64_t)ts.tv_nsec + ns;
-    ts.tv_sec += (time_t)(t / 1000000000ull);
-    ts.tv_nsec = (long)(t % 1000000000ull);
-    pthread_cond_timedwait(&big_cv, &big_lock, &ts);   /* the mutex is held once whatever the depth */
+    uint32_t seq = __atomic_load_n(&wake_seq, __ATOMIC_SEQ_CST);
+    bl_unlock();                                       /* the lock is held once whatever the depth */
+    emscripten_futex_wait(&wake_seq, seq, ns / 1e6);
+    bl_lock();
 }
 /* runs f with the lock fully released, then takes it back at the same depth */
 static void unlocked_call(void (*f)(uint64_t), uint64_t arg)
@@ -101,12 +113,13 @@ static void unlocked_call(void (*f)(uint64_t), uint64_t arg)
     if (!lock_depth) { f(arg); return; }
     int d = lock_depth;
     lock_depth = 0;
-    pthread_mutex_unlock(&big_lock);
+    bl_unlock();
     f(arg);
-    pthread_mutex_lock(&big_lock);
+    if (emscripten_is_main_runtime_thread()) while (!bl_try()) emscripten_main_thread_process_queued_calls();
+    else bl_lock();
     lock_depth = d;
 }
-static void wake_carriers(void) { pthread_cond_broadcast(&big_cv); }
+static void wake_carriers(void) { bl_broadcast(); }
 
 int sched_thread_count(void) { return total_threads; }
 
@@ -124,7 +137,7 @@ void uew_threads(void)
 {
     /* called from the page's watchdog timer: waiting for the lock there would stop the page's event loop, which the
        holder may need, so a busy lock means a best-effort read without it */
-    int locked = !lock_depth && pthread_mutex_trylock(&big_lock) == 0;
+    int locked = !lock_depth && bl_try();
     if (locked) lock_depth = 1;
     uint64_t now = host_ticks_ns();
     for (GThread* t = all_threads; t; t = t->all_next) {
@@ -143,8 +156,9 @@ void uew_threads(void)
         host_log("[thr] %u c%d %-24s %s%s, %.1f s, start=%llx ret=%llx", (unsigned)t->tid, t->carrier, t->name, st, what,
                  t->wait_n ? (now - t->wait_since) / 1e9 : 0.0, (unsigned long long)t->start, (unsigned long long)t->wait_ret);
     }
-    if (locked) { lock_depth = 0; pthread_mutex_unlock(&big_lock); }
+    if (locked) { lock_depth = 0; bl_unlock(); }
 }
+int sched_on_page(void) { return K && K->id == 0; }
 unsigned sched_current_id(void) { return (unsigned)K->current->tid; }
 int sched_is_main(void) { return K->current == main_thread; }
 GThread* sched_current(void) { return K->current; }
@@ -376,10 +390,14 @@ void sched_name_check(SchedCheck check, const char* name, void (*desc)(GThread* 
     for (int i = 0; i < ncheck_names; i++) if (check_names[i].fn == check) return;
     if (ncheck_names < 16) { check_names[ncheck_names].fn = check; check_names[ncheck_names].name = name; check_names[ncheck_names].desc = desc; ncheck_names++; }
 }
-static int runnable(GThread* t, uint64_t now)
+/* the clock is read only for a thread that sleeps or waits with a timeout: spinning yields (SwitchToThread) call this
+   all the time, and a read costs a call out to the browser */
+static int runnable(GThread* t, uint64_t* now)
 {
-    if (t->done || t->suspended || !t->ctx || t->wake_at > now) return 0;
-    return !t->check || now >= t->block_until || t->check(t);
+    if (t->done || t->suspended || !t->ctx) return 0;
+    if (t->wake_at || t->check) { if (*now == UINT64_MAX) *now = host_ticks_ns(); }
+    if (t->wake_at > *now) return 0;
+    return !t->check || *now >= t->block_until || t->check(t);
 }
 static void reap(void)
 {
@@ -401,16 +419,16 @@ static GThread* pick(void)
 {
     Carrier* k = K;
     if (k->ndead > 0) reap();
-    uint64_t now = host_ticks_ns();
+    uint64_t now = UINT64_MAX;
     GThread* cur = k->current;
     if (k->nframe_waiters)
-        for (GThread* t = k->threads; t; t = t->next) if (t->frame_wait && t != cur && t != &k->base && runnable(t, now)) return t;
+        for (GThread* t = k->threads; t; t = t->next) if (t->frame_wait && t != cur && t != &k->base && runnable(t, &now)) return t;
     if (k->nprio)
-        for (GThread* t = k->threads; t; t = t->next) if (t->prio && t != cur && runnable(t, now)) return t;
+        for (GThread* t = k->threads; t; t = t->next) if (t->prio && t != cur && runnable(t, &now)) return t;
     /* the carrier's base context is only a place to wait (carrier 0's base is the guest main thread, a real one) */
     int base_runs = k->id == 0 && base_is_guest;
     if (cur->done || (cur == &k->base && !base_runs)) {
-        for (GThread* t = k->threads; t; t = t->next) if (t != cur && (t != &k->base || base_runs) && runnable(t, now)) return t;
+        for (GThread* t = k->threads; t; t = t->next) if (t != cur && (t != &k->base || base_runs) && runnable(t, &now)) return t;
         return NULL;
     }
     GThread* t = cur;
@@ -418,7 +436,7 @@ static GThread* pick(void)
         t = t->next ? t->next : k->threads;
         if (t == cur) break;
         if (t == &k->base && !base_runs) continue;
-        if (runnable(t, now)) return t;
+        if (runnable(t, &now)) return t;
     }
     return NULL;
 }

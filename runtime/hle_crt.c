@@ -1,4 +1,5 @@
 #include <string.h>
+#include "fastmem.h"
 #include "host.h"
 
 #include <ctype.h>
@@ -301,17 +302,17 @@ HLE(memcpy)
     RET(A1);
 }
 HLE(memmove) { if (mt_file && A3) mt_log(c); if (A3) memmove(G2H(A1), G2H(A2), (size_t)A3); RET(A1); }
-HLE(memcmp) { RET((int64_t)memcmp(G2H(A1), G2H(A2), (size_t)A3)); }
-HLE(memchr) { uint8_t* p = memchr(G2H(A1), (int)(uint8_t)A2, (size_t)A3); RET(p ? (uint64_t)(p - MEM) : 0); }
+HLE(memcmp) { RET((int64_t)fast_memcmp(G2H(A1), G2H(A2), (size_t)A3)); }
+HLE(memchr) { uint8_t* p = memchr(G2H(A1), (int)(uint8_t)A2, (size_t)A3); RET(p ? (uint64_t)(uint32_t)(p - MEM) : 0); }
 HLE(strlen) { RET(strlen(GSTR(A1))); }
 HLE(strcmp) { RET((int64_t)strcmp(GSTR(A1), GSTR(A2))); }
 HLE(strncmp) { RET((int64_t)strncmp(GSTR(A1), GSTR(A2), (size_t)A3)); }
 HLE(strcpy) { strcpy((char*)G2H(A1), GSTR(A2)); RET(A1); }
 HLE(strncpy) { strncpy((char*)G2H(A1), GSTR(A2), (size_t)A3); RET(A1); }
 HLE(strcat) { strcat((char*)G2H(A1), GSTR(A2)); RET(A1); }
-HLE(strchr) { const char* p = strchr(GSTR(A1), (int)(char)A2); RET(p ? (uint64_t)((uint8_t*)p - MEM) : 0); }
-HLE(strrchr) { const char* p = strrchr(GSTR(A1), (int)(char)A2); RET(p ? (uint64_t)((uint8_t*)p - MEM) : 0); }
-HLE(strstr) { const char* p = strstr(GSTR(A1), GSTR(A2)); RET(p ? (uint64_t)((uint8_t*)p - MEM) : 0); }
+HLE(strchr) { const char* p = strchr(GSTR(A1), (int)(char)A2); RET(p ? (uint64_t)(uint32_t)((uint8_t*)p - MEM) : 0); }
+HLE(strrchr) { const char* p = strrchr(GSTR(A1), (int)(char)A2); RET(p ? (uint64_t)(uint32_t)((uint8_t*)p - MEM) : 0); }
+HLE(strstr) { const char* p = strstr(GSTR(A1), GSTR(A2)); RET(p ? (uint64_t)(uint32_t)((uint8_t*)p - MEM) : 0); }
 HLE(wcslen) { uint64_t n = 0; while (LD16(A1 + 2 * n)) n++; RET(n); }
 HLE(atoi) { RET((int64_t)atoi(GSTR(A1))); }
 HLE(strtol) { char* e; long long v = strtoll(GSTR(A1), &e, (int)A3); if (A2) ST64(A2, A1 + (uint64_t)(e - GSTR(A1))); RET(v); }

@@ -8,6 +8,8 @@
 #include <string.h>
 #include <math.h>
 #include <strings.h>
+#include "fastmem.h"
+#define memcmp fast_memcmp
 
 int uewg_init(int w, int h, void* ring, int ring_size);
 int uewg_max_dynamic_ubo(void);
@@ -209,6 +211,7 @@ typedef struct WTex {
     uint32_t cb_serial, cb_version, cb_first, cb_size, cb_off;
     uint8_t* shadow;        /* last uploaded contents of a big CPU-written buffer: only changed bytes go up again */
     int gpu_written;        /* bound as a UAV or cleared since that upload: the shadow no longer matches the GPU copy */
+    int8_t f32_color;       /* a 32-bit float colour format (1 yes, 2 no, 0 not worked out yet): asked for every draw */
 } WTex;
 
 enum { WV_MAX = 6 };
@@ -1831,7 +1834,8 @@ static void depth_mask(GpuCtx* c, int stage, uint32_t m[8])
         if (w && w->depth_aspect && v->res && v->res->type != RES_BUFFER) m[i >> 5] |= 1u << (i & 31);
         /* an integer view of a 32-bit float texture (R32_TYPELESS read as R32_UINT): the shader declares it f32 */
         WTex* t = v && v->res && v->res->type != RES_BUFFER ? T(v->res) : NULL;
-        if (t && t->fmt.name && !(t->fmt.flags & FF_DEPTH) && strstr(t->fmt.name, "32float") && ws && ws->refl_ok && ws->refl.srv[i].ret && !ws->refl.srv[i].compare)
+        if (t && !t->f32_color) t->f32_color = t->fmt.name && !(t->fmt.flags & FF_DEPTH) && strstr(t->fmt.name, "32float") ? 1 : 2;
+        if (t && t->f32_color == 1 && ws && ws->refl_ok && ws->refl.srv[i].ret && !ws->refl.srv[i].compare)
             m[4 + (i >> 5)] |= 1u << (i & 31);
     }
 }

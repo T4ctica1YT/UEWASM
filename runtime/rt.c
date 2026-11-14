@@ -405,7 +405,8 @@ static void nolock_init(void)
         "GetSystemTimePreciseAsFileTime", "GetTickCount", "GetTickCount64", "GetLastError", "SetLastError",
         "GetCurrentProcessorNumber", "GetCurrentProcessorNumberEx", "EnterCriticalSection", "LeaveCriticalSection",
         "TryEnterCriticalSection", "SwitchToThread", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "AcquireSRWLockShared",
-        "ReleaseSRWLockShared", "TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared" };
+        "ReleaseSRWLockShared", "TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared", "timeGetTime", "QueryUnbiasedInterruptTime",
+        "GetSystemMetrics", "IsIconic", "GetForegroundWindow", "GetActiveWindow", "GetFocus", "GetDesktopWindow" };
     uint8_t* m = calloc(rt_thunk_count + 1, 1);
     for (size_t k = 0; k < rt_thunk_count; k++) {
         if (!rt_thunks[k].fn) continue;
@@ -864,6 +865,24 @@ void rt_idiv64(CPU* c, uint64_t s) { if (!s) { DIV_ERR(); return; } __int128 n =
 /* a locked one already holds its address's lock (lifted code takes it around the call) */
 void rt_cmpxchg16b(CPU* c, Flags* f, uint64_t a)
 {
+#ifdef UEW_THREADS
+    /* other cores update either half with 8-byte locked instructions, which use the hardware's atomics and not the
+       stripe lock this one holds: the low half changes only by a real compare-exchange, so their updates aren't lost */
+    if (!((uint32_t)a & 7)) {
+        uint64_t* p = (uint64_t*)(MEMB + (uint32_t)a);
+        uint64_t hi = __atomic_load_n(p + 1, __ATOMIC_SEQ_CST), lo = R(0);
+        if (hi == R(2) && __atomic_compare_exchange_n(p, &lo, R(3), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            __atomic_store_n(p + 1, R(1), __ATOMIC_SEQ_CST);
+            rt_setzf(f, 1);
+        } else {
+            if (hi != R(2)) lo = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+            R(0) = lo;
+            R(2) = hi;
+            rt_setzf(f, 0);
+        }
+        return;
+    }
+#endif
     uint64_t lo = LD64(a), hi = LD64(a + 8);
     if (lo == R(0) && hi == R(2)) {
         ST64(a, R(3));

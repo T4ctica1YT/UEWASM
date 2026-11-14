@@ -37,6 +37,24 @@ const UEWG = {
       const kind = m.split("\n")[0].replace(/\[[^\]]*\]/g, "[]").replace(/\d+/g, "N").slice(0, 140);
       g.errKinds.set(kind, (g.errKinds.get(kind) || 0) + 1);
     });
+    // Windows resets a GPU stuck on one batch for ~2 s; the browser then loses the device for good and every draw after
+    // it is dropped (sound and game keep going over a blank screen). Reload once to get a new device; saves flush on pagehide
+    device.lost.then(info => {
+      g.lost = true;
+      console.log(`[webgpu] device lost (${info.reason}): ${info.message}`);
+      const st = typeof document !== "undefined" && document.getElementById("status");
+      let last = 0;
+      try { last = +sessionStorage.getItem("uewGpuReload") || 0; } catch (_) {}
+      if (Date.now() - last > 300000) {
+        try { sessionStorage.setItem("uewGpuReload", Date.now()); } catch (_) {}
+        if (st) st.textContent = "The graphics driver reset. Restarting…";
+        setTimeout(() => location.reload(), 1500);
+      } else if (st) st.textContent = "The graphics driver reset again. Close other GPU-heavy programs, or set the browser to the high-performance GPU, then reload.";
+    });
+    // queue uploads ride along with the next submission; a loading frame can carry hundreds of MB, more than a slow GPU
+    // copies inside the watchdog's window, so they go up in bounded batches
+    g.queuedBytes = 0; g.queueLimit = 32 << 20;
+    g.queued = (n) => { if ((g.queuedBytes += n) > g.queueLimit) { g.queuedBytes = 0; g.queue.submit([]); } };
     g.add = (x) => { if (g.free.length) { const i = g.free.pop(); g.o[i] = x; return i; } g.o.push(x); return g.o.length - 1; };
     g.encoder = () => g.enc || (g.enc = device.createCommandEncoder());
     // background shader compiles: on unless the page asks for ?syncshaders=1 or the build turned them off
@@ -105,7 +123,8 @@ ${P.shaders.get(sh)}`); break; }
     // device for good. Heavy frames (UE's GPU benchmark: hundreds of passes of long shaders) are split into several
     // submissions; an ordinary frame (~50 passes) stays one.
     g.passesInCb = 0;
-    g.passBudget = () => { if (++g.passesInCb > 64 && g.enc) g.flush(0); };
+    g.passLimit = 64;
+    g.passBudget = () => { if (++g.passesInCb > g.passLimit && g.enc) g.flush(0); };
     // only the part of the ring written since the last flush goes up; what is already there stays valid for the frame
     g.ringDone = 0;
     // flushes that do not know the write position (readbacks) read it from the C side: work already recorded may use
@@ -118,7 +137,7 @@ ${P.shaders.get(sh)}`); break; }
       if (used > g.ringDone) g.queue.writeBuffer(g.ring, g.ringDone, HEAPU8, g.ringPtr + g.ringDone, used - g.ringDone);
       g.ringDone = used;
       if (g.enc) { g.queue.submit([g.enc.finish()]); g.enc = null; }
-      g.passesInCb = 0;
+      g.passesInCb = 0; g.queuedBytes = 0;
     };
     g.dummy = (key) => {
       let x = g.dummies.get(key);
@@ -138,6 +157,7 @@ ${P.shaders.get(sh)}`); break; }
     g.emptyLayout = device.createBindGroupLayout({ entries: [] });
     g.zeroVB = () => g.zvb || (g.zvb = device.createBuffer({ size: 65536, usage: GPUBufferUsage.VERTEX }));
     // a bad call is logged and skipped rather than stopping the game
+    g.fail = (what, e) => g.guard(what, () => { throw e; });
     g.guard = (what, fn) => { try { fn(); } catch (e) { g.skip.threw++; g.skip.last = `${what}: ${e.message} @ ${(e.stack || "").split("\n").slice(1, 3).join(" < ")}`; if (g.errors++ < 40) console.log(`[webgpu] ${what}: ${e.message}`); } };
     g.skip = { nopass: 0, nopipe: 0, threw: 0, last: "" };
     g.hitch = { last: 0, tex: 0, texPx: 0, upBytes: 0, sh: 0, pipe: 0, psh: 0, ppipe: 0, rb: 0, bytes: 0, req: 0, fms: 0, logged: 0 };
@@ -368,8 +388,12 @@ ${P.shaders.get(sh)}`); break; }
     };
     const ai = adapter.info || {};
     console.log(`[webgpu] GPU: ${[ai.vendor, ai.architecture, ai.description].filter(x => x).join(" / ") || "not reported"}${ai.isFallbackAdapter ? " (software fallback!)" : ""}; features: ${features.join(" ")}`);
-    if (/intel|integrated/i.test(`${ai.vendor} ${ai.architecture} ${ai.description}`))
+    // integrated GPUs run the same passes several times slower: shorter submissions keep each well inside the watchdog
+    if (/intel|integrated/i.test(`${ai.vendor} ${ai.architecture} ${ai.description}`)) {
+      g.passLimit = 16;
+      g.queueLimit = 8 << 20;
       console.log("[webgpu] this may be the integrated GPU: Windows Settings > System > Display > Graphics, set your browser to High performance");
+    }
     // bit 1: 24-bit depth can be stored as 32-bit float (more precise, and readable by copies)
     return 1 | (g.features.has("depth32float-stencil8") ? 2 : 0);
   },
@@ -481,7 +505,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     const n = Math.min((size + 3) & ~3, b.size - offset);
     if (n > 0) {
       g.queue.writeBuffer(b, offset, HEAPU8, ptr, n);
-      g.stat.write++; g.stat.writeBytes += n;
+      g.stat.write++; g.stat.writeBytes += n; g.queued(n);
       if (g.stat.by) g.stat.by.set(id, [(g.stat.by.get(id) || [0])[0] + n, b.size, offset]);
     }
   },
@@ -525,7 +549,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (/^(bc|etc2|eac|astc)/.test(t.format)) { w = (w + 3) & ~3; h = (h + 3) & ~3; }
     g.stat.texWrite++;
     g.hitch.upBytes += bpr * rows * d;
-    try { g.queue.writeTexture({ texture: t, mipLevel: mip, origin: [x, y, z] }, HEAPU8, { offset: ptr, bytesPerRow: bpr, rowsPerImage: rows }, [w, h, d]); }
+    try { g.queue.writeTexture({ texture: t, mipLevel: mip, origin: [x, y, z] }, HEAPU8, { offset: ptr, bytesPerRow: bpr, rowsPerImage: rows }, [w, h, d]); g.queued(bpr * rows * d); }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] upload " + e.message); }
   },
 
@@ -759,7 +783,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     g.pendClears.push(d);
   },
 
-  uewg_draw: function (p) { Module.uewg.guard("draw", () => {
+  // the hottest call (thousands a frame): an inline try instead of a closure per draw
+  uewg_draw: function (p) { try {
     const g = Module.uewg;
     // a copy or dispatch since the last draw ended the pass: carry on with the same targets
     if (!g.pass && g.lastPass) { g.stat.reopen++; g.openPass(); }
@@ -881,7 +906,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
       }
     }
     g.draws++;
-  }); },
+  } catch (e) { Module.uewg.fail("draw", e); } },
 
   uewg_dispatch: function (p) { Module.uewg.guard("dispatch", () => {
     const g = Module.uewg, I = HEAP32;
