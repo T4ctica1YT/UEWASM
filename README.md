@@ -21,6 +21,9 @@ in Unreal Engine 4 and 5, while plans to add support for Unreal Engine 3 are pla
 is implemented yet.
 <br>
 
+> [AI Use Disclosure]
+> This project was made mostly by AI, but WAS overlooked and corrected by a human.
+
 > [!IMPORTANT]
 > This repository **does not contain any games or built recomplilations, this project is also not affiliated with Epic Games or any Publishers (or other) of games mentioned**.
 > You need your own copy of any game you would like to recompile. Everything this tool creates 
@@ -200,5 +203,4 @@ Edge/Chrome).
 
 - **[NotRexed](https://github.com/notrexed)** - Took too long to make his tool (Rexcomp) / Inspired the making of UEWASM
 
-> [AI Use Disclosure]
-> This project was made mostly by AI, but WAS overlooked and corrected by a human.
+
