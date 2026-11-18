@@ -54,6 +54,7 @@ class Program:
         self.pe = pe
         self.base = base
         self.img = pe.image(base)
+        self.relocset = set(pe.relocs)
         self.text = [s for s in pe.sections if s.executable]
         self.roots = set()
         self.ends = {}
@@ -66,6 +67,11 @@ class Program:
         self.bits = pe.bits
         self.ptr = pe.bits // 8
         self.sj_funcs = self.find_setjmp32() if pe.bits == 32 else set()
+        # 32-bit C++ try/catch: functions to give a host setjmp ({start: frame pointer offset}) and catch continuations
+        self.eh_starts, self.eh_conts = ({}, set())
+        if pe.bits == 32:
+            from . import eh32
+            self.eh_starts, self.eh_conts = eh32.analyze(self.img, base, [(s.rva, s.vsize, s.executable) for s in pe.sections])
 
     def find_setjmp32(self):
         """MSVC's static _setjmp/_setjmp3 (no symbols in a shipped exe): mov edx,[esp+4] then ebp/ebx/edi/esi/esp into the buffer"""
@@ -97,6 +103,117 @@ class Program:
         if i < 0 or not (self._funcs[i][0] <= rva < self._funcs[i][1]):
             return None
         return self.pe.family.get(self._funcs[i][0], self._funcs[i][0])
+
+    def flags_read_first(self, a):
+        """code at a reads the status flags before writing them, along straight-line code (no jumps or calls followed):
+        a call there has to hand the caller's flags over"""
+        written, p = 0, a
+        for _ in range(64):
+            try:
+                ins = self.decode(p)
+            except Exception:
+                return False
+            if ins.code == I.Code.INVALID:
+                return False
+            if ins.rflags_read & 0x3F & ~written:
+                return True
+            written |= ins.rflags_modified
+            if (written & 0x3F) == 0x3F or ins.flow_control != FC.NEXT:
+                return False
+            p = ins.next_ip
+        return False
+
+    def flags_live_after_call(self, a):
+        """after a call returns to a, the callee's flags are read: by the next instructions, or by code the next call
+        hands them to (the CRT's x87 helpers return results in the flags: _CIlog checks its argument that way)"""
+        written, p = 0, a
+        for _ in range(64):
+            try:
+                ins = self.decode(p)
+            except Exception:
+                return False
+            if ins.code == I.Code.INVALID:
+                return False
+            if ins.rflags_read & 0x3F & ~written:
+                return True
+            written |= ins.rflags_modified
+            if (written & 0x3F) == 0x3F:
+                return False
+            if ins.flow_control == FC.CALL:
+                near = ins.op_kind(0) in (OK.NEAR_BRANCH64, OK.NEAR_BRANCH32)
+                t = ins.near_branch_target if near else 0
+                return bool(near and not written & 0x3F and not self.func_start(t) and self.flags_read_first(t))
+            if ins.flow_control != FC.NEXT:
+                return False
+            p = ins.next_ip
+        return False
+
+    def site_args(self, root, lab, labels, out):
+        """bytes pushed for each call through a register or vtable in the block at lab: counted from the end of the
+        function's prologue, the block's start or the last call (rustlift: site_args)"""
+        R, M = I.Register, I.Mnemonic
+        a, n, prev, prologue = lab, 0, None, lab == root
+        for _ in range(4096):
+            try:
+                ins = self.decode(a)
+            except Exception:
+                return
+            if ins.code == I.Code.INVALID:
+                return
+            fc = ins.flow_control
+            if prologue and _prologue_ins(ins, prev):
+                prev = ins
+            else:
+                prologue = False
+                k0 = ins.op0_kind if ins.op_count else None
+                if fc in (FC.CALL, FC.INDIRECT_CALL):
+                    if fc == FC.INDIRECT_CALL and (k0 == OK.REGISTER or (k0 == OK.MEMORY and ins.memory_base != R.NONE)):
+                        out[ins.next_ip] = n
+                    n = 0
+                elif ins.mnemonic == M.PUSH:
+                    n += 4
+                elif ins.mnemonic == M.POP:
+                    n = max(0, n - 4)
+                elif ins.mnemonic in (M.SUB, M.ADD) and k0 == OK.REGISTER and ins.op0_register == R.ESP \
+                        and ins.op1_kind in (OK.IMMEDIATE8TO32, OK.IMMEDIATE32):
+                    v = ins.immediate(1) & 0xFFFFFFFF
+                    n = n + v if ins.mnemonic == M.SUB else max(0, n - v)
+                elif (k0 == OK.REGISTER and ins.op0_register == R.ESP) or ins.mnemonic == M.LEAVE:
+                    n = 0
+            if fc not in (FC.NEXT, FC.CALL, FC.INDIRECT_CALL):
+                return
+            a = ins.next_ip
+            if a in labels:
+                return
+
+    def find_flag_returns(self):
+        """32-bit: every direct call target whose flags are read after it returns (its rets then hand them over), and the
+        bytes pushed for each indirect call (call_args)"""
+        self.call_args = {}
+        for r in sorted(self.blocks):
+            labels = self.blocks[r]
+            for lab in sorted(labels):
+                self.site_args(r, lab, labels, self.call_args)
+        out = set()
+        for labels in self.blocks.values():
+            for lab in labels:
+                a = lab
+                for _ in range(4096):
+                    try:
+                        ins = self.decode(a)
+                    except Exception:
+                        break
+                    if ins.code == I.Code.INVALID:
+                        break
+                    fc = ins.flow_control
+                    if fc == FC.CALL and ins.op_kind(0) in (OK.NEAR_BRANCH64, OK.NEAR_BRANCH32) and self.flags_live_after_call(ins.next_ip):
+                        out.add(ins.near_branch_target)
+                    if fc not in (FC.NEXT, FC.CALL):
+                        break
+                    a = ins.next_ip
+                    if a in labels:
+                        break
+        self.flag_ret = out
 
     def flags_live(self, a):
         """code at a may read the status flags before setting them (so a jump there has to hand them over)"""
@@ -142,6 +259,20 @@ class Program:
             self.cache[a] = ins
         return ins
 
+    def code_table_target(self, site, v):
+        """32-bit images without a function table sometimes keep pointer tables inside .text (the CRT's initializer
+        lists in msvcr90, for one): a relocated pointer there counts when it is aligned and its target follows a ret or
+        padding, as a function start does (jump-table case labels usually don't)"""
+        if self.bits != 32 or site & 3:
+            return False
+        t = v - self.base
+        if t < 3 or t > len(self.img):
+            return False
+        if self.img[t - 1] in (0xCC, 0x90, 0xC3) or self.img[t - 3] == 0xC2:
+            return True
+        # zero alignment padding (msvcrt): only on a 16-byte boundary after four zero bytes
+        return t % 16 == 0 and t >= 4 and self.img[t - 4:t] == bytes(4)
+
     def discover(self):
         pe = self.pe
         # a chained unwind entry (code the compiler moved out of its function: shrink-wrapped prologues, cold paths) is
@@ -154,12 +285,16 @@ class Program:
         self.roots.add(self.base + pe.entry_rva)
         for cb in pe.tls_callbacks:
             self.roots.add(self.base + cb)
+        # where a C++ catch resumes: entered from the runtime with the catching function's frame (rt_eh_land)
+        for t in sorted(self.eh_conts):
+            if self.in_code(t):
+                self.roots.add(t)
         for rva in list(pe.exports.values()) + list(pe.exports_ord.values()):
             if isinstance(rva, int) and self.in_code(self.base + rva):
                 self.roots.add(self.base + rva)
         for rva in pe.relocs:
             v = int.from_bytes(self.img[rva:rva + self.ptr], "little")
-            if self.in_code(v) and not self.in_code(self.base + rva):
+            if self.in_code(v) and (not self.in_code(self.base + rva) or self.code_table_target(rva, v)):
                 self.roots.add(v)
         if self.bits == 32:
             self.data_pointers()
@@ -197,6 +332,10 @@ class Program:
                 bisect.insort(self.starts, r)
                 self.blocks[r], extra = self.scan(r)
                 work += [t for t in sorted(extra) if t not in self.roots]
+        self.flag_ret = set()
+        self.call_args = {}
+        if self.bits == 32:
+            self.find_flag_returns()
         return self
 
     def data_pointers(self):
@@ -292,6 +431,20 @@ class Program:
                     continue
                 tbl = (ins.memory_displacement & 0xFFFFFFFF) - self.base
                 if not (0 < tbl < self.pe.image_size):
+                    continue
+                if self.relocset and bound is None:
+                    # with relocations the entries are exactly the relocated slots: forwards from the base, and
+                    # backwards too (memmove indexes with a negated count); an unused first slot may overlap code
+                    def ok(p):
+                        return p in self.relocset and p + 4 <= len(self.img) and self.in_code(int.from_bytes(self.img[p:p + 4], "little"))
+                    p = tbl if ok(tbl) else tbl + 4
+                    while ok(p) and p < tbl + 4096:
+                        targets.add(int.from_bytes(self.img[p:p + 4], "little"))
+                        p += 4
+                    p = tbl - 4
+                    while p >= 0 and tbl - p <= 4096 and ok(p):
+                        targets.add(int.from_bytes(self.img[p:p + 4], "little"))
+                        p -= 4
                     continue
                 for n in range(bound or 1024):
                     p = tbl + 4 * n
@@ -417,6 +570,43 @@ class Program:
                 a = nxt
         self.ends.setdefault(r, end)
         return labels, extra
+
+
+def _fs_load(ins):
+    return ins.mnemonic == I.Mnemonic.MOV and ins.op0_kind == OK.REGISTER and ins.op0_register == I.Register.EAX \
+        and ins.op1_kind == OK.MEMORY and ins.memory_segment == I.Register.FS
+
+
+def _prologue_ins(ins, prev):
+    """part of a 32-bit MSVC prologue: frame, saved registers, locals, EH registration, /GS cookie (rustlift: prologue_ins)"""
+    m, k0, R = ins.mnemonic, ins.op0_kind, I.Register
+    imm = (OK.IMMEDIATE8TO32, OK.IMMEDIATE32)
+    if m == I.Mnemonic.PUSH:
+        if k0 == OK.REGISTER:
+            r = ins.op0_register
+            if r in (R.EBP, R.EBX, R.ESI, R.EDI, R.ECX):
+                return True
+            return r == R.EAX and prev is not None and (_fs_load(prev) or (prev.mnemonic == I.Mnemonic.XOR and prev.op0_kind == OK.REGISTER
+                                                                            and prev.op0_register == R.EAX))
+        if k0 in imm:
+            return (ins.immediate(0) & 0xFFFFFFFF) in (0xFFFFFFFF, 0xFFFFFFFE) or (
+                prev is not None and prev.mnemonic == I.Mnemonic.PUSH and prev.op0_kind in imm)
+        return False
+    if m == I.Mnemonic.MOV:
+        if k0 == OK.REGISTER and ins.op0_register == R.EBP:
+            return ins.op1_kind == OK.REGISTER and ins.op1_register == R.ESP
+        if k0 == OK.REGISTER and ins.op0_register == R.EAX and ins.op1_kind == OK.MEMORY:
+            return ins.memory_segment == R.FS or (ins.memory_base == R.NONE and ins.memory_index == R.NONE)
+        if k0 == OK.MEMORY and ins.op1_kind == OK.REGISTER and ins.op1_register == R.EAX:
+            return ins.memory_segment == R.FS or ins.memory_base in (R.EBP, R.ESP)
+        return False
+    if m == I.Mnemonic.SUB:
+        return k0 == OK.REGISTER and ins.op0_register == R.ESP and ins.op1_kind in imm
+    if m == I.Mnemonic.XOR:
+        return k0 == OK.REGISTER and ins.op0_register == R.EAX and ins.op1_kind == OK.REGISTER and ins.op1_register in (R.EBP, R.ESP)
+    if m == I.Mnemonic.LEA:
+        return k0 == OK.REGISTER and ins.op0_register == R.EAX and ins.memory_base in (R.EBP, R.ESP)
+    return False
 
 
 class Func:
@@ -1020,6 +1210,7 @@ class Func:
             self.emit("R(0) = d_;")
         else:
             self.emit(f"R(0) = (R(0) & ~{MASK[s]}) | d_;")
+        self.emit("SPILL(); rt_cas_miss(c); FILL();")
         self.emit("} }")
 
     def op_CMPXCHG16B(self, ins):
@@ -1122,7 +1313,7 @@ class Func:
         v = self.rd(0, self.p.ptr)
         targets = [t for t in self.p.jt.get(ins.ip, []) if t in self.labels or t in self.p.roots]
         if not targets:
-            self.emit(f"{{ static IC ic_; uint64_t t_ = {v}; SPILL(); GuestFn f_ = t_ == ic_.a ? ic_.f : rt_ic_fn(c, t_, &ic_); TAIL f_(c); return; }}")
+            self.emit(f"{{ static IC ic_ = IC_INIT; uint64_t t_ = {v}; SPILL(); GuestFn f_ = t_ == ic_.a ? ic_.f : rt_ic_fn(c, t_, &ic_); TAIL f_(c); return; }}")
             return True
         self.emit(f"switch ({v}) {{")
         for t in targets:
@@ -1151,13 +1342,22 @@ class Func:
         if near:
             t = ins.near_branch_target
             call = f"F_{t:x}(c);" if t in self.p.roots else f"rt_call(c, {h(t)});"
-            self.emit(f"{push} SPILL(); {call} FILLV();")
+            # 32-bit code that hands flags across a call: to a target that reads them on entry, or back from a callee
+            # whose flags are read after it returns
+            pre = post = ""
+            if self.p.bits == 32:
+                if not self.p.func_start(t) and self.p.flags_read_first(t):
+                    pre = "rt_xfl = rt_flags(&F); "
+                if self.p.flags_live_after_call(ins.next_ip):
+                    post = " F.fop = F_RAW; F.rawfl = rt_xfl;"
+            self.emit(f"{push} {pre}SPILL(); {call} FILLV();{post}")
         else:
-            self.emit(f"{{ static IC ic_; uint64_t t_ = {self.rd(0, P)}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}")
+            self.emit(f"{{ static IC ic_ = IC_INIT; uint64_t t_ = {self.rd(0, P)}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}")
 
     def op_RET(self, ins):
         extra = ins.immediate(0) if ins.op_count else 0
-        self.emit(f"R(4) += {self.p.ptr + extra}; SPILL(); return;")
+        fl = "rt_xfl = rt_flags(&F); " if self.root in getattr(self.p, "flag_ret", ()) else ""
+        self.emit(f"{fl}R(4) += {self.p.ptr + extra}; SPILL(); return;")
         return True
 
     def op_INT3(self, ins):

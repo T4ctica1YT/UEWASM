@@ -307,7 +307,10 @@ fn base64(s: &str) -> Option<Vec<u8>> {
 pub fn check_tools() -> String {
     let mut parts = vec![];
     let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let em = std::env::var("EMSDK").ok().map(PathBuf::from).into_iter().chain([Path::new(&home).join("emsdk")])
+    // %USERPROFILE%\emsdk, or the drive root where emsdk's own instructions often put it
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let em = std::env::var("EMSDK").ok().map(PathBuf::from).into_iter()
+        .chain([Path::new(&home).join("emsdk"), Path::new(&format!("{drive}\\")).join("emsdk")])
         .any(|d| d.join("upstream/emscripten").is_dir());
     parts.push(if em { "Emscripten: found".to_string() } else { "Emscripten: NOT FOUND (install emsdk to %USERPROFILE%\\emsdk or set EMSDK)".into() });
     parts.push(match cli() { Ok((p, _)) => format!("builder: {}", p.file_name().unwrap_or_default().to_string_lossy()), Err(e) => e });

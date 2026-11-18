@@ -280,6 +280,9 @@ HLE(CreateThread)
     ((Obj*)handle_obj(h))->thread = t;
     t->handle = h;
     if (tid_out) ST32(tid_out, (uint64_t)t->tid);
+    host_log("[thread] %u created: start %llx, parameter %llx, from %llx (stack %llx, state %p; creator state %p)", (unsigned)t->tid,
+             (unsigned long long)start, (unsigned long long)param, (unsigned long long)LDP(R(4)), (unsigned long long)t->cpu->r[4],
+             (void*)t->cpu, (void*)c);
     RET(h);
 }
 HLE(ResumeThread) { Obj* o = handle_obj(A1); if (o && o->thread) { o->thread->suspended = 0; sched_notify(); } RET(o ? 1 : 0xFFFFFFFF); }

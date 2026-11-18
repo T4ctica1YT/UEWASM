@@ -701,11 +701,72 @@ static void copy(GpuRes* dst, uint32_t dsub, uint32_t dx, uint32_t dy, uint32_t 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 }
 
+/* An sRGB back buffer holds gamma-encoded bytes and the screen shows those bytes as they are. glBlitFramebuffer
+   decodes an sRGB source to linear and the canvas isn't sRGB, so a blit would show it far too dark (and WebGL has
+   no way to turn the decode off). Instead a full-screen triangle samples it (decoded, filtered in linear space) and
+   encodes it again. Every draw sets its own program, targets, VAO and render state, so nothing has to be restored
+   beyond the shared VAO. */
+static GLuint srgb_prog, srgb_vao, srgb_samp;
+static int present_srgb(GLuint tex, int cw, int ch)
+{
+    if (!srgb_prog) {
+        static const char* vs = "#version 300 es\nout vec2 uv;\nvoid main() {\n"
+            "  vec2 p = vec2(float((gl_VertexID & 1) * 4 - 1), float((gl_VertexID & 2) * 2 - 1));\n"
+            "  uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n  gl_Position = vec4(p, 0.0, 1.0);\n}\n";
+        static const char* fs = "#version 300 es\nprecision highp float;\nuniform highp sampler2D t;\nin vec2 uv;\nout vec4 o;\n"
+            "void main() {\n  vec3 c = clamp(textureLod(t, uv, 0.0).rgb, 0.0, 1.0);\n"
+            "  o = vec4(mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c)), 1.0);\n}\n";
+        GLuint s[2] = { glCreateShader(GL_VERTEX_SHADER), glCreateShader(GL_FRAGMENT_SHADER) };
+        glShaderSource(s[0], 1, &vs, NULL);
+        glShaderSource(s[1], 1, &fs, NULL);
+        GLuint p = glCreateProgram();
+        for (int i = 0; i < 2; i++) { glCompileShader(s[i]); glAttachShader(p, s[i]); }
+        glLinkProgram(p);
+        for (int i = 0; i < 2; i++) glDeleteShader(s[i]);
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) { host_log("[gl] sRGB present shader failed; the picture will be too dark"); glDeleteProgram(p); srgb_prog = ~0u; return 0; }
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "t"), 0);
+        glGenVertexArrays(1, &srgb_vao);
+        glGenSamplers(1, &srgb_samp);
+        glSamplerParameteri(srgb_samp, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glSamplerParameteri(srgb_samp, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glSamplerParameteri(srgb_samp, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glSamplerParameteri(srgb_samp, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        srgb_prog = p;
+    }
+    if (srgb_prog == ~0u) return 0;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, cw, ch);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glColorMask(1, 1, 1, 1);
+    glUseProgram(srgb_prog);
+    glBindVertexArray(srgb_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindSampler(0, srgb_samp);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindSampler(0, 0);
+    glBindVertexArray(vao);
+    return 1;
+}
+
 static void present(GpuRes* bb, uint32_t w, uint32_t h)
 {
     if (!glctx || !bb || !GR(bb)) return;
     int cw, ch;
     emscripten_get_canvas_element_size("#canvas", &cw, &ch);
+    if (GR(bb)->f.ifmt == GL_SRGB8_ALPHA8 && GR(bb)->target == GL_TEXTURE_2D && present_srgb(GR(bb)->tex, cw, ch)) {
+        frames++;
+        if (frames == 1 || frames % 600 == 0) host_log("[gl] frame %llu (%llu draws so far)", (unsigned long long)frames, (unsigned long long)draws);
+        return;
+    }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, blit_read_fbo);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, GR(bb)->tex, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);

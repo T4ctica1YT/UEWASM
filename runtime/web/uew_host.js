@@ -156,7 +156,7 @@ addToLibrary({
   host_query_flag__postset: "if (typeof process == 'object' && process.on) process.on('unhandledRejection', e => { if (e == 'unwind' || (e && e.name == 'ExitStatus')) return; throw e; });" +
     "if (typeof addEventListener == 'function') addEventListener('unhandledrejection', e => { if (e.reason == 'unwind' || (e.reason && e.reason.name == 'ExitStatus')) e.preventDefault(); });" +
     // a crash on another core reaches the page as a bare message; print the wasm stack (function names) from where it happened
-    "if (typeof ENVIRONMENT_IS_PTHREAD != 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self != 'undefined') self.addEventListener('error', e => { if (e.error && e.error.stack) err('[worker crash] ' + e.error.stack); });",
+    "if (typeof ENVIRONMENT_IS_PTHREAD != 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self != 'undefined' && typeof self.addEventListener == 'function') self.addEventListener('error', e => { if (e.error && e.error.stack) err('[worker crash] ' + e.error.stack); });",
   host_query_flag__deps: ['$UTF8ToString', '$stringToNewUTF8'],
   host_query_flag: function (name) {
     if (typeof location === "undefined") return 0;

@@ -157,7 +157,7 @@ def op_FXAM(f, ins):
 
 
 UNARY = {"FCHS": "-{0}", "FABS": "fabs({0})", "FSQRT": "sqrt({0})", "FSIN": "sin({0})", "FCOS": "cos({0})",
-         "FRNDINT": "frnd(c, {0})", "F2XM1": "(exp2({0}) - 1.0)"}
+         "FRNDINT": "frnd(c, {0})", "F2XM1": "expm1({0} * 0.69314718055994530942)"}
 
 
 def op_unary(f, ins):

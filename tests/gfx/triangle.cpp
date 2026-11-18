@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <windows.h>
 #include <d3d11.h>
 
@@ -12,8 +13,11 @@ struct Vertex { float x, y; unsigned color; float u, v; };
 
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 
-int main()
+int main(int argc, char** argv)
 {
+    // "srgb": an sRGB back buffer (the screen then shows the gamma-encoded bytes the GPU wrote)
+    bool srgb = false;
+    for (int i = 1; i < argc; i++) srgb |= !strcmp(argv[i], "srgb");
     WNDCLASSW wc = {};
     wc.lpfnWndProc = proc;
     wc.lpszClassName = L"tri";
@@ -23,7 +27,7 @@ int main()
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferDesc.Width = 640;
     sd.BufferDesc.Height = 360;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.BufferDesc.Format = srgb ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 1;

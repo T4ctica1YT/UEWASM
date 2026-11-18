@@ -35,7 +35,8 @@ FIRST_BASE = 0x00400000
 SKIP_DLLS = re.compile(r"(libcef|chrome_elf|libegl|libglesv2|d3dcompiler|gfsdk_aftermath|winpixeventruntime|dxgi|d3d1\d|"
                        r"steam_api|nvtt|embree|tbb|libsndfile|ue4prereq|crashreport|unrealcefsubprocess|steamvr|openvr|oculus|libovr|"
                        r"xaudio2_\d|openimagedenoise|gfnruntimesdk|dbghelp|nvngx|^sl\.|libxess|libxell|amd_fidelityfx|ffx_|directml|"
-                       r"crashpad|msquic|nvlowlatency|reflex|^api-ms-win-|^ext-ms-win-|^xinput[0-9]|^x3daudio|beclient|easyanticheat|gfesdk)", re.I)
+                       r"crashpad|msquic|nvlowlatency|reflex|^api-ms-win-|^ext-ms-win-|^xinput[0-9]|^x3daudio|beclient|easyanticheat|gfesdk|"
+                       r"^dsetup|^d3dx9_|^steamapiupdater|^cudart|^wxmsw)", re.I)
 
 
 _sys_ords = {}
@@ -52,9 +53,41 @@ def system_ord_name(dll, ordinal, sysdir=SYSTEM):
     return _sys_ords[key].get(ordinal)
 
 
+def sxs_dirs(d):
+    """side-by-side runtime folders next to an exe (Microsoft.VC90.CRT and the like), which older games ship their CRT in"""
+    try:
+        return [p for p in Path(d).iterdir() if p.is_dir() and re.match(r"Microsoft\.VC\d+\.\w+$", p.name, re.I)]
+    except OSError:
+        return []
+
+
+WINSXS = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "WinSxS"
+
+
+def sxs_crt(name, bits):
+    """Visual C++ 2005/2008 runtime DLLs (msvcr80, msvcp90...) that a game doesn't ship, from Windows' side-by-side
+    store, newest version first, as the Windows loader resolves them through the game's manifest"""
+    m = re.match(r"msvc[rpm](\d)0\.dll$", name, re.I)
+    if not m or not WINSXS.is_dir():
+        return None
+    arch = "x86" if bits == 32 else "amd64"
+
+    def version(d):
+        v = re.search(r"_(\d+)\.(\d+)\.(\d+)\.(\d+)_", d.name)
+        return tuple(int(x) for x in v.groups()) if v else (0,)
+    for d in sorted(WINSXS.glob(f"{arch}_microsoft.vc{m[1]}0.crt_*"), key=version, reverse=True):
+        if (d / name).is_file():
+            return d / name
+    return None
+
+
 def game_dlls(exe):
     """DLLs shipped with the game that it may load at runtime (PhysX, codecs, middleware)."""
     exe = Path(exe)
+    try:
+        bits = pemod.load(exe).bits
+    except Exception:
+        bits = 64
     root = exe.parent
     for _ in range(4):
         if (root / "Engine").is_dir():
@@ -67,13 +100,14 @@ def game_dlls(exe):
         # plugin binaries are runtime middleware (FMOD, Wwise...) in shipped games; editor modules are the exception
         if SKIP_DLLS.search(p.name) or "Mods" in p.parts or re.match(r"(UE4|Unreal)Editor", p.name, re.I):
             continue
-        if "Win32" in p.parts or "x86" in p.parts:
-            continue
+        # only DLLs the exe could load: 64-bit games often ship 32-bit leftovers (and the reverse), so it goes by the
+        # DLL's own bitness rather than its folder name (a 32-bit game keeps everything under Binaries\Win32)
         try:
-            if pemod.load(p):
-                found.append(p)
-        except ValueError:
-            pass
+            m = pemod.load(p)
+        except Exception:
+            continue
+        if m and m.bits == bits and not any(re.match(r"Microsoft\.VC\d+\.", x, re.I) for x in p.parts):
+            found.append(p)
     return root, found
 
 
@@ -100,7 +134,9 @@ class Module:
 class Linker:
     def __init__(self, exe, search=(), hle_names=(), recompile_system=True, extra=()):
         self.exe = Path(exe)
-        self.search = [self.exe.parent, *map(Path, search)]
+        self.search = [self.exe.parent, *sxs_dirs(self.exe.parent), *map(Path, search)]
+        from . import stdcall
+        stdcall.SEARCH[:] = [str(d) for d in self.search]
         self.hle = set(hle_names)
         self.recompile_system = recompile_system
         self.modules = {}
@@ -129,7 +165,7 @@ class Linker:
                 return p
         if self.recompile_system and n in RUNTIME_DLLS and (self.sysdir / n).is_file():
             return self.sysdir / n
-        return None
+        return sxs_crt(n, self.bits)
 
     def bits_of(self, p):
         try:

@@ -686,8 +686,6 @@ HLE(DirectSoundEnumerateW) { RET(0); }
 HLE(DirectSoundEnumerateA) { RET(0); }
 
 /* ---- other graphics APIs games probe for ---- */
-HLE(Direct3DCreate9) { RET(0); }
-HLE(Direct3DCreate9Ex) { if (A2) ST64(A2, 0); RET(0x8876086A); }   /* D3DERR_NOTAVAILABLE */
 HLE(DXVA2CreateDirect3DDeviceManager9) { if (A1) ST32(A1, 0); if (A2) ST64(A2, 0); RET(0x80004001); }
 HLE(D3D12SerializeRootSignature) { if (A3) ST64(A3, 0); if (A4) ST64(A4, 0); RET(0x80004001); }
 HLE(D3D12SerializeVersionedRootSignature) { if (A2) ST64(A2, 0); if (A3) ST64(A3, 0); RET(0x80004001); }

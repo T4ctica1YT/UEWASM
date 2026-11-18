@@ -105,11 +105,17 @@ fn main() {
             tls_callbacks: arr_u64(&m["tls_callbacks"]),
             relocs: arr_u64(&m["relocs"]),
             sj_slots: arr_u64(&m["sj_slots"]).into_iter().collect(),
+            eh_starts: m.get("eh_starts").and_then(|v| v.as_array()).map(|a| a.iter()
+                .map(|x| (x[0].as_u64().unwrap(), x[1].as_u64().unwrap())).collect()).unwrap_or_default(),
+            eh_conts: m.get("eh_conts").map(arr_u64).unwrap_or_default(),
         }
     }).collect();
     let progs: Vec<Program> = modules.into_par_iter().map(|m| {
         let mut p = Program::new(m);
         p.discover();
+        if p.m.bits == 32 {
+            p.find_flag_returns();
+        }
         p
     }).collect();
     let t_disc = t0.elapsed().as_secs_f64();
@@ -145,12 +151,17 @@ fn main() {
         for &r in &ch.roots {
             let labels = &p.blocks[&r];
             let (body, entry) = {
-                let mut f = Func { c: &ctx, labels, out: vec![], ins: Default::default(), cas: false, cache: &mut cache,
+                let mut f = Func { c: &ctx, root: r, labels, out: vec![], ins: Default::default(), cas: false, cache: &mut cache,
                                    fl_cache: &mut fl_cache, unsupported: &mut unsupported };
                 bad += f.lift() as u64;
                 let entry = if p.func_start(r) || !f.flags_live(r) { "2" } else { "rt_xfl" };
                 (std::mem::take(&mut f.out), entry)
             };
+            let mut body = body;
+            if let Some(off) = p.m.eh_starts.get(&r) {
+                // a 32-bit function with a try block: a catch's continuation is resumed here (rt_eh_slot32)
+                body.insert(0, format!("    if (setjmp(*rt_eh_slot32(c, (uint32_t)R(4) - {off}, 0x{r:x}ull))) {{ rt_eh_land(c); return; }}"));
+            }
             out.push(format!("void F_{:x}(CPU* __restrict c) {{", r));
             let (mut body, xused) = regs_local(&rx, body, p.m.bits);
             let used: BTreeSet<u32> = body.iter().flat_map(|l| rx.r_use.captures_iter(l).map(|c| c[1].parse::<u32>().unwrap()).collect::<Vec<_>>()).collect();
@@ -169,8 +180,8 @@ fn main() {
             out.push(String::new());
         }
         let mut text = out.join("\n");
-        if text.contains("rt_sj_slot(") || text.contains("rt_sj_slot32(") {
-            text = text.replacen("#include \"funcs.h\"", "#include \"funcs.h\"\n#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\njmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);", 1);
+        if text.contains("rt_sj_slot(") || text.contains("rt_sj_slot32(") || text.contains("rt_eh_slot32(") {
+            text = text.replacen("#include \"funcs.h\"", "#include \"funcs.h\"\n#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\njmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);\njmp_buf* rt_eh_slot32(CPU* c, uint64_t frame, uint64_t fn);\nvoid rt_eh_land(CPU* c);", 1);
         }
         if text.contains("rt_xfl") {
             text = text.replacen("#include \"funcs.h\"", &format!("#include \"funcs.h\"\n{XFL_DECL}"), 1);
@@ -196,7 +207,8 @@ fn main() {
     let mods: Vec<Value> = progs.iter().map(|p| {
         let mut r: Vec<u64> = p.blocks.keys().copied().collect();
         r.sort();
-        json!({ "roots": r })
+        let ca: Vec<Value> = p.call_args.iter().map(|&(a, n)| json!([a, n])).collect();
+        json!({ "roots": r, "call_args": ca })
     }).collect();
     let ch: Vec<Value> = results.into_iter().map(|(u, at, bad)| json!({ "u": u, "at": at, "bad": bad })).collect();
     let out = json!({ "modules": mods, "chunks": ch, "files": chunks.len(), "seconds": [t_disc, t_lift] });

@@ -1,4 +1,7 @@
 #include "rt.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 #if defined(_WIN32) && defined(UEW_STACKCHECK)
 #include <windows.h>
 #endif
@@ -107,6 +110,17 @@ uint64_t g_pages(uint64_t size)
     if (i == ~0ull) {
         host_log("[mem] out of guest memory (%llu bytes requested, %llu MB in use)", (unsigned long long)size,
                  (unsigned long long)(units_used * UNIT >> 20));
+        /* once: who asked (an absurd size is usually a bad count further up) */
+        static int said;
+        if (!said++) {
+            void rt_backtrace(CPU* c, const char* tag);
+            void rt_ring_dump(void);
+            CPU* cur = sched_current_cpu();
+            void rt_host_chain(const char* tag);
+            if (cur) rt_backtrace(cur, "mem");
+            rt_host_chain("mem");
+            rt_ring_dump();
+        }
         return 0;
     }
     units_take(i, n);
@@ -284,16 +298,32 @@ void rt_hle_tick(CPU* c) { rt_hle_budget = 1024; sched_tick(c); }
 #include "dyn_tramp.inc"
 
 static uint16_t dyn_pops[DYN_MAX];
+#define POPS_SITE 0xFFFFu
+
+/* what the call site at this return address pushed (rt_call_args is sorted by return address); 0 if it isn't known */
+static unsigned site_pops(uint32_t ret)
+{
+    size_t lo = 0, hi = rt_call_arg_count;
+    while (lo < hi) {
+        size_t m = (lo + hi) / 2;
+        if (rt_call_args[2 * m] < ret) lo = m + 1;
+        else hi = m;
+    }
+    if (lo < rt_call_arg_count && rt_call_args[2 * lo] == ret) return rt_call_args[2 * lo + 1];
+    static int said;
+    if (said++ < 20) host_log("[call] no argument size known for the call returning to %x; taken as 0", ret);
+    return 0;
+}
 
 uint64_t rt_dyn_thunk_n(GuestFn fn, const char* name, int nargs)
 {
     for (size_t i = 0; i < ndyn; i++)
-        if (dyn[i].fn == fn && dyn_pops[i] == 4 * nargs) return DYN_BASE + 8ull * i;
+        if (dyn[i].fn == fn && dyn_pops[i] == (nargs < 0 ? POPS_SITE : 4 * nargs)) return DYN_BASE + 8ull * i;
     if (ndyn == DYN_MAX) return 0;
     dyn[ndyn].fn = fn;
     dyn[ndyn].name = name;
     dyn[ndyn].dll = "dyn";
-    dyn_pops[ndyn] = (uint16_t)(4 * nargs);
+    dyn_pops[ndyn] = nargs < 0 ? POPS_SITE : (uint16_t)(4 * nargs);
     return DYN_BASE + 8ull * ndyn++;
 }
 
@@ -301,9 +331,48 @@ uint64_t rt_dyn_thunk(GuestFn fn, const char* name) { return rt_dyn_thunk_n(fn, 
 
 /* a 32-bit guest calling the runtime: the stack arguments are laid out as a Win64 frame (rcx, rdx, r8, r9, then the
    stack slots) so every HLE function serves both; small negative values (handles like -1) widen with their sign */
+/* ?watch=<hex address>: a guest dword checked after every system call of a 32-bit game; a change is logged with the
+   call that made it (or, for a change by the game's own code, the next call after it) */
+static uint64_t watch_addr = ~0ull;
+static uint32_t watch_val;
+static void watch_check(const char* name)
+{
+    if (watch_addr == ~0ull) {
+        watch_addr = (uint64_t)host_query_hex("watch");
+        if (watch_addr) { watch_val = (uint32_t)LD32(watch_addr); host_log("[watch] %llx = %x", (unsigned long long)watch_addr, watch_val); }
+    }
+    if (!watch_addr) return;
+    static int64_t want = -2;
+    if (want == -2) want = host_query_hex("watchval") ? (int64_t)host_query_hex("watchval") : -1;
+    uint32_t v = (uint32_t)LD32(watch_addr);
+    if (v != watch_val && (want < 0 || v == (uint32_t)want)) {
+        host_log("[watch] %llx: %x -> %x after %s (thread %u)", (unsigned long long)watch_addr, watch_val, v, name, sched_current_id());
+        watch_val = v;
+    } else watch_val = v;
+}
+
+void rt_ring_dump(void);
+#define ring_dump rt_ring_dump
 void rt_hle32(CPU* c, const Thunk* e, unsigned pops)
 {
     uint64_t esp = R(4), f = (esp - 0x200) & ~15ull;
+    /* x86 code keeps the stack 4-byte aligned; the first call that sees otherwise points at what broke it */
+    static int misaligned;
+    if ((esp & 3) && !misaligned++) host_log("[stack] esp %llx not aligned at %s, called from %llx (thread %u)", (unsigned long long)esp,
+                                              e->name, (unsigned long long)LD32(esp), sched_current_id());
+    if ((esp & 3) && misaligned == 1) ring_dump();
+    /* and stays inside the thread's own stack (the TEB's StackLimit..StackBase): the first call made from anywhere else
+       (esp loaded from something that was never a stack address) is logged with the calls before it */
+    static int strayed;
+    if (!strayed && c->gsbase) {
+        uint64_t hi = LD32(c->gsbase + 4), lo = LD32(c->gsbase + 8);
+        if (hi > lo && (esp < lo || esp > hi) && !strayed++) {
+            host_log("[stack] esp %llx outside the stack of thread %u (%llx-%llx) at %s, called from %llx, ebp %llx",
+                     (unsigned long long)esp, sched_current_id(), (unsigned long long)lo, (unsigned long long)hi, e->name,
+                     (unsigned long long)LD32(esp), (unsigned long long)R(5));
+            ring_dump();
+        }
+    }
     uint64_t keep[4] = { R(3), R(5), R(6), R(7) };
     ST64(f, LD32(esp));
     for (unsigned i = 1; i <= 20; i++) {
@@ -311,10 +380,13 @@ void rt_hle32(CPU* c, const Thunk* e, unsigned pops)
         if (v >= 0xFFFF0000ull) v |= 0xFFFFFFFF00000000ull;
         ST64(f + 8ull * i, v);
     }
+    ST64(f + 8ull * 21, esp);   /* the guest esp at the call, for handlers that need it (RaiseException, RtlUnwind) */
+    ST64(f + 8ull * 22, (uint32_t)R(1));   /* ecx: a thiscall method's this (HLE32_ECX) */
     R(1) = LD64(f + 8); R(2) = LD64(f + 16); R(8) = LD64(f + 24); R(9) = LD64(f + 32);
     R(4) = f;
     if (e->fn) e->fn(c);
     else hle_missing(c, e);
+    watch_check(e->name);
     R(3) = keep[0]; R(5) = keep[1]; R(6) = keep[2]; R(7) = keep[3];
     R(2) = (uint32_t)(R(0) >> 32);
     R(0) = (uint32_t)R(0);
@@ -358,18 +430,47 @@ void uew_set_trace(int on) { trace_on = on; }
 /* one traced call: name, the first four arguments, the guest return address and the green thread */
 const char* host_trace_filter(void);
 /* ?tracering=1: the last calls are kept quietly and printed when the game traps */
-static struct { const char* name; uint64_t a[4], ret; unsigned tid; } ring[64];
+static struct { const char* name; uint64_t a[4], ret, bp; unsigned tid; } ring[64];
 static unsigned ring_n;
 static int ring_on = -1;
-static void ring_dump(void)
+/* also the debug panel's thread dump, to show what a busy thread keeps calling */
+#ifndef UEW_EBPCHECK
+void rt_ebp_dump_all(void) {}
+#endif
+void rt_ring_dump(void)
 {
+    void rt_ebp_dump_all(void);
+    rt_ebp_dump_all();
     if (ring_on <= 0) return;
     host_log("[trap] last %u system calls:", ring_n < 64 ? ring_n : 64);
     for (unsigned i = ring_n > 64 ? ring_n - 64 : 0; i < ring_n; i++) {
         unsigned k = i & 63;
-        host_log("  %s(%llx, %llx, %llx, %llx) ret=%llx t=%u", ring[k].name, (unsigned long long)ring[k].a[0], (unsigned long long)ring[k].a[1],
-                 (unsigned long long)ring[k].a[2], (unsigned long long)ring[k].a[3], (unsigned long long)ring[k].ret, ring[k].tid);
+        host_log("  %s(%llx, %llx, %llx, %llx) ret=%llx rbp=%llx t=%u", ring[k].name, (unsigned long long)ring[k].a[0], (unsigned long long)ring[k].a[1],
+                 (unsigned long long)ring[k].a[2], (unsigned long long)ring[k].a[3], (unsigned long long)ring[k].ret, (unsigned long long)ring[k].bp, ring[k].tid);
     }
+}
+
+/* 32-bit games: the arguments are on the stack; with ?tracering=1 they go to the ring, otherwise every call is logged */
+static void trace_call32(CPU* c, const char* name)
+{
+    if (ring_on < 0) ring_on = host_query_flag("tracering");
+    if (ring_on) {
+        unsigned k = ring_n++ & 63;
+        ring[k].name = name;
+        for (int i = 0; i < 4; i++) ring[k].a[i] = LD32(R(4) + 4ull * (i + 1));
+        ring[k].ret = LD32(R(4)); ring[k].bp = R(5); ring[k].tid = sched_current_id();
+        return;
+    }
+    /* the same ",Name,Name," filter as 64-bit games (UEW_TRACE_ONLY / window.uewTraceOnly) */
+    static const char* only;
+    if (!only) only = host_trace_filter();
+    if (only[0]) {
+        char k[96];
+        snprintf(k, sizeof k, ",%s,", name);
+        if (!strstr(only, k)) return;
+    }
+    host_log("[hle] %s(%x, %x, %x, %x) ret=%x", name, (unsigned)LD32(R(4) + 4), (unsigned)LD32(R(4) + 8),
+             (unsigned)LD32(R(4) + 12), (unsigned)LD32(R(4) + 16), (unsigned)LD32(R(4)));
 }
 
 void rt_trace_call(CPU* c, const char* name)
@@ -378,7 +479,7 @@ void rt_trace_call(CPU* c, const char* name)
     if (ring_on) {
         unsigned k = ring_n++ & 63;
         ring[k].name = name; ring[k].a[0] = R(1); ring[k].a[1] = R(2); ring[k].a[2] = R(8); ring[k].a[3] = R(9);
-        ring[k].ret = LD64(R(4)); ring[k].tid = sched_current_id();
+        ring[k].ret = LD64(R(4)); ring[k].bp = R(5); ring[k].tid = sched_current_id();
         return;
     }
     /* optional ",Name,Name," list (UEW_TRACE_ONLY / window.uewTraceOnly) keeps the log to the calls of interest */
@@ -457,7 +558,9 @@ void rt_call(CPU* c, uint64_t t)
     if (t >= DYN_BASE && t < DYN_BASE + 8ull * ndyn) {
         size_t k = (t - DYN_BASE) / 8;
         rt_lock();
-        if (RT_G32) rt_hle32(c, &dyn[k], dyn_pops[k]);
+        if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL || host_query_flag("tracering");
+        if (RT_G32 && trace_on) trace_call32(c, dyn[k].name);
+        if (RT_G32) rt_hle32(c, &dyn[k], dyn_pops[k] == POPS_SITE ? site_pops((uint32_t)LD32(R(4))) : dyn_pops[k]);
         else {
             dyn[k].fn(c);
             R(4) += 8;
@@ -482,8 +585,7 @@ void rt_call(CPU* c, uint64_t t)
         }
         if (trace_on < 0) trace_on = getenv("UEW_TRACE") != NULL || host_query_flag("tracering");
         if (RT_G32) {
-            if (trace_on) host_log("[hle] %s(%x, %x, %x, %x) ret=%x", e->name, (unsigned)LD32(R(4) + 4), (unsigned)LD32(R(4) + 8),
-                                   (unsigned)LD32(R(4) + 12), (unsigned)LD32(R(4) + 16), (unsigned)LD32(R(4)));
+            if (trace_on) trace_call32(c, e->name);
             rt_hle32(c, e, rt_thunk_pops[k]);
         } else {
             if (trace_on) rt_trace_call(c, e->name);
@@ -539,10 +641,11 @@ static GuestFn lookup_fn(uint64_t t)
 #endif
 }
 
+static void eh_check(CPU* c, uint64_t target);
 GuestFn rt_jump_fn(CPU* c, uint64_t t)
 {
-    (void)c;
     STACK_CHECK(c, t);
+    if (RT_G32) eh_check(c, t);
     GuestFn f = lookup_fn(t);
     if (f) return f;
     jump_pending = t;
@@ -554,7 +657,8 @@ GuestFn rt_jump_fn(CPU* c, uint64_t t)
 static void ic_fill(IC* ic, uint64_t t, GuestFn f)
 {
 #ifdef UEW_THREADS
-    uint64_t z = 0;
+    /* filled once: claim the empty cache (IC_INIT) first, so no reader sees a target with another site's function */
+    uint64_t z = ~0ull;
     if (!__atomic_compare_exchange_n((uint64_t*)&ic->a, &z, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
     ic->f = f;
     __atomic_store_n((uint64_t*)&ic->a, t, __ATOMIC_RELEASE);
@@ -664,12 +768,45 @@ void rt_exit(int code)
 #endif
 }
 
+/* the WebAssembly call stack: with function names in the build (names=True), every recompiled frame is F_<guest
+   address>, so this is the guest call chain that led here (tail calls leave no frame) */
+void rt_host_chain(const char* tag)
+{
+#ifdef __EMSCRIPTEN__
+    static char st[16384];
+    emscripten_get_callstack(EM_LOG_C_STACK | EM_LOG_NO_PATHS, st, sizeof st);
+    char line[2048];
+    int n = 0;
+    for (char* s = st; *s && n < (int)sizeof line - 64;) {
+        char* e = strchr(s, 10);   /* end of line */
+        if (e) *e = 0;
+        char* at = strstr(s, "at ");
+        if (at) {
+            at += 3;
+            char* sp = strpbrk(at, " (");
+            int len = sp ? (int)(sp - at) : (int)strlen(at);
+            if (len > 40) len = 40;
+            if (strncmp(at, "rt_trap", 7) && strncmp(at, "emscripten_get_callstack", 24))
+                n += snprintf(line + n, sizeof line - n, " %.*s", len, at);
+        }
+        if (!e) break;
+        s = e + 1;
+    }
+    host_log("[%s] call chain:%s", tag, line);
+
+#else
+    (void)tag;
+#endif
+}
+
 void rt_trap(CPU* c, uint64_t pc, const char* what)
 {
     ring_dump();
     rt_backtrace(c, "trap");
     host_log("[trap] %s at %llx (rsp=%llx rax=%llx rcx=%llx)", what, (unsigned long long)pc,
              (unsigned long long)R(4), (unsigned long long)R(0), (unsigned long long)R(1));
+    host_log("[trap] rdx=%llx rbx=%llx rbp=%llx rsi=%llx rdi=%llx", (unsigned long long)R(2), (unsigned long long)R(3),
+             (unsigned long long)R(5), (unsigned long long)R(6), (unsigned long long)R(7));
 #ifdef _MSC_VER
     void* fr[24];
     char buf[24 * 12];
@@ -677,6 +814,8 @@ void rt_trap(CPU* c, uint64_t pc, const char* what)
     for (int i = 0; i < k; i++)
         n += snprintf(buf + n, sizeof(buf) - n, " %llx", (unsigned long long)((char*)fr[i] - &__ImageBase));
     host_log("[trap] host stack:%s", buf);
+#elif defined(__EMSCRIPTEN__)
+    rt_host_chain("trap");
 #endif
     rt_exit(0xC0000005);
 }
@@ -748,7 +887,11 @@ void rt_cpuid(CPU* c)
     (void)sub;
     switch (leaf) {
     case 0: a = 7; b = 0x756e6547; d = 0x49656e69; cc = 0x6c65746e; break;
-    case 1: a = 0x000906EA; b = 0x00100800; cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 23); d = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 25) | (1u << 26); break;
+    case 1: a = 0x000906EA; b = 0x00100800; cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 23); d = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 25) | (1u << 26);
+        /* 32-bit games probe MMX by running an MMX instruction under SEH; the lifter has no MMX registers, so the CPU
+           reports none and those games keep to their SSE and integer paths */
+        if (RT_G32) d &= ~(1u << 23);
+        break;
     case 0x80000000: a = 0x80000008; break;
     case 0x80000001: cc = 1u << 5; d = (1u << 29); break;
     case 0x80000002: a = 0x4D534157; b = 0x50432034; cc = 0x00000055; break;
@@ -1235,6 +1378,177 @@ static void sj_jump32(CPU* c, uint64_t t)
     (void)c;
 }
 
+/* ---- 32-bit SEH and C++ exceptions ----
+   RaiseException walks the thread's handler chain (fs:[0]) and calls each handler as Windows does. A C++ catch ends
+   in the CRT's _JumpToContinuation: esp and ebp set to the catching function's frame and a jump into its body. That
+   function took a host setjmp on entry (rt_eh_slot32, from the lifter for every function with a try block, keyed by
+   its frame pointer), so the jump longjmps back to that host frame, which then runs the continuation (lifted as an
+   entry point of its own) and returns for it: the host call stack matches the guest's again. */
+enum { EH_SLOTS = 256, EH_DEPTH = 16 };
+typedef struct { uint32_t frame, fn; jmp_buf host; } EhSlot;
+typedef struct {
+    int n, nd;
+    uint32_t target;
+    uint32_t disp_sp[EH_DEPTH];      /* guest esp of each dispatch in progress (RaiseException calls), innermost last */
+    EhSlot s[EH_SLOTS];               /* frames that can catch, outermost first */
+} EhThread;
+
+static EhThread* eh_me(void)
+{
+    GThread* t = sched_current();
+    if (!t) return NULL;
+    if (!t->eh) t->eh = calloc(1, sizeof(EhThread));
+    return (EhThread*)t->eh;
+}
+
+/* function entry: frame is what ebp will be inside it, fn its address */
+jmp_buf* rt_eh_slot32(CPU* c, uint64_t frame, uint64_t fn)
+{
+    static jmp_buf spare;
+    EhThread* t = eh_me();
+    if (!t) return &spare;
+    uint32_t sp = (uint32_t)c->r[4];
+    /* frames at or below this one have returned (the stack grows down) */
+    while (t->n && t->s[t->n - 1].frame < sp) t->n--;
+    if (t->n == EH_SLOTS) {
+        memmove(t->s, t->s + 1, sizeof t->s[0] * (EH_SLOTS - 1));
+        t->n--;
+    }
+    EhSlot* e = &t->s[t->n++];
+    e->frame = (uint32_t)frame;
+    e->fn = (uint32_t)fn;
+    return &e->host;
+}
+
+/* a jump while an exception is being dispatched: into a registered frame's own function, with that frame's ebp, is
+   a catch continuation */
+static void eh_check(CPU* c, uint64_t target)
+{
+    GThread* g = sched_current();
+    EhThread* t = g ? (EhThread*)g->eh : NULL;
+    if (!t || !t->nd) return;
+    uint32_t bp = (uint32_t)c->r[5];
+    for (int i = t->n; i-- > 0;) {
+        EhSlot* e = &t->s[i];
+        if (e->frame != bp || target <= e->fn || target - e->fn >= 0x100000) continue;
+        /* the dispatches below the frame are over */
+        while (t->nd && t->disp_sp[t->nd - 1] < e->frame) t->nd--;
+        t->n = i + 1;
+        t->target = (uint32_t)target;
+        longjmp(e->host, 1);
+    }
+}
+
+/* in the catching function's host frame, after the longjmp: run the continuation; the caller returns next */
+void rt_eh_land(CPU* c)
+{
+    EhThread* t = eh_me();
+    uint32_t target = t ? t->target : 0;
+    GuestFn f = target ? lookup_fn(target) : NULL;
+    if (!f) rt_trap(c, target, "catch continuation is not a lifted entry point");
+    f(c);
+}
+
+static int seh_frame_ok(CPU* c, uint32_t reg)
+{
+    uint32_t hi = (uint32_t)LD32(c->gsbase + 4), lo = (uint32_t)LD32(c->gsbase + 8);
+    return reg != 0xFFFFFFFFu && reg >= lo && reg + 8 <= hi && !(reg & 3);
+}
+
+/* EXCEPTION_RECORD (x86): code, flags, record, address, parameter count, parameters[15] */
+static void seh_record(uint64_t rec, uint32_t code, uint32_t flags, uint32_t addr, uint32_t n, uint64_t args)
+{
+    memset(G2H(rec), 0, 80);
+    ST32(rec, code);
+    ST32(rec + 4, flags);
+    ST32(rec + 12, addr);
+    if (n > 15) n = 15;
+    ST32(rec + 16, n);
+    for (uint32_t i = 0; i < n && args; i++) ST32(rec + 20 + 4ull * i, LD32(args + 4ull * i));
+}
+
+/* CONTEXT (x86): the integer registers as the caller of RaiseException/RtlUnwind has them */
+static void seh_context(CPU* c, uint64_t ctx, uint32_t eip, uint32_t esp)
+{
+    memset(G2H(ctx), 0, 0x2CC);
+    ST32(ctx, 0x10007);
+    ST32(ctx + 0x9C, (uint32_t)c->r[7]); ST32(ctx + 0xA0, (uint32_t)c->r[6]); ST32(ctx + 0xA4, (uint32_t)c->r[3]);
+    ST32(ctx + 0xA8, (uint32_t)c->r[2]); ST32(ctx + 0xAC, (uint32_t)c->r[1]); ST32(ctx + 0xB0, (uint32_t)c->r[0]);
+    ST32(ctx + 0xB4, (uint32_t)c->r[5]); ST32(ctx + 0xB8, eip); ST32(ctx + 0xBC, 0x23); ST32(ctx + 0xC0, 0x202);
+    ST32(ctx + 0xC4, esp); ST32(ctx + 0xC8, 0x2B);
+}
+
+/* runtime scratch for one dispatch, below the runtime's own frame; handlers run below it */
+static uint64_t seh_area(CPU* c) { return (c->r[4] - 0x1000) & ~15ull; }
+
+/* the dispatcher's own registration, which Windows puts at the head of the chain while a handler runs: the CRT's
+   catch code relinks it on top of the catching frame after unwinding (_UnwindNestedFrames), so without it the
+   catching frame would be linked to itself. Its handler lets every search go on past it. */
+static void seh_dispatcher(CPU* c) { RET(1); }
+
+/* calls handler(record, frame, context, dispatcher context); returns its EXCEPTION_DISPOSITION */
+static uint32_t seh_call(CPU* c, uint64_t area, uint32_t reg, uint64_t rec, uint64_t ctx)
+{
+    static uint64_t thunk;
+    if (!thunk) thunk = rt_dyn_thunk_n(seh_dispatcher, "seh_dispatcher", 0);
+    uint64_t save = c->r[4], node = area + 0x700;
+    ST32(node, LD32(c->gsbase));
+    ST32(node + 4, thunk);
+    ST32(c->gsbase, node);
+    uint64_t a[4] = { rec, reg, ctx, area + 0x600 };
+    ST32(area + 0x600, 0);
+    c->r[4] = area;
+    uint32_t r = (uint32_t)rt_invoke(c, LD32(reg + 4), 4, a);
+    c->r[4] = save;
+    /* whatever the handler left under the dispatcher's record */
+    if ((uint32_t)LD32(c->gsbase) == (uint32_t)node) ST32(c->gsbase, LD32(node));
+    return r;
+}
+
+/* RaiseException for 32-bit games: returns 1 if a handler said to continue execution, 0 if nothing handled it (a
+   catch never returns here) */
+int rt_seh_raise32(CPU* c, uint32_t code, uint32_t flags, uint32_t n, uint64_t args, uint32_t ret, uint32_t esp)
+{
+    EhThread* t = eh_me();
+    uint64_t area = seh_area(c), rec = area + 0x100, ctx = area + 0x200;
+    seh_record(rec, code, flags, ret, n, args);
+    seh_context(c, ctx, ret, esp);
+    if (t && t->nd < EH_DEPTH) t->disp_sp[t->nd++] = esp;
+    int handled = 0;
+    static int dbg = -1;
+    if (dbg < 0) dbg = host_query_flag("sehdebug");
+    /* the chain runs up the stack: anything else is a broken chain, not a handler to call again */
+    uint32_t reg = (uint32_t)LD32(c->gsbase), prev = 0;
+    for (; seh_frame_ok(c, reg) && reg > prev; prev = reg, reg = (uint32_t)LD32(reg)) {
+        uint32_t d = seh_call(c, area, reg, rec, ctx);
+        if (dbg) host_log("[seh]   frame %x handler %x -> %u", reg, (unsigned)LD32(reg + 4), d);
+        if (d == 0 && !(flags & 1)) { handled = 1; break; }   /* ExceptionContinueExecution */
+    }
+    if (dbg && !handled) host_log("[seh]   chain ends at %x (after %x)", reg, prev);
+    if (t && t->nd) t->nd--;
+    return handled;
+}
+
+/* RtlUnwind(target frame, target ip, record, return value) for 32-bit games: every handler above the target frame is
+   called with the unwinding flag (they run their destructors) and taken off the chain; then back to the caller */
+void rt_seh_unwind32(CPU* c, uint32_t target, uint64_t record, uint32_t ret, uint32_t esp)
+{
+    uint64_t area = seh_area(c), rec = area + 0x100, ctx = area + 0x200;
+    if (record) {
+        memcpy(G2H(rec), G2H(record), 80);
+        ST32(rec + 4, (uint32_t)LD32(rec + 4) | 2 | (target ? 0 : 4));   /* EXCEPTION_UNWINDING, EXIT_UNWIND */
+    } else seh_record(rec, 0xC0000027u, 2 | (target ? 0 : 4), ret, 0, 0);   /* STATUS_UNWIND */
+    seh_context(c, ctx, ret, esp);
+    uint32_t reg = (uint32_t)LD32(c->gsbase);
+    while (seh_frame_ok(c, reg) && reg != target) {
+        uint32_t next = (uint32_t)LD32(reg);
+        seh_call(c, area, reg, rec, ctx);
+        ST32(c->gsbase, next);
+        if (next <= reg) break;
+        reg = next;
+    }
+}
+
 void rt_sj_jump(CPU* c, uint64_t jb, uint64_t val)
 {
     static const int regs[] = { 3, 4, 5, 6, 7, 12, 13, 14, 15 };
@@ -1283,4 +1597,99 @@ void rt_atomic_begin(uint64_t a)
     while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) while (__atomic_load_n(l, __ATOMIC_RELAXED)) {}
 }
 void rt_atomic_end(uint64_t a) { __atomic_store_n(&atomic_stripes[(a >> 4) & 8191], 0, __ATOMIC_RELEASE); }
+#endif
+
+#ifdef UEW_G32CHECK
+void rt_g32_wide(const char* fn)
+{
+    static const char* seen[512];
+    static int n;
+    for (int i = 0; i < n; i++) if (seen[i] == fn) return;
+    if (n < 512) seen[n++] = fn;
+    host_log("[g32] 64-bit guest access in %s", fn);
+}
+#endif
+
+#ifdef UEW_EBPCHECK
+/* ?ebpwatch=<hex>: the first recompiled function entered with that guest ebp, with this thread's own recent history of
+   function entries (esp, ebp), printed where the stack pointer moved between memory regions. Also logs the first
+   function entered with a misaligned esp. Debug builds only (UEW_EXTRA_CFLAGS=-DUEW_EBPCHECK). */
+enum { EH = 16384 };
+typedef struct { CPU* c; unsigned n; struct { const char* fn; uint32_t sp, bp; } e[EH]; } EbpHist;
+static void ebp_dump(EbpHist* h, CPU* c, const char* tag)
+{
+    uint32_t next_sp = (uint32_t)c->r[4];
+    int shown = 0;
+    for (unsigned i = h->n; i-- > (h->n > EH ? h->n - EH : 0) && shown < 60;) {
+        unsigned k = i % EH;
+        if ((h->e[k].sp >> 20) != (next_sp >> 20) || i + 40 > h->n) {
+            host_log("[%s]   -%u %s esp=%x ebp=%x", tag, h->n - 1 - i, h->e[k].fn, h->e[k].sp, h->e[k].bp);
+            shown++;
+        }
+        next_sp = h->e[k].sp;
+    }
+    /* the outermost functions entered in the whole window: the callers of whatever the thread keeps doing */
+    struct { const char* fn; uint32_t sp; unsigned n; } top[24];
+    int nt = 0;
+    for (unsigned i = h->n > EH ? h->n - EH : 0; i < h->n; i++) {
+        unsigned k = i % EH;
+        int j = 0;
+        while (j < nt && top[j].fn != h->e[k].fn) j++;
+        if (j < nt) { top[j].n++; if (h->e[k].sp > top[j].sp) top[j].sp = h->e[k].sp; continue; }
+        if (nt < 24) { top[nt].fn = h->e[k].fn; top[nt].sp = h->e[k].sp; top[nt].n = 1; nt++; continue; }
+        int lo = 0;
+        for (int m = 1; m < nt; m++) if (top[m].sp < top[lo].sp) lo = m;
+        if (h->e[k].sp > top[lo].sp) { top[lo].fn = h->e[k].fn; top[lo].sp = h->e[k].sp; top[lo].n = 1; }
+    }
+    for (int a = 0; a < nt; a++)
+        for (int b = a + 1; b < nt; b++)
+            if (top[b].sp > top[a].sp) { __typeof__(top[0]) t = top[a]; top[a] = top[b]; top[b] = t; }
+    for (int a = 0; a < nt && a < 16; a++)
+        host_log("[%s]   outer %s esp=%x (%u entries)", tag, top[a].fn, top[a].sp, top[a].n);
+}
+static EbpHist* hs[64];
+/* the thread dump (debug panel): every thread's latest function entries, to see where a busy thread loops */
+void rt_ebp_dump_all(void)
+{
+    for (int i = 0; i < 64 && hs[i]; i++) {
+        host_log("[hist] state %p:", (void*)hs[i]->c);
+        ebp_dump(hs[i], hs[i]->c, "hist");
+    }
+}
+void rt_ebp_check(CPU* c, const char* fn)
+{
+    static uint64_t want = ~0ull;
+    static int done, sp_done;
+    if (want == ~0ull) want = (uint64_t)host_query_hex("ebpwatch");
+    EbpHist* h = NULL;
+    for (int i = 0; i < 64; i++) {
+        if (!hs[i]) { hs[i] = calloc(1, sizeof(EbpHist)); hs[i]->c = c; }
+        if (hs[i]->c == c) { h = hs[i]; break; }
+    }
+    if (!h) return;
+    if (want && !done && (uint32_t)c->r[5] == (uint32_t)want) {
+        done = 1;
+        host_log("[ebp] %llx first seen entering %s from %llx (thread %u, state %p)", (unsigned long long)want, fn,
+                 (unsigned long long)(RT_G32 ? LD32(c->r[4]) : LD64(c->r[4])), sched_current_id(), (void*)c);
+        if (RT_G32) {
+            uint64_t sp = c->r[4];
+            host_log("[ebp]   esp=%llx eax=%llx ecx=%llx edx=%llx ebx=%llx esi=%llx edi=%llx", (unsigned long long)sp,
+                     (unsigned long long)c->r[0], (unsigned long long)c->r[1], (unsigned long long)c->r[2],
+                     (unsigned long long)c->r[3], (unsigned long long)c->r[6], (unsigned long long)c->r[7]);
+            for (int i = 0; i < 32; i += 8)
+                host_log("[ebp]   [esp+%02x] %08x %08x %08x %08x %08x %08x %08x %08x", 4 * i, (unsigned)LD32(sp + 4ull * i),
+                         (unsigned)LD32(sp + 4ull * i + 4), (unsigned)LD32(sp + 4ull * i + 8), (unsigned)LD32(sp + 4ull * i + 12),
+                         (unsigned)LD32(sp + 4ull * i + 16), (unsigned)LD32(sp + 4ull * i + 20), (unsigned)LD32(sp + 4ull * i + 24),
+                         (unsigned)LD32(sp + 4ull * i + 28));
+        }
+        ebp_dump(h, c, "ebp");
+    }
+    if (RT_G32 && !sp_done && (c->r[4] & 3)) {
+        sp_done = 1;
+        host_log("[esp] %llx not aligned entering %s (thread %u)", (unsigned long long)c->r[4], fn, sched_current_id());
+        ebp_dump(h, c, "esp");
+    }
+    unsigned k = h->n++ % EH;
+    h->e[k].fn = fn; h->e[k].sp = (uint32_t)c->r[4]; h->e[k].bp = (uint32_t)c->r[5];
+}
 #endif

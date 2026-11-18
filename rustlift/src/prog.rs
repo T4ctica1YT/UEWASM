@@ -18,6 +18,9 @@ pub struct Module {
     pub tls_callbacks: Vec<u64>,
     pub relocs: Vec<u64>,
     pub sj_slots: HashSet<u64>,
+    /// 32-bit C++ try/catch: functions that get a host setjmp (start -> frame pointer offset) and catch continuations
+    pub eh_starts: HashMap<u64, u64>,
+    pub eh_conts: Vec<u64>,
 }
 
 pub struct Program {
@@ -30,8 +33,59 @@ pub struct Program {
     pub order: Vec<u64>,
     pub blocks: HashMap<u64, BTreeSet<u64>>,
     pub sj_funcs: HashSet<u64>,
+    /// 32-bit: call targets whose flags are read after they return (find_flag_returns)
+    pub flag_ret: HashSet<u64>,
+    /// 32-bit: bytes pushed for each indirect call, by return address
+    pub call_args: Vec<(u64, u32)>,
+    /// relocated slots (rvas): in 32-bit modules with relocations they mark jump-table entries exactly
+    pub relocset: HashSet<u64>,
     pub ptr: u64,
     funcs_sorted: Vec<(u64, u64)>,
+}
+
+fn fs_load(ins: &Instruction) -> bool {
+    ins.mnemonic() == Mnemonic::Mov && ins.op0_kind() == OpKind::Register && ins.op0_register() == Register::EAX
+        && ins.op1_kind() == OpKind::Memory && ins.memory_segment() == Register::FS
+}
+
+/// part of a 32-bit MSVC prologue: frame, saved registers, locals, EH registration, /GS cookie (lift.py: _prologue_ins)
+fn prologue_ins(ins: &Instruction, prev: Option<&Instruction>) -> bool {
+    let imm = |k: OpKind| k == OpKind::Immediate8to32 || k == OpKind::Immediate32;
+    let k0 = ins.op0_kind();
+    match ins.mnemonic() {
+        Mnemonic::Push => {
+            if k0 == OpKind::Register {
+                let r = ins.op0_register();
+                if matches!(r, Register::EBP | Register::EBX | Register::ESI | Register::EDI | Register::ECX) {
+                    return true;
+                }
+                return r == Register::EAX && prev.map_or(false, |p| fs_load(p) || (p.mnemonic() == Mnemonic::Xor
+                    && p.op0_kind() == OpKind::Register && p.op0_register() == Register::EAX));
+            }
+            if imm(k0) {
+                let v = ins.immediate(0) & 0xFFFF_FFFF;
+                return v == 0xFFFF_FFFF || v == 0xFFFF_FFFE || prev.map_or(false, |p| p.mnemonic() == Mnemonic::Push && imm(p.op0_kind()));
+            }
+            false
+        }
+        Mnemonic::Mov => {
+            if k0 == OpKind::Register && ins.op0_register() == Register::EBP {
+                return ins.op1_kind() == OpKind::Register && ins.op1_register() == Register::ESP;
+            }
+            if k0 == OpKind::Register && ins.op0_register() == Register::EAX && ins.op1_kind() == OpKind::Memory {
+                return ins.memory_segment() == Register::FS || (ins.memory_base() == Register::None && ins.memory_index() == Register::None);
+            }
+            if k0 == OpKind::Memory && ins.op1_kind() == OpKind::Register && ins.op1_register() == Register::EAX {
+                return ins.memory_segment() == Register::FS || matches!(ins.memory_base(), Register::EBP | Register::ESP);
+            }
+            false
+        }
+        Mnemonic::Sub => k0 == OpKind::Register && ins.op0_register() == Register::ESP && imm(ins.op1_kind()),
+        Mnemonic::Xor => k0 == OpKind::Register && ins.op0_register() == Register::EAX && ins.op1_kind() == OpKind::Register
+            && matches!(ins.op1_register(), Register::EBP | Register::ESP),
+        Mnemonic::Lea => k0 == OpKind::Register && ins.op0_register() == Register::EAX && matches!(ins.memory_base(), Register::EBP | Register::ESP),
+        _ => false,
+    }
 }
 
 pub fn decode_at(bits: u32, base: u64, img: &[u8], a: u64) -> Instruction {
@@ -53,8 +107,9 @@ impl Program {
         let ptr = (m.bits / 8) as u64;
         let mut p = Program {
             m, text, roots: HashSet::new(), starts: vec![], ends: HashMap::new(), jt: HashMap::new(), order: vec![],
-            blocks: HashMap::new(), sj_funcs: HashSet::new(), ptr, funcs_sorted,
+            blocks: HashMap::new(), sj_funcs: HashSet::new(), flag_ret: HashSet::new(), call_args: vec![], ptr, funcs_sorted, relocset: HashSet::new(),
         };
+        p.relocset = p.m.relocs.iter().copied().collect();
         if p.m.bits == 32 {
             p.sj_funcs = p.find_setjmp32();
         }
@@ -156,6 +211,145 @@ impl Program {
         live
     }
 
+    /// code at a reads the status flags before writing them, along straight-line code (no jumps or calls followed):
+    /// a call there has to hand the caller's flags over
+    pub fn flags_read_first(&self, cache: &mut HashMap<u64, Instruction>, a: u64) -> bool {
+        let mut written: u32 = 0;
+        let mut p = a;
+        for _ in 0..64 {
+            let ins = self.decode(cache, p);
+            if ins.code() == Code::INVALID {
+                return false;
+            }
+            if ins.rflags_read() & 0x3F & !written != 0 {
+                return true;
+            }
+            written |= ins.rflags_modified();
+            if (written & 0x3F) == 0x3F || ins.flow_control() != FlowControl::Next {
+                return false;
+            }
+            p = ins.next_ip();
+        }
+        false
+    }
+
+    /// after a call returns to a, the callee's flags are read: by the next instructions, or by code the next call
+    /// hands them to (the CRT's x87 helpers return results in the flags: _CIlog checks its argument that way)
+    pub fn flags_live_after_call(&self, cache: &mut HashMap<u64, Instruction>, a: u64) -> bool {
+        let mut written: u32 = 0;
+        let mut p = a;
+        for _ in 0..64 {
+            let ins = self.decode(cache, p);
+            if ins.code() == Code::INVALID {
+                return false;
+            }
+            if ins.rflags_read() & 0x3F & !written != 0 {
+                return true;
+            }
+            written |= ins.rflags_modified();
+            if (written & 0x3F) == 0x3F {
+                return false;
+            }
+            let fc = ins.flow_control();
+            if fc == FlowControl::Call {
+                let near = matches!(ins.op_kind(0), OpKind::NearBranch32 | OpKind::NearBranch64);
+                return near && written & 0x3F == 0 && !self.func_start(ins.near_branch_target())
+                    && self.flags_read_first(cache, ins.near_branch_target());
+            }
+            if fc != FlowControl::Next {
+                return false;
+            }
+            p = ins.next_ip();
+        }
+        false
+    }
+
+    /// bytes pushed for each call through a register or vtable in the block at lab: counted from the end of the
+    /// function's prologue, the block's start or the last call (lift.py: site_args)
+    fn site_args(&self, cache: &mut HashMap<u64, Instruction>, root: u64, lab: u64, labels: &BTreeSet<u64>, out: &mut Vec<(u64, u32)>) {
+        let (mut a, mut n, mut prologue) = (lab, 0u64, lab == root);
+        let mut prev: Option<Instruction> = None;
+        for _ in 0..4096 {
+            let ins = self.decode(cache, a);
+            if ins.code() == Code::INVALID {
+                return;
+            }
+            let fc = ins.flow_control();
+            if prologue && prologue_ins(&ins, prev.as_ref()) {
+                prev = Some(ins);
+            } else {
+                prologue = false;
+                let k0 = if ins.op_count() > 0 { Some(ins.op0_kind()) } else { None };
+                let esp = k0 == Some(OpKind::Register) && ins.op0_register() == Register::ESP;
+                if fc == FlowControl::Call || fc == FlowControl::IndirectCall {
+                    if fc == FlowControl::IndirectCall
+                        && (k0 == Some(OpKind::Register) || (k0 == Some(OpKind::Memory) && ins.memory_base() != Register::None)) {
+                        out.push((ins.next_ip(), n as u32));
+                    }
+                    n = 0;
+                } else if ins.mnemonic() == Mnemonic::Push {
+                    n += 4;
+                } else if ins.mnemonic() == Mnemonic::Pop {
+                    n = n.saturating_sub(4);
+                } else if matches!(ins.mnemonic(), Mnemonic::Sub | Mnemonic::Add) && esp
+                    && matches!(ins.op1_kind(), OpKind::Immediate8to32 | OpKind::Immediate32) {
+                    let v = ins.immediate(1) & 0xFFFF_FFFF;
+                    n = if ins.mnemonic() == Mnemonic::Sub { n + v } else { n.saturating_sub(v) };
+                } else if esp || ins.mnemonic() == Mnemonic::Leave {
+                    n = 0;
+                }
+            }
+            if fc != FlowControl::Next && fc != FlowControl::Call && fc != FlowControl::IndirectCall {
+                return;
+            }
+            a = ins.next_ip();
+            if labels.contains(&a) {
+                return;
+            }
+        }
+    }
+
+    /// 32-bit: every direct call target whose flags are read after it returns (its rets then hand them over), and the
+    /// bytes pushed for each indirect call (call_args)
+    pub fn find_flag_returns(&mut self) {
+        let mut cache = HashMap::new();
+        let mut sites = vec![];
+        let mut roots: Vec<u64> = self.blocks.keys().copied().collect();
+        roots.sort();
+        for r in roots {
+            let labels = &self.blocks[&r];
+            for &lab in labels {
+                self.site_args(&mut cache, r, lab, labels, &mut sites);
+            }
+        }
+        self.call_args = sites;
+        let mut out = HashSet::new();
+        for labels in self.blocks.values() {
+            for &lab in labels {
+                let mut a = lab;
+                for _ in 0..4096 {
+                    let ins = self.decode(&mut cache, a);
+                    if ins.code() == Code::INVALID {
+                        break;
+                    }
+                    let fc = ins.flow_control();
+                    if fc == FlowControl::Call && matches!(ins.op_kind(0), OpKind::NearBranch32 | OpKind::NearBranch64)
+                        && self.flags_live_after_call(&mut cache, ins.next_ip()) {
+                        out.insert(ins.near_branch_target());
+                    }
+                    if fc != FlowControl::Next && fc != FlowControl::Call {
+                        break;
+                    }
+                    a = ins.next_ip();
+                    if labels.contains(&a) {
+                        break;
+                    }
+                }
+            }
+        }
+        self.flag_ret = out;
+    }
+
     fn rd_ptr(&self, rva: u64) -> u64 {
         let r = rva as usize;
         let img = self.m.img;
@@ -177,6 +371,25 @@ impl Program {
         self.starts.insert(i, t);
     }
 
+    /// 32-bit images without a function table sometimes keep pointer tables inside .text (the CRT's initializer lists
+    /// in msvcr90, for one): a relocated pointer there counts when it is aligned and its target follows a ret or padding,
+    /// as a function start does (jump-table case labels usually don't). Same rule as lift.py.
+    fn code_table_target(&self, site: u64, v: u64) -> bool {
+        if self.m.bits != 32 || site & 3 != 0 {
+            return false;
+        }
+        let t = v.wrapping_sub(self.m.base) as usize;
+        let img = self.m.img;
+        if t < 3 || t > img.len() {
+            return false;
+        }
+        if matches!(img[t - 1], 0xCC | 0x90 | 0xC3) || img[t - 3] == 0xC2 {
+            return true;
+        }
+        // zero alignment padding (msvcrt): only on a 16-byte boundary after four zero bytes
+        t % 16 == 0 && t >= 4 && img[t - 4..t] == [0, 0, 0, 0]
+    }
+
     pub fn discover(&mut self) {
         let base = self.m.base;
         // a chained unwind entry (code the compiler moved out of its function: shrink-wrapped prologues, cold paths) is
@@ -192,6 +405,12 @@ impl Program {
         for cb in self.m.tls_callbacks.clone() {
             self.roots.insert(base + cb);
         }
+        // where a C++ catch resumes: entered from the runtime with the catching function's frame (rt_eh_land)
+        for t in self.m.eh_conts.clone() {
+            if self.in_code(t) {
+                self.roots.insert(t);
+            }
+        }
         for rva in self.m.exports.clone() {
             if self.in_code(base + rva) {
                 self.roots.insert(base + rva);
@@ -199,7 +418,7 @@ impl Program {
         }
         for rva in self.m.relocs.clone() {
             let v = self.rd_ptr(rva);
-            if self.in_code(v) && !self.in_code(base + rva) {
+            if self.in_code(v) && (!self.in_code(base + rva) || self.code_table_target(rva, v)) {
                 self.roots.insert(v);
             }
         }
@@ -407,6 +626,18 @@ impl Program {
                 }
                 let tbl = (ins.memory_displacement64() & 0xFFFFFFFF) as i64 - self.m.base as i64;
                 if !(0 < tbl && (tbl as u64) < self.m.image_size) {
+                    continue;
+                }
+                if !self.relocset.is_empty() && bound.is_none() {
+                    // with relocations the entries are exactly the relocated slots: forwards from the base, and
+                    // backwards too (memmove indexes with a negated count); an unused first slot may overlap code
+                    let tb = tbl as u64;
+                    let ok = |p: u64| self.relocset.contains(&p) && (p as usize) + 4 <= img.len() && self.in_code(self.u32_at(p as usize) as u64);
+                    let mut p = tb;
+                    if !ok(p) { p += 4; }
+                    while ok(p) && p < tb + 4096 { targets.insert(self.u32_at(p as usize) as u64); p += 4; }
+                    let mut p = tb.wrapping_sub(4);
+                    while p < tb && tb - p <= 4096 && ok(p) { targets.insert(self.u32_at(p as usize) as u64); p = p.wrapping_sub(4); }
                     continue;
                 }
                 for n in 0..bound.unwrap_or(1024) {

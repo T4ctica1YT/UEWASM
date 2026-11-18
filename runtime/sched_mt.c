@@ -133,8 +133,10 @@ void sched_note_wait(CPU* c, uint32_t n, uint64_t h, uint32_t ms)
     cur->wait_since = n ? host_ticks_ns() : 0;
 }
 __attribute__((used, visibility("default")))
+void rt_ring_dump(void);
 void uew_threads(void)
 {
+    rt_ring_dump();
     /* called from the page's watchdog timer: waiting for the lock there would stop the page's event loop, which the
        holder may need, so a busy lock means a best-effort read without it */
     int locked = !lock_depth && bl_try();
@@ -629,4 +631,9 @@ void rt_pause(CPU* c)
     if ((++n & 63) == 0) { rt_lock(); sched_yield(c); rt_unlock(); }
 }
 void sched_set_prio(void) { if (!K->current->prio) { K->current->prio = 1; K->nprio++; } }
+#endif
+
+#ifdef UEW_THREADS
+/* real threads: the holder is running on another core */
+void rt_cas_miss(CPU* c) { (void)c; }
 #endif

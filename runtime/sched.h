@@ -27,6 +27,7 @@ typedef struct GThread {
     int carrier;                             /* real-thread builds: the host thread that runs it */
     struct GThread* all_next;                /* real-thread builds: every thread, for lookups by id */
     int lockd;                               /* real-thread builds: its depth in the global lock while switched out */
+    void* eh;                                /* 32-bit games: frames that can catch C++ exceptions (rt.c) */
 } GThread;
 typedef int (*SchedCheck)(GThread* t);
 /* runs other threads until check(current) holds (1) or the deadline passes (0) */

@@ -8,8 +8,9 @@ const UEWG = {
     if (!adapter) return 0;
     const want = ["texture-compression-bc", "texture-compression-bc-sliced-3d", "float32-filterable", "float32-blendable", "rg11b10ufloat-renderable", "depth32float-stencil8",
       "depth-clip-control", "indirect-first-instance", "texture-formats-tier1", "texture-formats-tier2", "texture-component-swizzle", "bgra8unorm-storage", "dual-source-blending"];
-    // debug: window.uewGpuProfile = 1 times every pass on the GPU and logs the slowest ones
-    if (typeof window !== "undefined" && window.uewGpuProfile) want.push("timestamp-query");
+    // debug: ?gpuprof=1 (or window.uewGpuProfile = 1 before the game starts) times every pass on the GPU and logs the slowest ones
+    if (typeof window !== "undefined" && (window.uewGpuProfile || (typeof location !== "undefined" && /[?&]gpuprof=1(&|$)/.test(location.search))))
+      want.push("timestamp-query");
     const features = want.filter(f => adapter.features.has(f));
     const L = adapter.limits, req = {};
     for (const k of ["maxSampledTexturesPerShaderStage", "maxSamplersPerShaderStage", "maxStorageBuffersPerShaderStage", "maxStorageTexturesPerShaderStage",
@@ -31,6 +32,16 @@ const UEWG = {
       ringPtr, enc: null, pass: null, blit: null, frames: 0, draws: 0, dummies: new Map(),
     };
     g.errKinds = new Map();
+    // a lost device (driver reset, Windows' GPU watchdog after a ~2 s frame, GPU process crash) leaves the canvas black
+    // for good while the game keeps running: say so in the log and on the page instead of failing silently
+    device.lost.then(info => {
+      if (info.reason === "destroyed") return;
+      g.lost = info;
+      console.log(`[webgpu] DEVICE LOST (${info.reason}): ${info.message}. The picture stays black until the page is reloaded; ` +
+        "see docs/RENDERING.md, 'Black after it was working'.");
+      const s = typeof document !== "undefined" && document.getElementById("status");
+      if (s) { s.textContent = "The graphics device was lost (GPU reset or driver crash). Reload the page to continue."; s.style.color = "#f88"; }
+    });
     device.addEventListener("uncapturederror", e => {
       const m = e.error.message;
       if (g.errors++ < 40) console.log("[webgpu] " + m.split("\n").slice(0, 3).join(" | "));

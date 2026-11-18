@@ -118,6 +118,17 @@ static inline uint64_t pchk_(uint64_t a, uint64_t v, const char* fn) { if ((v >>
 #define ST16(a, v) st16_(MEMB, (a), (v))
 #define ST32(a, v) st32_(MEMB, (a), (v))
 #define ST64(a, v) st64_(MEMB, (a), pchk_((a), (v), __func__))
+#elif defined(UEW_G32CHECK) && !defined(LIFTED)
+/* debug builds: runtime functions that load or store 64 bits for a 32-bit game, logged once each (pointers and
+   SIZE_T are 4 bytes there; 64-bit fields such as FILETIME are fine, the rest overrun the game's structures) */
+extern const int RT_G32;
+void rt_g32_wide(const char* fn);
+#undef LD64
+#define LD64(a) (RT_G32 ? rt_g32_wide(__func__) : (void)0, ld64_(MEMB, (a)))
+#define ST8(a, v) st8_(MEMB, (a), (v))
+#define ST16(a, v) st16_(MEMB, (a), (v))
+#define ST32(a, v) st32_(MEMB, (a), (v))
+#define ST64(a, v) (RT_G32 ? rt_g32_wide(__func__) : (void)0, st64_(MEMB, (a), (v)))
 #else
 #define ST8(a, v) st8_(MEMB, (a), (v))
 #define ST16(a, v) st16_(MEMB, (a), (v))
@@ -346,6 +357,8 @@ typedef struct IC { _Atomic uint64_t a; GuestFn f; } IC;
 #else
 typedef struct IC { uint64_t a; GuestFn f; } IC;
 #endif
+/* no guest address is all ones, so a fresh cache never matches (a call to address 0 must reach rt_call's trap) */
+#define IC_INIT { ~0ull, 0 }
 void rt_call(CPU* c, uint64_t target);
 void rt_call_ic(CPU* c, uint64_t target, IC* ic);
 void rt_jump(CPU* c, uint64_t target);
@@ -363,6 +376,7 @@ extern uint64_t rt_div_ip;   /* guest address of the division being run (divide 
 void rt_fxsave(CPU* c, uint64_t a);
 void rt_fxrstor(CPU* c, uint64_t a);
 void rt_pause(CPU* c);
+void rt_cas_miss(CPU* c);
 void rt_xgetbv(CPU* c);
 uint64_t rt_crc32(uint64_t crc, uint64_t v, int bytes);
 uint64_t rt_pcmpstr(Flags* f, XMM* x0, XMM a, XMM b, int imm, int64_t la, int64_t lb, int expl, int mask);
@@ -384,3 +398,11 @@ void rt_cmps(CPU* c, Flags* f, int n, int rep);
 
 #include "sse.h"
 #include "x87.h"
+
+#if defined(UEW_EBPCHECK) && defined(LIFTED)
+/* debug builds: ?ebpwatch=<hex> logs the first recompiled function entered with that guest ebp, and the one entered
+   just before it (where a corrupted frame pointer comes from) */
+void rt_ebp_check(CPU* c, const char* fn);
+#define MEM (rt_ebp_check(c, __func__), MEM)
+#endif
+

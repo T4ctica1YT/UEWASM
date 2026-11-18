@@ -463,7 +463,8 @@ class App:
         if not exe:
             self.info["text"] = "Pick the game's install folder (the main *-Shipping.exe is found automatically)." if not self.game.get() else "No Windows executable found there."
             return
-        engine = "Unreal Engine" if any((p / "Engine").is_dir() for p in list(exe.parents)[:5]) else "unknown engine"
+        from .recomp.build import engine_of
+        engine = engine_of(exe) or "unknown engine"
         self.info["text"] = f"{exe.name} · {exe.stat().st_size / 1048576:.0f} MB · {engine}"
         if not self.out.get():
             self.out.set(str(Path.home() / "UEWASM Builds" / exe.stem))

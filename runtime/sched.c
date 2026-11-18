@@ -33,8 +33,10 @@ void sched_note_wait(CPU* c, uint32_t n, uint64_t h, uint32_t ms)
 #ifdef __EMSCRIPTEN__
 __attribute__((used, visibility("default")))
 #endif
+void rt_ring_dump(void);
 void uew_threads(void)
 {
+    rt_ring_dump();
     uint64_t now = host_ticks_ns();
     for (GThread* t = threads; t; t = t->next) {
         if (t->done) continue;
@@ -361,6 +363,13 @@ void rt_pause(CPU* c)
 {
     static unsigned n;
     if ((++n & 63) == 0) sched_yield(c);
+}
+/* a failed lock cmpxchg: with one thread running at a time the value can only be held by a thread that isn't running,
+   so a spin on it (games that poll a lock without pause) must let that thread run */
+void rt_cas_miss(CPU* c)
+{
+    static unsigned n;
+    if ((++n & 3) == 0) sched_yield(c);
 }
 CPU* sched_current_cpu(void) { return current->cpu; }
 void sched_set_prio(void) { if (!current->prio) { current->prio = 1; nprio++; } }

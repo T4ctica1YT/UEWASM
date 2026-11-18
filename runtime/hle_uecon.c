@@ -205,6 +205,9 @@ static uint64_t new_console(uint64_t object, uint64_t console, uint64_t cdo, uin
 
 static int attempt(char* msg, int cap)
 {
+    /* the layouts probed here are UE4/UE5's (64-bit, FName pool or chunked GNames); 32-bit Unreal Engine 3 games
+       lay UObject out differently in almost every version, so nothing is touched there */
+    if (RT_G32) { snprintf(msg, cap, "not available for 32-bit (Unreal Engine 3) games"); return 0; }
     if (!names && !find_names()) { snprintf(msg, cap, "engine name table not found yet"); return 0; }
     if (!objs && !find_objects()) { snprintf(msg, cap, "engine object table not found yet"); return 0; }
     uint64_t object = find("Object", "Class"), console = find("Console", "Class"), gvc = find("GameViewportClient", "Class");
