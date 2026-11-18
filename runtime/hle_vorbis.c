@@ -128,7 +128,7 @@ static void v_read(CPU* c)
     RET((int64_t)r);
 }
 static void v_pcm_seek_page(CPU* c) { S_OR(RET(-131)); RET((int64_t)ov_pcm_seek_page(&s->f, (ogg_int64_t)A2)); }
-static void v_time_seek(CPU* c) { S_OR(RET(-131)); RET((int64_t)ov_time_seek(&s->f, c->x[1].g[0])); }
+static void v_time_seek(CPU* c) { S_OR(RET(-131)); RET((int64_t)ov_time_seek(&s->f, DARG(2, 1))); }
 static void v_time_total(CPU* c) { S_OR(RETD(-131.0)); RETD(ov_time_total(&s->f, (int)A2)); }
 static void v_pcm_total(CPU* c) { S_OR(RET(-131)); RET((int64_t)ov_pcm_total(&s->f, (int)A2)); }
 static void v_halfrate(CPU* c) { S_OR(RET(-131)); RET((int64_t)ov_halfrate(&s->f, (int)A2)); }

@@ -88,6 +88,7 @@ pub struct Ctx<'a> {
 
 pub struct Func<'a> {
     pub c: &'a Ctx<'a>,
+    pub root: u64,
     pub labels: &'a BTreeSet<u64>,
     pub out: Vec<String>,
     pub ins: Instruction,
@@ -748,6 +749,7 @@ impl<'a> Func<'a> {
                 } else {
                     self.emit(format!("R(0) = (R(0) & ~{}) | d_;", mask(s)));
                 }
+                self.emit("SPILL(); rt_cas_miss(c); FILL();");
                 self.emit("} }");
             }
             "CMPXCHG16B" => { let a = self.addr()?; self.emit(format!("SPILL(); rt_cmpxchg16b(c, &F, {a}); FILL();")); }
@@ -801,7 +803,7 @@ impl<'a> Func<'a> {
                 let targets: Vec<u64> = self.c.p.jt.get(&ins.ip()).map(|v| v.iter().copied()
                     .filter(|t| self.labels.contains(t) || self.c.roots.contains(t)).collect()).unwrap_or_default();
                 if targets.is_empty() {
-                    self.emit(format!("{{ static IC ic_; uint64_t t_ = {v}; SPILL(); GuestFn f_ = t_ == ic_.a ? ic_.f : rt_ic_fn(c, t_, &ic_); TAIL f_(c); return; }}"));
+                    self.emit(format!("{{ static IC ic_ = IC_INIT; uint64_t t_ = {v}; SPILL(); GuestFn f_ = t_ == ic_.a ? ic_.f : rt_ic_fn(c, t_, &ic_); TAIL f_(c); return; }}"));
                     return Ok(true);
                 }
                 self.emit(format!("switch ({v}) {{"));
@@ -832,15 +834,23 @@ impl<'a> Func<'a> {
                 if near {
                     let t = ins.near_branch_target();
                     let call = if self.c.roots.contains(&t) { format!("F_{:x}(c);", t) } else { format!("rt_call(c, {});", h(t)) };
-                    self.emit(format!("{push} SPILL(); {call} FILLV();"));
+                    // 32-bit code that hands flags across a call: to a target that reads them on entry, or back from
+                    // a callee whose flags are read after it returns
+                    let (pre, post) = if self.bits() == 32 {
+                        let pre = !self.c.p.func_start(t) && self.c.p.flags_read_first(self.cache, t);
+                        let post = self.c.p.flags_live_after_call(self.cache, ins.next_ip());
+                        (if pre { "rt_xfl = rt_flags(&F); " } else { "" }, if post { " F.fop = F_RAW; F.rawfl = rt_xfl;" } else { "" })
+                    } else { ("", "") };
+                    self.emit(format!("{push} {pre}SPILL(); {call} FILLV();{post}"));
                 } else {
                     let v = self.rd(0, Some(p))?;
-                    self.emit(format!("{{ static IC ic_; uint64_t t_ = {v}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}"));
+                    self.emit(format!("{{ static IC ic_ = IC_INIT; uint64_t t_ = {v}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}"));
                 }
             }
             "RET" => {
                 let extra = if ins.op_count() > 0 { ins.immediate(0) } else { 0 };
-                self.emit(format!("R(4) += {}; SPILL(); return;", self.ptr() as u64 + extra));
+                let fl = if self.c.p.flag_ret.contains(&self.root) { "rt_xfl = rt_flags(&F); " } else { "" };
+                self.emit(format!("{fl}R(4) += {}; SPILL(); return;", self.ptr() as u64 + extra));
                 return Ok(true);
             }
             "INT3" => { self.emit(format!("SPILL(); rt_trap(c, {}, \"int3\"); return;", h(ins.ip()))); return Ok(true); }

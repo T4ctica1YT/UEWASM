@@ -1,5 +1,6 @@
 #pragma once
 #include <stddef.h>
+#include <string.h>
 #include "rt.h"
 
 #define THUNK_BASE 0x10000ull
@@ -113,6 +114,15 @@ uint64_t host_time_100ns(void);
 uint64_t rt_dyn_thunk(GuestFn fn, const char* name);
 /* nargs: stack arguments a 32-bit guest pushes (stdcall: the call pops them) */
 uint64_t rt_dyn_thunk_n(GuestFn fn, const char* name, int nargs);
+/* nargs for a 32-bit callee-cleanup method whose argument count isn't known: it pops what its call site pushed
+   (rt_call_args, from the lifter) */
+#define RT_SITE_ARGS (-1)
+extern const uint32_t rt_call_args[];
+extern const size_t rt_call_arg_count;
+extern const uint32_t rt_steam_appid;
+/* 32-bit: the HLE frame keeps the caller's esp and ecx (a thiscall method's this) above the arguments */
+#define HLE32_ESP(c) ((uint32_t)ld64_(MEMB, (c)->r[4] + 8ull * 21))
+#define HLE32_ECX(c) ((uint32_t)ld64_(MEMB, (c)->r[4] + 8ull * 22))
 int host_query_flag(const char* name);
 /* a page parameter in hex (?name=1e3100000), 0 when absent */
 double host_query_hex(const char* name);
@@ -127,8 +137,23 @@ uint64_t g_mem_used(void);
 #define A2 R(2)
 #define A3 R(8)
 #define A4 R(9)
-#define ARG(n) LD64(R(4) + 8ull * (n))
+#define ARG(n) ld64_(MEMB, R(4) + 8ull * (n))   /* the runtime's own widened frame (rt_hle32), not a guest structure */
 #define RET(v) (R(0) = (uint64_t)(v))
-#define RETD(v) (c->x[0].g[0] = (v))
-#define RETF(v) (c->x[0].f[0] = (v))
+/* floating point: x64 passes double/float arguments in xmm0-3 (by argument position) and returns them in xmm0; a 32-bit
+   cdecl call passes them on the stack (a double takes two 4-byte slots, counted from 1 as A1-A4 are) and returns them in
+   x87 st(0). DARG(slot, pos) / FARG32(slot, pos) read an argument either way; RETD/RETF return one either way. */
+static inline double rt_bits_f64(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }
+static inline float rt_bits_f32(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
+#define DARG(slot, pos) (RT_G32 ? rt_bits_f64(ld64_(MEMB, (uint64_t)HLE32_ESP(c) + 4ull * (slot))) : c->x[pos].g[0])
+#define FARG32(slot, pos) (RT_G32 ? rt_bits_f32((uint32_t)ld64_(MEMB, (uint64_t)HLE32_ESP(c) + 4ull * (slot))) : c->x[pos].f[0])
+/* an integer or pointer argument after a double: its stack slot on 32-bit, its register (A1-A4) on x64 */
+#define IARG32(slot, a64) (RT_G32 ? (uint64_t)(uint32_t)ld64_(MEMB, (uint64_t)HLE32_ESP(c) + 4ull * (slot)) : (uint64_t)(a64))
+static inline void rt_ret_fp(CPU* c, double v, int f32)
+{
+    if (RT_G32) { c->ftop = (c->ftop - 1) & 7; c->st[c->ftop] = v; }
+    else if (f32) c->x[0].f[0] = (float)v;
+    else c->x[0].g[0] = v;
+}
+#define RETD(v) rt_ret_fp(c, (double)(v), 0)
+#define RETF(v) rt_ret_fp(c, (double)(float)(v), 1)
 #define GSTR(p) ((const char*)G2H(p))

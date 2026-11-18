@@ -33,6 +33,8 @@ class PE:
     image_size: int
     sections: list = field(default_factory=list)
     imports: list = field(default_factory=list)
+    # delay-loaded imports (resolved by the DLL's own helper at first call): only read, never linked
+    delay_imports: list = field(default_factory=list)
     relocs: list = field(default_factory=list)
     functions: list = field(default_factory=list)
     unwind: dict = field(default_factory=dict)
@@ -159,6 +161,26 @@ def load(path):
                 q += P
                 slot += P
             p += 20
+
+    rva, size = d(13)
+    p = rva
+    while rva and pe.off(p) is not None:
+        attrs, name_rva, _, iat, int_rva = struct.unpack_from("<IIIII", data, pe.off(p))
+        if not name_rva:
+            break
+        # attribute bit 0 clear: an old (VC6) descriptor holding addresses instead of RVAs
+        fix = 0 if attrs & 1 else image_base
+        dll = pe.cstr(name_rva - fix)
+        q, slot = int_rva - fix, iat - fix
+        while pe.off(q) is not None:
+            v = pe.uptr(q)
+            if not v:
+                break
+            name = f"#{v & 0xFFFF}" if v >> (bits - 1) else pe.cstr(((v & 0x7FFFFFFF) - fix) + 2)
+            pe.delay_imports.append(Import(dll, name, slot))
+            q += P
+            slot += P
+        p += 32
 
     rva, size = d(0)
     if rva:

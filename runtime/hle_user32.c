@@ -5,15 +5,19 @@
 #include <stdlib.h>
 
 typedef struct { uint64_t proc; char name[128]; uint64_t atom; } WClass;
-typedef struct { uint64_t hwnd, proc; int w, h, x, y, visible; uint64_t style, exstyle, userdata; } Wnd;
-typedef struct { uint64_t hwnd, wparam, lparam; uint32_t msg, time; } Msg;
+typedef struct { uint64_t hwnd, proc; int w, h, x, y, visible; uint64_t style, exstyle, userdata; unsigned tid; } Wnd;
+/* tid: the thread whose queue it is in (the window's creator, or a PostThreadMessage target); 0 = any thread */
+typedef struct { uint64_t hwnd, wparam, lparam; uint32_t msg, time; unsigned tid; } Msg;
 
 static WClass classes[64];
 static int nclasses;
 static Wnd wins[64];
 static int nwins;
-static Msg queue[1024];
-static int qhead, qtail;
+/* every thread's posted messages in one list, in posting order; each thread takes only its own (as Windows keeps a
+   queue per thread: a thread waiting in GetMessage for its thread messages mustn't take the game window's input) */
+enum { QMAX = 1024 };
+static Msg queue[QMAX];
+static int qn;
 static uint8_t keys[256];
 static int mouse_x, mouse_y, cursor_count;
 /* the "desktop" is the canvas, so games default to the render size the page asked for */
@@ -40,12 +44,46 @@ static Wnd* wnd(uint64_t h)
     return nwins ? &wins[0] : NULL;
 }
 
+static Wnd* wnd_exact(uint64_t h)
+{
+    for (int i = 0; i < nwins; i++)
+        if (wins[i].hwnd == h) return &wins[i];
+    return NULL;
+}
+
+static void post_to(unsigned tid, uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp)
+{
+    if (qn == QMAX) return;
+    queue[qn++] = (Msg){ hwnd, wp, lp, msg, (uint32_t)(host_ticks_ns() / 1000000), tid };
+}
+
+/* a window's messages go to the thread that created it */
 static void post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp)
 {
-    int next = (qtail + 1) % 1024;
-    if (next == qhead) return;
-    queue[qtail] = (Msg){ hwnd, wp, lp, msg, (uint32_t)(host_ticks_ns() / 1000000) };
-    qtail = next;
+    Wnd* w = wnd_exact(hwnd);
+    post_to(w ? w->tid : 0, hwnd, msg, wp, lp);
+}
+
+/* the first message for this thread that passes GetMessage/PeekMessage's filters (window: 0 any, -1 thread
+   messages only; message range: both 0 = all), or -1 */
+static int find_msg(uint64_t hwnd, uint32_t lo, uint32_t hi)
+{
+    unsigned me = sched_current_id();
+    for (int i = 0; i < qn; i++) {
+        Msg* m = &queue[i];
+        if (m->tid && m->tid != me) continue;
+        if ((int64_t)hwnd == -1 || (uint32_t)hwnd == 0xFFFFFFFFu) { if (m->hwnd) continue; }
+        else if (hwnd && m->hwnd != hwnd) continue;
+        if ((lo || hi) && (m->msg < lo || m->msg > hi)) continue;
+        return i;
+    }
+    return -1;
+}
+
+static void take_msg(int i)
+{
+    memmove(queue + i, queue + i + 1, sizeof queue[0] * (size_t)(qn - i - 1));
+    qn--;
 }
 
 /* input goes to the window the game last showed or focused (UE makes helper windows first) */
@@ -103,12 +141,19 @@ static void wcopy_name(uint64_t p, char* out, size_t cap)
     else wstr_to_utf8(p, out, cap);
 }
 
+/* WNDCLASS(EX): the window procedure and class name; 32-bit games use the 4-byte-pointer layout */
+static void class_fields(uint64_t p, int ex, uint64_t* proc, uint64_t* name)
+{
+    if (RT_G32) { *proc = LD32(p + (ex ? 8 : 4)); *name = LD32(p + (ex ? 40 : 36)); }
+    else { *proc = LD64(p + 8); *name = LD64(p + 64); }
+}
 HLE(RegisterClassW)
 {
     if (nclasses == 64) { RET(0); return; }
     WClass* k = &classes[nclasses++];
-    k->proc = LD64(A1 + 8);
-    wcopy_name(LD64(A1 + 64), k->name, sizeof k->name);
+    uint64_t name;
+    class_fields(A1, 0, &k->proc, &name);
+    wcopy_name(name, k->name, sizeof k->name);
     k->atom = 0xC000 + (uint64_t)nclasses;
     RET(k->atom);
 }
@@ -116,8 +161,9 @@ HLE(RegisterClassExW)
 {
     if (nclasses == 64) { RET(0); return; }
     WClass* k = &classes[nclasses++];
-    k->proc = LD64(A1 + 8);
-    wcopy_name(LD64(A1 + 64), k->name, sizeof k->name);
+    uint64_t name;
+    class_fields(A1, 1, &k->proc, &name);
+    wcopy_name(name, k->name, sizeof k->name);
     k->atom = 0xC000 + (uint64_t)nclasses;
     RET(k->atom);
 }
@@ -132,8 +178,10 @@ static void register_class_a(CPU* c)
 {
     if (nclasses == 64) { RET(0); return; }
     WClass* k = &classes[nclasses++];
-    k->proc = LD64(A1 + 8);
-    acopy_name(LD64(A1 + 64), k->name, sizeof k->name);
+    uint64_t name;
+    /* the ANSI entry serves WNDCLASSA and WNDCLASSEXA alike: the Ex form starts with its size */
+    class_fields(A1, LD32(A1) == (RT_G32 ? 48u : 80u), &k->proc, &name);
+    acopy_name(name, k->name, sizeof k->name);
     k->atom = 0xC000 + (uint64_t)nclasses;
     RET(k->atom);
 }
@@ -169,6 +217,7 @@ HLE(CreateWindowExW)
     Wnd* w = &wins[nwins];
     memset(w, 0, sizeof *w);
     w->hwnd = HWND_BASE + 0x10ull * (uint64_t)(nwins + 1);
+    w->tid = sched_current_id();
     w->proc = k ? k->proc : 0;
     w->style = A4;
     w->exstyle = A1;
@@ -178,19 +227,21 @@ HLE(CreateWindowExW)
     w->x = x == (int)0x80000000 ? 0 : x;
     w->y = y == (int)0x80000000 ? 0 : y;
     nwins++;
+    /* CREATESTRUCTW: params, instance, menu, parent (pointer-sized), cy, cx, y, x, style, name, class, ex style */
     uint64_t cs = g_calloc(80);
-    ST64(cs, ARG(12));
-    ST64(cs + 8, ARG(11));
-    ST64(cs + 16, ARG(10));
-    ST64(cs + 24, ARG(9));
-    ST32(cs + 32, (uint32_t)w->h);
-    ST32(cs + 36, (uint32_t)w->w);
-    ST32(cs + 40, (uint32_t)w->y);
-    ST32(cs + 44, (uint32_t)w->x);
-    ST32(cs + 48, (uint32_t)A4);
-    ST64(cs + 56, A3);
-    ST64(cs + 64, A2);
-    ST32(cs + 72, (uint32_t)A1);    uint64_t hwnd = w->hwnd;
+    uint32_t q = GP;
+    STP(cs, ARG(12));
+    STP(cs + q, ARG(11));
+    STP(cs + 2 * q, ARG(10));
+    STP(cs + 3 * q, ARG(9));
+    ST32(cs + 4 * q, (uint32_t)w->h);
+    ST32(cs + 4 * q + 4, (uint32_t)w->w);
+    ST32(cs + 4 * q + 8, (uint32_t)w->y);
+    ST32(cs + 4 * q + 12, (uint32_t)w->x);
+    ST32(cs + 4 * q + 16, (uint32_t)A4);
+    STP(cs + (RT_G32 ? 36 : 56), A3);
+    STP(cs + (RT_G32 ? 40 : 64), A2);
+    ST32(cs + (RT_G32 ? 44 : 72), (uint32_t)A1);    uint64_t hwnd = w->hwnd;
     int idx = nwins - 1;
     call_wndproc(c, &wins[idx], 0x0081, 0, cs);
     call_wndproc(c, &wins[idx], 0x0001, 0, cs);
@@ -208,22 +259,23 @@ HLE(DefWindowProcW)
 }
 HLE(CallWindowProcW) { uint64_t a[4] = { A2, A3, A4, ARG(5) }; RET(rt_invoke(c, A1, 4, a)); }
 
-static int pump(CPU* c)
+static int pump(CPU* c, uint64_t hwnd, uint32_t lo, uint32_t hi)
 {
     host_poll_events();
     (void)c;
-    return qhead != qtail;
+    return find_msg(hwnd, lo, hi);
 }
 
+/* MSG: hwnd, message, wParam, lParam (pointer-sized from hwnd on), time, pt */
 static void write_msg(uint64_t p, Msg* m)
 {
-    ST64(p, m->hwnd);
-    ST32(p + 8, m->msg);
-    ST64(p + 16, m->wparam);
-    ST64(p + 24, m->lparam);
-    ST32(p + 32, m->time);
-    ST32(p + 36, (uint32_t)mouse_x);
-    ST32(p + 40, (uint32_t)mouse_y);
+    STP(p, m->hwnd);
+    ST32(p + GP, m->msg);
+    STP(p + 2 * GP, m->wparam);
+    STP(p + 3 * GP, m->lparam);
+    ST32(p + 4 * GP, m->time);
+    ST32(p + 4 * GP + 4, (uint32_t)mouse_x);
+    ST32(p + 4 * GP + 8, (uint32_t)mouse_y);
 }
 
 HLE(PeekMessageW)
@@ -235,33 +287,37 @@ HLE(PeekMessageW)
         RET(1);
         return;
     }
-    if (!pump(c)) { RET(0); return; }
-    write_msg(A1, &queue[qhead]);
-    if (ARG(5) & 1) qhead = (qhead + 1) % 1024;
+    int i = pump(c, A2, (uint32_t)A3, (uint32_t)A4);
+    if (i < 0) { RET(0); return; }
+    write_msg(A1, &queue[i]);
+    if (ARG(5) & 1) take_msg(i);
     RET(1);
 }
 HLE(PeekMessageA) { hle_PeekMessageW(c); }
 HLE(GetMessageW)
 {
-    while (!pump(c) && !quit_posted) {
+    uint64_t out = A1, hwnd = A2;
+    uint32_t lo = (uint32_t)A3, hi = (uint32_t)A4;
+    int i;
+    while ((i = pump(c, hwnd, lo, hi)) < 0 && !quit_posted) {
         sched_wait_frame(c);
     }
-    if (quit_posted) { RET(0); return; }
-    write_msg(A1, &queue[qhead]);
-    qhead = (qhead + 1) % 1024;
+    if (i < 0) { RET(0); return; }
+    write_msg(out, &queue[i]);
+    take_msg(i);
     RET(1);
 }
 HLE(TranslateMessage) { RET(0); }
 HLE(DispatchMessageW)
 {
-    Wnd* w = wnd(LD64(A1));
-    RET(call_wndproc(c, w, (uint32_t)LD32(A1 + 8), LD64(A1 + 16), LD64(A1 + 24)));
+    Wnd* w = wnd_exact(LDP(A1));
+    RET(w ? call_wndproc(c, w, (uint32_t)LD32(A1 + GP), LDP(A1 + 2 * GP), LDP(A1 + 3 * GP)) : 0);
 }
 HLE(DispatchMessageA) { hle_DispatchMessageW(c); }
 HLE(PostMessageW) { post(A1 ? A1 : main_hwnd(), (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
 HLE(SendMessageW) { RET(call_wndproc(c, wnd(A1), (uint32_t)A2, A3, A4)); }
 HLE(PostQuitMessage) { quit_posted = 1; RET(0); }
-HLE(PostThreadMessageW) { post(main_hwnd(), (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
+HLE(PostThreadMessageW) { post_to((unsigned)A1, 0, (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
 STUB(WaitMessage, 1)
 STUB(MsgWaitForMultipleObjects, 0x102)
 STUB(GetQueueStatus, 0)

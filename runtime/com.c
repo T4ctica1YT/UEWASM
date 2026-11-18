@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static ComKind* kinds[64];
 static int nkinds;
@@ -40,12 +41,12 @@ static void qi(CPU* c)
     int ok = iid_eq(iid, unk);
     for (int i = 0; k && !ok && i < k->niids; i++) ok = iid_eq(iid, k->iids[i]);
     if (!ok) {
-        ST64(out, 0);
+        STP(out, 0);
         RET(0x80004002);
         return;
     }
     ST32(THIS + 8, LD32(THIS + 8) + 1);
-    ST64(out, THIS);
+    STP(out, THIS);
     RET(0);
 }
 static void addref(CPU* c) { uint32_t n = (uint32_t)LD32(THIS + 8) + 1; ST32(THIS + 8, n); RET(n); }
@@ -65,16 +66,32 @@ void com_iunknown(ComKind* k)
     k->slots[0] = qi;
     k->slots[1] = addref;
     k->slots[2] = release;
+    k->nargs[0] = 3;
+    k->nargs[1] = 1;
+    k->nargs[2] = 1;
 }
+
+void com_nargs(ComKind* k, const char* n)
+{
+    for (int i = 0; n[i] && i < k->nslots; i++) k->nargs[i] = (uint8_t)(n[i] >= 'a' ? n[i] - 'a' + 10 : n[i] - '0');
+}
+
+float com_fbits(uint64_t v) { float f; uint32_t u = (uint32_t)v; memcpy(&f, &u, 4); return f; }
 
 void com_finalize(ComKind* k)
 {
     if (k->vtbl) return;
     kinds[nkinds++] = k;
-    k->vtbl = g_calloc(8ull * (uint64_t)k->nslots);
+    /* a 32-bit stdcall method that pops the wrong amount moves the game's stack: every implemented method needs its count */
+    if (RT_G32)
+        for (int i = 3; i < k->nslots; i++)
+            if (k->slots[i] && !k->nargs[i]) { host_log("[com] %s: method %d has no 32-bit argument count", k->name, i); break; }
+    k->vtbl = g_calloc((uint64_t)GP * (uint64_t)k->nslots);
     for (int i = 0; i < k->nslots; i++) {
         GuestFn f = k->slots[i] ? k->slots[i] : com_generic[i];
-        ST64(k->vtbl + 8ull * i, rt_dyn_thunk(f, k->name));
+        /* 32-bit COM methods are stdcall: the thunk pops `this` and the arguments */
+        uint64_t t = RT_G32 ? rt_dyn_thunk_n(f, k->name, k->nargs[i] ? k->nargs[i] : 1) : rt_dyn_thunk(f, k->name);
+        STP(k->vtbl + (uint64_t)GP * i, t);
     }
 }
 

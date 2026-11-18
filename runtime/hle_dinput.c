@@ -9,11 +9,12 @@ void user32_di_mouse(int* dx, int* dy, int* dz);
 
 static const uint8_t GUID_SysMouse[16] = { 0x60, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
 static const uint8_t GUID_SysKeyboard[16] = { 0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 };
-static const uint8_t IID_IDirectInput8W[16] = { 0x00, 0x2F, 0x43, 0xBF, 0x9E, 0x56, 0xDA, 0x47, 0x9A, 0x1F, 0xE0, 0x72, 0xE5, 0x7D, 0x6E, 0x3E };
-static const uint8_t IID_IDirectInput8A[16] = { 0x30, 0x80, 0x79, 0xBF, 0x3C, 0x22, 0xD3, 0x47, 0x9F, 0x1B, 0x9F, 0x91, 0x75, 0xB2, 0x5B, 0x3D };
+/* {BF798031-483A-4DA2-AA99-5D64ED369700} and {BF798030-...} */
+static const uint8_t IID_IDirectInput8W[16] = { 0x31, 0x80, 0x79, 0xBF, 0x3A, 0x48, 0xA2, 0x4D, 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 };
+static const uint8_t IID_IDirectInput8A[16] = { 0x30, 0x80, 0x79, 0xBF, 0x3A, 0x48, 0xA2, 0x4D, 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 };
 static const uint8_t iids_di[2][16] = {
-    { 0x00, 0x2F, 0x43, 0xBF, 0x9E, 0x56, 0xDA, 0x47, 0x9A, 0x1F, 0xE0, 0x72, 0xE5, 0x7D, 0x6E, 0x3E },
-    { 0x30, 0x80, 0x79, 0xBF, 0x3C, 0x22, 0xD3, 0x47, 0x9F, 0x1B, 0x9F, 0x91, 0x75, 0xB2, 0x5B, 0x3D } };
+    { 0x31, 0x80, 0x79, 0xBF, 0x3A, 0x48, 0xA2, 0x4D, 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 },
+    { 0x30, 0x80, 0x79, 0xBF, 0x3A, 0x48, 0xA2, 0x4D, 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
 static ComKind K_DI = { "IDirectInput8", 11, {0}, iids_di, 2 };
 static ComKind K_Dev = { "IDirectInputDevice8", 32, {0} };
 
@@ -53,11 +54,11 @@ static int buttons(void) { return (user32_key(1) ? 1 : 0) | (user32_key(2) ? 2 :
 static void di_create_device(CPU* c)
 {
     int kind = iid_eq(A2, GUID_SysKeyboard) ? 1 : iid_eq(A2, GUID_SysMouse) ? 2 : 0;
-    if (!kind) { if (A3) ST64(A3, 0); RET(0x80040154); return; }   /* REGDB_E_CLASSNOTREG: no such device */
+    if (!kind) { if (A3) STP(A3, 0); RET(0x80040154); return; }   /* REGDB_E_CLASSNOTREG: no such device */
     uint64_t o = com_new(&K_Dev, NULL, D_SIZE);
     memset(G2H(DEV(o)), 0, D_SIZE);
     ST32(DEV(o) + D_KIND, (uint32_t)kind);
-    ST64(A3, o);
+    STP(A3, o);
     RET(0);
 }
 /* DIDEVICEINSTANCEW: size, instance guid, product guid, type, instance name[260], product name[260], ff guid, usage page, usage */
@@ -141,11 +142,11 @@ static void dev_state(CPU* c)
     }
     RET(0);
 }
-/* DIDEVICEOBJECTDATA (x64): offset, data, timestamp, sequence, app data (8): 24 bytes */
+/* DIDEVICEOBJECTDATA: offset, data, timestamp, sequence, app data (pointer-sized): 24 bytes on x64, 20 on x86 */
 static void dev_data(CPU* c)
 {
     uint64_t d = DEV(THIS), out = A3, inout = A4;
-    uint32_t each = (uint32_t)A2 ? (uint32_t)A2 : 24, cap = inout ? (uint32_t)LD32(inout) : 0, n = 0, peek = (uint32_t)ARG(5) & 1;
+    uint32_t each = (uint32_t)A2 ? (uint32_t)A2 : (RT_G32 ? 20 : 24), cap = inout ? (uint32_t)LD32(inout) : 0, n = 0, peek = (uint32_t)ARG(5) & 1;
     if (!LD32(d + D_ACQ)) { if (inout) ST32(inout, 0); RET(0x8007000C); return; }
     uint32_t seq = (uint32_t)LD32(d + D_SEQ), t = (uint32_t)(host_ticks_ns() / 1000000);
 #define EVENT(ofs, val) do { if (n < cap && out) { uint64_t e_ = out + (uint64_t)each * n; memset(G2H(e_), 0, each); ST32(e_, (ofs)); ST32(e_ + 4, (val)); ST32(e_ + 8, t); ST32(e_ + 12, seq++); } n++; } while (0)
@@ -185,6 +186,10 @@ static void setup(void)
                       dev_unsupported, dev_info, ok, ok, dev_unsupported, dev_enum_none, dev_unsupported, dev_unsupported, dev_unsupported,
                       dev_enum_none, dev_unsupported, ok, dev_unsupported, dev_enum_none, dev_unsupported, dev_unsupported, dev_unsupported, dev_unsupported };
     for (int i = 3; i < 32; i++) K_Dev.slots[i] = s[i];
+    /* 32-bit: stack arguments per method, `this` included (stdcall) */
+    static const char di_args[] = "31145233465", dev_args[] = "31124331135223423454322421555442";
+    for (int i = 0; di_args[i]; i++) K_DI.nargs[i] = (uint8_t)(di_args[i] - '0');
+    for (int i = 0; dev_args[i]; i++) K_Dev.nargs[i] = (uint8_t)(dev_args[i] - '0');
 }
 
 HLE(DirectInput8Create)
@@ -192,7 +197,7 @@ HLE(DirectInput8Create)
     setup();
     uint64_t out = A4;
     if (!out) { RET(0x80070057); return; }
-    if (A3 && !iid_eq(A3, IID_IDirectInput8W) && !iid_eq(A3, IID_IDirectInput8A)) { ST64(out, 0); RET(0x80004002); return; }
-    ST64(out, com_new(&K_DI, NULL, 0));
+    if (A3 && !iid_eq(A3, IID_IDirectInput8W) && !iid_eq(A3, IID_IDirectInput8A)) { STP(out, 0); RET(0x80004002); return; }
+    STP(out, com_new(&K_DI, NULL, 0));
     RET(0);
 }

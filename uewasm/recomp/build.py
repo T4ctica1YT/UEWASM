@@ -79,6 +79,45 @@ def refresh_thunks(gen):
     return len(new)
 
 
+# lifted files with host setjmps: guest setjmp sites and functions that can catch C++ exceptions
+SJ_DECL = ("#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\n"
+           "jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);\n"
+           "jmp_buf* rt_eh_slot32(CPU* c, uint64_t frame, uint64_t fn);\nvoid rt_eh_land(CPU* c);")
+
+
+def eh_entry(fn, off):
+    """first line of a 32-bit function with a try block: its frame (ebp = entry esp - off) can take a catch's
+    continuation, which the runtime resumes here with a longjmp (rt_eh_slot32)"""
+    return f"    if (setjmp(*rt_eh_slot32(c, (uint32_t)R(4) - {off}, 0x{fn:x}ull))) {{ rt_eh_land(c); return; }}"
+
+
+def steam_appid(exe):
+    """the game's Steam app id (offline Steam reports it): steam_appid.txt beside the exe, or the Steam library manifest
+    whose install folder holds the game; 0 when neither says"""
+    exe = Path(exe)
+    for d in [exe.parent, *list(exe.parents)[:4]]:
+        f = d / "steam_appid.txt"
+        if f.is_file():
+            m = re.match(r"\s*(\d+)", f.read_text(errors="replace"))
+            if m:
+                return int(m[1])
+    parts = [p.lower() for p in exe.parts]
+    if "common" in parts and "steamapps" in parts:
+        i = parts.index("common")
+        if i + 1 < len(parts):
+            apps = Path(*exe.parts[:i])
+            for mf in apps.glob("appmanifest_*.acf"):
+                try:
+                    t = mf.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                m = re.search(r'"installdir"\s*"([^"]*)"', t)
+                a = re.search(r'"appid"\s*"(\d+)"', t)
+                if m and a and m[1].lower() == parts[i + 1]:
+                    return int(a[1])
+    return 0
+
+
 def thunk_pops(thunks, bits):
     """rt_thunk_pops[]: argument bytes each import's callee pops (32-bit stdcall); unknown ones are listed"""
     if bits != 32:
@@ -142,7 +181,7 @@ def _init_worker(all_roots, comments, mode="high"):
 
 
 def _lift_chunk(args):
-    path, base, roots, blocks, ends, out_path, jt = args
+    path, base, roots, blocks, ends, out_path, jt, flag_ret = args
     prog = _W["progs"].get(path)
     if prog is None:
         prog = Program(pemod.load(path), base)
@@ -152,6 +191,7 @@ def _lift_chunk(args):
     prog.blocks = blocks
     prog.ends = ends
     prog.jt = jt
+    prog.flag_ret = flag_ret
     prog.unsupported.clear()
     prog.unsupported_at.clear()
     out = ['#define LIFTED 1', '#include "rt.h"', '#include "funcs.h"', ""]
@@ -159,6 +199,8 @@ def _lift_chunk(args):
     for r in roots:
         fn = Func(prog, r)
         bad += fn.lift()
+        if r in getattr(prog, "eh_starts", {}):
+            fn.out.insert(0, eh_entry(r, prog.eh_starts[r]))
         out.append(f"void F_{r:x}(CPU* __restrict c) {{")
         entry = "2" if prog.func_start(r) or not prog.flags_live(r) else "rt_xfl"
         body, xused = regs_local(fn.out, prog.bits)
@@ -175,9 +217,8 @@ def _lift_chunk(args):
         out.append("")
     prog.cache.clear()
     text = "\n".join(out)
-    if "rt_sj_slot(" in text or "rt_sj_slot32(" in text:
-        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\n'
-                            'jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);', 1)
+    if "rt_sj_slot(" in text or "rt_sj_slot32(" in text or "rt_eh_slot32(" in text:
+        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + SJ_DECL, 1)
     if "rt_xfl" in text:
         text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + XFL_DECL, 1)
     # declare only the functions this file calls: funcs.h names every function in the game (tens of MB on big
@@ -228,11 +269,14 @@ def _lift_python(link, gen, comments, jobs, log, progress, t0):
             ch = mroots[i:i + CHUNK]
             jt = {k: v for k, v in prog.jt.items() if m.base <= k < m.base + m.pe.image_size}
             tasks.append((str(m.path), m.base, ch, {r: prog.blocks[r] for r in ch}, {r: prog.ends.get(r) for r in ch},
-                          str(gen / f"funcs_{len(tasks):04d}.c"), {k: v for k, v in jt.items() if ch[0] <= k < max(prog.ends.get(r) or r + 0x100000 for r in ch)}))
+                          str(gen / f"funcs_{len(tasks):04d}.c"), {k: v for k, v in jt.items() if ch[0] <= k < max(prog.ends.get(r) or r + 0x100000 for r in ch)},
+                          prog.flag_ret))
     unsupported = Counter()
     where = {}
     bad = 0
+    call_args = {}
     for _, prog in progs:
+        call_args.update(prog.call_args)
         prog.cache.clear()
     workers = jobs or resources.plan()["lift_workers"]
     progress("analyze", 1, 1)
@@ -247,7 +291,7 @@ def _lift_python(link, gen, comments, jobs, log, progress, t0):
             for k, v in at.items():
                 where.setdefault(k, v)
             bad += b
-    return roots, len(tasks), unsupported, where, bad
+    return roots, len(tasks), unsupported, where, bad, call_args
 
 
 RUST_DIR = Path(__file__).resolve().parents[2] / "rustlift"
@@ -280,7 +324,11 @@ def _lift_rust(link, out, gen, lo, log, progress, t0):
         pe = m.pe
         exports = [v for v in list(pe.exports.values()) + list(pe.exports_ord.values()) if isinstance(v, int)]
         sj = [m.base + i.iat_rva for i in pe.imports if i.name in SETJMP] if pe.bits == 64 else []
-        mods.append({"base": m.base, "bits": pe.bits, "image_size": pe.image_size, "entry_rva": pe.entry_rva,
+        eh_starts, eh_conts = {}, set()
+        if pe.bits == 32:
+            from . import eh32
+            eh_starts, eh_conts = eh32.analyze(pe.image(m.base), m.base, [(s.rva, s.vsize, s.executable) for s in pe.sections])
+        mods.append({"eh_starts": sorted([a, o] for a, o in eh_starts.items()), "eh_conts": sorted(eh_conts),"base": m.base, "bits": pe.bits, "image_size": pe.image_size, "entry_rva": pe.entry_rva,
                      "sections": [[s.rva, s.vsize, s.executable] for s in pe.sections], "functions": [list(f) for f in pe.functions],
                      "unwind": list(pe.unwind), "family": [[b, r] for b, r in pe.family.items()], "exports": exports,
                      "tls_callbacks": list(pe.tls_callbacks), "relocs": list(pe.relocs), "sj_slots": sj})
@@ -294,8 +342,10 @@ def _lift_rust(link, out, gen, lo, log, progress, t0):
         raise RuntimeError("the Rust lifter failed:\n" + (r.stderr or r.stdout)[-3000:])
     res = json.loads(r.stdout)
     all_roots = set()
+    call_args = {}
     for m, mr in zip(link.order, res["modules"]):
         all_roots.update(mr["roots"])
+        call_args.update((a, n) for a, n in mr.get("call_args", []))
         log(f"  {m.name}: {len(mr['roots'])} functions at 0x{m.base:x}")
     roots = sorted(all_roots)
     log(f"{len(link.order)} modules, {len(roots)} functions ({time.time() - t0:.1f}s; Rust lifter: discovery {res['seconds'][0]:.1f}s, "
@@ -308,7 +358,7 @@ def _lift_rust(link, out, gen, lo, log, progress, t0):
             where.setdefault(k, v)
         bad += ch["bad"]
     progress("lift", 1, 1)
-    return roots, res["files"], unsupported, where, bad
+    return roots, res["files"], unsupported, where, bad, call_args
 
 
 def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, search=(), extra=(), system_dlls=True, progress=nop_progress,
@@ -330,9 +380,9 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
     (out / "image.bin").write_bytes(bytes(span))
     del span
     if lifter == "rust" and not comments:
-        roots, ntasks, unsupported, where, bad = _lift_rust(link, out, gen, lo, log, progress, t0)
+        roots, ntasks, unsupported, where, bad, call_args = _lift_rust(link, out, gen, lo, log, progress, t0)
     else:
-        roots, ntasks, unsupported, where, bad = _lift_python(link, gen, comments, jobs, log, progress, t0)
+        roots, ntasks, unsupported, where, bad, call_args = _lift_python(link, gen, comments, jobs, log, progress, t0)
     log(f"lifted into {ntasks} C files ({time.time() - t0:.1f}s), {bad} instructions unsupported")
 
     lines = ['#include "host.h"', '#include "funcs.h"', ""]
@@ -368,6 +418,12 @@ def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, searc
     lines += [f"    {{0x{r:x}ull, F_{r:x}}}," for r in roots]
     lines.append("    {0, NULL}};")
     lines.append(f"const size_t rt_fn_count = {len(roots)};")
+    # 32-bit: bytes pushed for each indirect call, by return address, for runtime stand-ins called through vtables
+    # whose argument counts aren't known (offline Steam interfaces)
+    sites = sorted(call_args.items())
+    lines.append("const uint32_t rt_call_args[] = {" + (", ".join(f"0x{a:x}, {n}" for a, n in sites) or "0, 0") + "};")
+    lines.append(f"const size_t rt_call_arg_count = {len(sites)};")
+    lines.append(f"const uint32_t rt_steam_appid = {steam_appid(exe)};")
     write_if_changed(gen / "meta.c", "\n".join(lines) + "\n")
     keep = {f"funcs_{i:04d}.c" for i in range(ntasks)} | {"meta.c", "funcs.h"}
     for f in gen.iterdir():
@@ -528,6 +584,25 @@ def _epic_args(exe_rel):
 
 # offline stand-ins for online services: a script the page loads, and launch arguments that point the game at it
 BACKENDS = {"epic": {"script": "epic.js", "args": _epic_args}}
+
+
+def engine_of(exe):
+    """which Unreal Engine generation an installed game is, from its folder layout: "Unreal Engine 3" (cooked packages
+    in <Game>/Cooked*, binaries in Binaries/Win32 or Win64 at the top), "Unreal Engine 4/5" (Engine/Binaries and
+    <Project>/Content/Paks), "Unreal Engine" when it's Unreal but unclear, or None"""
+    for top in list(Path(exe).parents)[:5]:
+        if not (top / "Engine").is_dir():
+            continue
+        try:
+            kids = [d for d in top.iterdir() if d.is_dir() and d.name.lower() != "engine"]
+            if any(c.is_dir() and c.name.lower().startswith("cooked") for d in kids for c in d.iterdir()):
+                return "Unreal Engine 3"
+        except OSError:
+            pass
+        if (top / "Engine" / "Binaries").is_dir() or any(top.glob("*/Content/Paks")):
+            return "Unreal Engine 4/5"
+        return "Unreal Engine"
+    return None
 
 
 def default_args(exe):
@@ -833,7 +908,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     # the debug panel and what it drives (UE console enabler, game speed, call tracing) are only built in when wanted, so
     # a build without them carries none of that code (nothing for a game's anti-cheat to find)
     debug_defs = ["-DUEW_DEBUG_TOOLS"] if debug_panel else []
-    exports = ["_main", "_uew_ctx_start", "_uew_threads"] + (["_uew_set_trace", "_uew_set_speed", "_uew_ue_console"] if debug_panel else [])
+    exports = ["_main", "_uew_ctx_start", "_uew_threads"] + (["_uew_set_trace", "_uew_set_speed", "_uew_ue_console", "_uew_d3d9_trace"] if debug_panel else [])
     jobs = []
     for src in srcs:
         o = str(obj / (src.stem + ".o"))

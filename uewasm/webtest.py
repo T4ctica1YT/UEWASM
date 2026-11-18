@@ -99,6 +99,9 @@ def run(build_dir, seconds=90, report_dir=None):
     info = {}
     if (build_dir / "uewasm.json").is_file():
         info = json.loads((build_dir / "uewasm.json").read_text(encoding="utf-8"))
+    elif (build_dir.parent / "options.json").is_file():
+        # a build folder's web/ beside the options it was built with (renderer: WebGPU needs its browser flags)
+        info = json.loads((build_dir.parent / "options.json").read_text(encoding="utf-8"))
     srv = background(build_dir)
     url = f"http://localhost:{srv.server_port}/index.html"
     console, page_errors, failed = [], [], []
@@ -149,6 +152,7 @@ def run(build_dir, seconds=90, report_dir=None):
                 rd.mkdir(parents=True, exist_ok=True)
                 (rd / "screenshot.png").write_bytes(shot)
                 (rd / "report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+                (rd / "console.txt").write_text("\n".join(console + [f"[pageerror] {e}" for e in page_errors]), encoding="utf-8")
             browser.close()
     finally:
         srv.shutdown()

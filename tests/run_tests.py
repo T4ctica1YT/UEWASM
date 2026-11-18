@@ -18,8 +18,10 @@ def compile_test(src, env, x86=False):
     out = HERE / "bin" / (src.stem + ("32" if x86 else ""))
     out.mkdir(parents=True, exist_ok=True)
     exe = out / f"{src.stem}.exe"
-    # 32-bit builds link the CRT statically, as most 32-bit games ship
-    flags = [f.replace("/MD", "/MT") for f in FLAGS[src.suffix]] if x86 else FLAGS[src.suffix]
+    # 32-bit builds link the CRT statically, as most 32-bit games ship, unless the test asks for the DLL
+    # ("uewasm-test: /MD" in the source: it tests the runtime's own CRT functions)
+    dll_crt = "uewasm-test: /MD" in src.read_text(encoding="utf-8", errors="replace")
+    flags = [f.replace("/MD", "/MT") for f in FLAGS[src.suffix]] if x86 and not dll_crt else FLAGS[src.suffix]
     if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
         r = subprocess.run([build.tool(env, "cl"), "/nologo", *flags, f"/Fe:{exe}", f"/Fo:{out}\\", str(src)],
                            env=env, capture_output=True, text=True, cwd=out)
@@ -43,6 +45,7 @@ def main():
     ap.add_argument("--no-wasm", action="store_true")
     ap.add_argument("--x86", action="store_true", help="build the tests as 32-bit programs")
     ap.add_argument("--threads", choices=["coop", "real"], default="coop", help="web build threading (real: guest threads on several cores)")
+    ap.add_argument("--lifter", choices=["python", "rust"], default="python", help="which lifter recompiles the tests")
     a = ap.parse_args()
     env = build.msvc_env("x86" if a.x86 else "x64")
     srcs = sorted(p for p in HERE.iterdir() if p.suffix in FLAGS and (not a.names or p.stem in a.names))
@@ -50,7 +53,7 @@ def main():
     for src in srcs:
         exe = compile_test(src, env, a.x86)
         out = exe.parent / "recomp"
-        build.recompile(exe, out, mem_mb=256, log=lambda *_: None)
+        build.recompile(exe, out, mem_mb=256, log=lambda *_: None, lifter=a.lifter)
         native = build.build_native(out, log=lambda *_: None)
         clean_saved(exe.parent)
         ref = run([str(exe)], cwd=exe.parent)

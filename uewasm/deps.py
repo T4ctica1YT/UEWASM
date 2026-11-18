@@ -54,6 +54,9 @@ def find_emsdk():
     here = Path(__file__).resolve()
     cands = [os.environ.get("UEWASM_EMSDK"), saved_emsdk(), os.environ.get("EMSDK"), default_emsdk_dir(),
              here.parents[1] / ".toolchain/emsdk", here.parents[2] / ".toolchain/emsdk"]
+    if os.name == "nt":
+        # emsdk's own instructions often put it at the drive root
+        cands.append(Path(os.environ.get("SystemDrive", "C:") + "\\") / "emsdk")
     for c in cands:
         r = emsdk_at(c)
         if r:

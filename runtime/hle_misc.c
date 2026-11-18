@@ -15,7 +15,7 @@ HLE(IdnToAscii) { int64_t n = (int32_t)A3; if (n < 0) { n = 0; while (LD16(A2 + 
 /* registry: empty but writable */
 STUB(RegOpenKeyExW, 2)
 STUB(RegOpenKeyExA, 2)
-HLE(RegCreateKeyExW) { ST64(ARG(8), 0x80000100); if (ARG(9)) ST32(ARG(9), 1); RET(0); }
+HLE(RegCreateKeyExW) { STP(ARG(8), 0x80000100); if (ARG(9)) ST32(ARG(9), 1); RET(0); }
 STUB(RegQueryValueExW, 2)
 STUB(RegQueryValueExA, 2)
 STUB(RegSetValueExW, 0)
@@ -53,7 +53,7 @@ HLE(CoCreateInstance)
         host_log("[com] CoCreateInstance: no class {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", (unsigned)LD32(A1), (unsigned)LD16(A1 + 4),
                  (unsigned)LD16(A1 + 6), g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
     }
-    if (ARG(5)) ST64(ARG(5), 0);
+    if (ARG(5)) STP(ARG(5), 0);
     RET(0x80040154);
 }
 HLE(CoTaskMemAlloc) { RET(g_alloc(A1)); }
@@ -94,7 +94,7 @@ HLE(SysAllocStringByteLen) { RET(bstr_alloc(A1, (uint32_t)A2)); }
 HLE(SysFreeString) { if (A1) g_free(A1 - 4); RET(0); }
 HLE(SysStringLen) { RET(A1 ? LD32(A1 - 4) / 2 : 0); }
 HLE(SysStringByteLen) { RET(A1 ? LD32(A1 - 4) : 0); }
-HLE(SysReAllocString) { uint64_t n = A2 ? bstr_alloc(A2, wlen(A2) * 2) : 0; if (A1 && LD64(A1)) g_free(LD64(A1) - 4); if (A1) ST64(A1, n); RET(n != 0 || !A2); }
+HLE(SysReAllocString) { uint64_t n = A2 ? bstr_alloc(A2, wlen(A2) * 2) : 0; if (A1 && LDP(A1)) g_free(LDP(A1) - 4); if (A1) STP(A1, n); RET(n != 0 || !A2); }
 HLE(VariantInit) { if (A1) memset(G2H(A1), 0, 24); RET(0); }
 HLE(VariantClear) { if (A1) { if (LD16(A1) == 8 && LD64(A1 + 8)) g_free(LD64(A1 + 8) - 4); memset(G2H(A1), 0, 24); } RET(0); }
 
@@ -197,11 +197,11 @@ HLE(SHGetKnownFolderPath)
     uint32_t d1 = LD32(A1);
     const char* p = NULL;
     for (size_t i = 0; i < sizeof known / sizeof *known; i++) if (known[i].d1 == d1) p = known[i].path;
-    if (!p) { if (A4) ST64(A4, 0); RET(0x80070002); return; }
+    if (!p) { if (A4) STP(A4, 0); RET(0x80070002); return; }
     uint64_t out = g_alloc(2 * strlen(p) + 2);
     utf8_to_wstr(p, out, strlen(p) + 1);
     make_user_dir(p);
-    if (A4) ST64(A4, out);
+    if (A4) STP(A4, out);
     RET(0);
 }
 
@@ -245,8 +245,8 @@ HLE(CommandLineToArgvW)
     uint64_t block = g_alloc(8ull * (argc + 1) + 2ull * n);
     uint64_t strs = block + 8ull * (argc + 1);
     for (i = 0; i < n; i++) ST16(strs + 2ull * i, buf[i]);
-    for (i = 0; i < argc; i++) ST64(block + 8ull * i, strs + 2ull * starts[i]);
-    ST64(block + 8ull * argc, 0);
+    for (i = 0; i < argc; i++) STP(block + (uint64_t)GP * i, strs + 2ull * starts[i]);
+    STP(block + (uint64_t)GP * argc, 0);
     if (A2) ST32(A2, (uint32_t)argc);
     RET(block);
 }
@@ -342,7 +342,7 @@ HLE(GetDeviceCaps)
     RET(i == 88 || i == 90 ? 96 : i == 12 ? 32 : i == 8 ? 1920 : i == 10 ? 1080 : i == 116 ? 60 : i == 14 ? 1 : 0);
 }
 HLE(GetTextExtentPoint32W) { ST32(A4, (uint32_t)(8 * A3)); ST32(A4 + 4, 16); RET(1); }
-HLE(CreateDIBSection) { uint32_t w = (uint32_t)LD32(A2 + 4), h = (uint32_t)(int32_t)LD32(A2 + 8); uint64_t bits = g_calloc((uint64_t)w * (h & 0x7FFFFFFF) * 4 + 16); if (A4) ST64(A4, bits); RET(0x90006); }
+HLE(CreateDIBSection) { uint32_t w = (uint32_t)LD32(A2 + 4), h = (uint32_t)(int32_t)LD32(A2 + 8); uint64_t bits = g_calloc((uint64_t)w * (h & 0x7FFFFFFF) * 4 + 16); if (A4) STP(A4, bits); RET(0x90006); }
 STUB(wglCreateContext, 0)
 STUB(wglDeleteContext, 0)
 STUB(wglMakeCurrent, 0)
@@ -394,7 +394,7 @@ HLE(FormatMessageW)
     if (flags & 0x100) {
         uint64_t buf = g_alloc(2 * sizeof b);
         utf8_to_wstr(b, buf, sizeof b);
-        ST64(ARG(5), buf);
+        STP(ARG(5), buf);
     } else utf8_to_wstr(b, ARG(5), (size_t)ARG(6));
     RET(strlen(b));
 }
@@ -402,7 +402,7 @@ HLE(FormatMessageA)
 {
     char b[64];
     snprintf(b, sizeof b, "Error %u", (unsigned)A3);
-    if (A1 & 0x100) { ST64(ARG(5), g_strdup(b)); }
+    if (A1 & 0x100) { STP(ARG(5), g_strdup(b)); }
     else snprintf((char*)G2H(ARG(5)), (size_t)ARG(6), "%s", b);
     RET(strlen(b));
 }
@@ -418,12 +418,13 @@ int hle_cores(void)
 #define CORES hle_cores()
 HLE(GetLogicalProcessorInformation)
 {
-    uint32_t need = 32 * (CORES + 1);
+    /* SYSTEM_LOGICAL_PROCESSOR_INFORMATION: a pointer-sized mask, the relationship, a 16-byte union (24 or 32 bytes) */
+    uint32_t each = RT_G32 ? 24 : 32, need = each * (CORES + 1);
     if ((uint32_t)LD32(A2) < need || !A1) { ST32(A2, need); ST32(g_teb + TEB_ERR, 122); RET(0); return; }
     memset(G2H(A1), 0, need);
-    for (int i = 0; i < CORES; i++) { ST64(A1 + 32ull * i, 1ull << i); ST32(A1 + 32ull * i + 8, 0); }
-    ST64(A1 + 32ull * CORES, (1ull << CORES) - 1);
-    ST32(A1 + 32ull * CORES + 8, 3);
+    for (int i = 0; i < CORES; i++) { STP(A1 + (uint64_t)each * i, 1ull << i); ST32(A1 + (uint64_t)each * i + GP, 0); }
+    STP(A1 + (uint64_t)each * CORES, (1ull << CORES) - 1);
+    ST32(A1 + (uint64_t)each * CORES + GP, 3);
     ST32(A2, need);
     RET(1);
 }
@@ -437,12 +438,12 @@ HLE(GetLogicalProcessorInformationEx)
         ST32(p, rel == 0xFFFF ? 0 : rel);
         ST32(p + 4, each);
         ST16(p + 30, 1);
-        ST64(p + 32, rel == 3 ? (1ull << CORES) - 1 : 1ull << i);
+        STP(p + 32, rel == 3 ? (1ull << CORES) - 1 : 1ull << i);
     }
     ST32(A3, need);
     RET(1);
 }
-HLE(GetThreadGroupAffinity) { memset(G2H(A2), 0, 16); ST64(A2, (1ull << CORES) - 1); RET(1); }
+HLE(GetThreadGroupAffinity) { memset(G2H(A2), 0, 16); STP(A2, (1ull << CORES) - 1); RET(1); }
 HLE(GetNumaHighestNodeNumber) { ST32(A1, 0); RET(1); }
 HLE(GetCurrentProcessorNumberEx) { memset(G2H(A1), 0, 4); RET(0); }
 STUB(FlushProcessWriteBuffers, 0)
@@ -472,7 +473,18 @@ HLE(GetCurrencyFormatW) { uint64_t n = 0; while (LD16(A3 + 2 * n)) n++; if ((int
 HLE(GetNumberFormatW) { uint64_t n = 0; while (LD16(A3 + 2 * n)) n++; if ((int32_t)ARG(6) > (int64_t)n) memcpy(G2H(ARG(5)), G2H(A3), 2 * (n + 1)); RET(n + 1); }
 STUB(GetGeoInfoA, 0)
 STUB(FlushViewOfFile, 1)
-HLE(GlobalMemoryStatus) { ST32(A1, 56); ST32(A1 + 4, 30); ST64(A1 + 8, MEM_SIZE); ST64(A1 + 16, MEM_SIZE / 2); ST64(A1 + 24, MEM_SIZE); ST64(A1 + 32, MEM_SIZE); ST64(A1 + 40, 1ull << 40); ST64(A1 + 48, 1ull << 39); RET(0); }
+/* MEMORYSTATUS: SIZE_T fields, 4 bytes for 32-bit games (capped at 2 GB as Windows does without /LARGEADDRESSAWARE) */
+HLE(GlobalMemoryStatus)
+{
+    if (RT_G32) {
+        uint32_t m = MEM_SIZE > 0x7FFF0000ull ? 0x7FFF0000u : (uint32_t)MEM_SIZE;
+        ST32(A1, 32); ST32(A1 + 4, 30); ST32(A1 + 8, m); ST32(A1 + 12, m / 2); ST32(A1 + 16, m); ST32(A1 + 20, m);
+        ST32(A1 + 24, 0x7FFE0000u); ST32(A1 + 28, 0x60000000u);
+        RET(0);
+        return;
+    }
+    ST32(A1, 56); ST32(A1 + 4, 30); ST64(A1 + 8, MEM_SIZE); ST64(A1 + 16, MEM_SIZE / 2); ST64(A1 + 24, MEM_SIZE); ST64(A1 + 32, MEM_SIZE); ST64(A1 + 40, 1ull << 40); ST64(A1 + 48, 1ull << 39); RET(0);
+}
 STUB(CreateSymbolicLinkW, 0)
 STUB(CreateHardLinkW, 0)
 STUB(AreFileApisANSI, 1)
@@ -541,8 +553,6 @@ STUB(CloseThreadpoolTimer, 0)
 STUB(WaitForThreadpoolTimerCallbacks, 0)
 STUB(FreeLibraryWhenCallbackReturns, 0)
 
-STUB(DirectSoundCreate8, 0x88780078)
-STUB(DirectSoundCreate, 0x88780078)
 /* XINPUT_GAMEPAD: buttons u16, triggers 2 x u8, sticks 4 x s16 */
 static int pad_read(uint32_t i, uint64_t out)
 {
@@ -575,3 +585,34 @@ HLE(XInputGetCapabilities)
 }
 HLE(XInputGetBatteryInformation) { if (A3) { ST8(A3, 1); ST8(A3 + 1, 3); } RET(0); }
 STUB(XInputEnable, 0)
+
+/* calls older (32-bit, UE3-era) games make */
+HLE(GetWindowsDirectoryA) { const char* w = "C:\Windows"; size_t n = strlen(w); if (A1 && A2 > n) memcpy(G2H(A1), w, n + 1); RET(A2 > n ? n : n + 1); }
+HLE(GetSystemWindowsDirectoryW) { RET(utf8_to_wstr("C:\Windows", A1, (size_t)A2)); }
+HLE(GetDiskFreeSpaceA) { if (A2) ST32(A2, 8); if (A3) ST32(A3, 512); if (A4) ST32(A4, 0x1000000); if (ARG(5)) ST32(ARG(5), 0x2000000); RET(1); }
+STUB(GetCursorInfo, 0)
+STUB(LoadKeyboardLayoutW, 0x04090409)
+STUB(UnloadKeyboardLayout, 1)
+STUB(ReportFault, 0)
+STUB(SymSetSearchPath, 1)
+STUB(ldap_bind_s, 0x51)
+STUB(IsDBCSLeadByteEx, 0)
+STUB(ChangeDisplaySettingsA, 0)
+STUB(GetClassLongA, 0)
+STUB(SetPixel, 0)
+
+/* CUDA runtime (GPU PhysX): no CUDA device here, so PhysX keeps its simulation on the CPU */
+HLE(__cudaRegisterFatBinary) { static uint64_t h; if (!h) h = g_calloc(64); RET(h); }
+STUB(__cudaUnregisterFatBinary, 0)
+STUB(__cudaRegisterFunction, 0)
+STUB(__cudaRegisterVar, 0)
+STUB(__cudaRegisterTexture, 0)
+STUB(__cudaRegisterShared, 0)
+HLE(cudaCreateChannelDesc) { if (A1) memset(G2H(A1), 0, 20); RET(A1); }
+STUB(cudaGetDeviceProperties, 38)
+STUB(cudaMalloc, 38)
+STUB(cudaMallocHost, 38)
+STUB(cudaStreamCreate, 38)
+STUB(cudaEventCreate, 38)
+STUB(cudaGetLastError, 38)
+HLE(cudaGetErrorString) { static uint64_t s; if (!s) { s = g_calloc(32); strcpy((char*)G2H(s), "no CUDA device"); } RET(s); }

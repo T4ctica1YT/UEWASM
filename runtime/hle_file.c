@@ -587,7 +587,7 @@ HLE(GetFullPathNameW)
     size_t need = strlen(abs) + 1;
     if (A2 < need) { RET(need); return; }
     size_t n = utf8_to_wstr(abs, A3, (size_t)A2);
-    if (A4) { const char* s = strrchr(abs, '\\'); ST64(A4, s && s[1] ? A3 + 2 * (uint64_t)(s + 1 - abs) : 0); }
+    if (A4) { const char* s = strrchr(abs, '\\'); STP(A4, s && s[1] ? A3 + 2 * (uint64_t)(s + 1 - abs) : 0); }
     RET(n);
 }
 HLE(GetFullPathNameA)
@@ -703,3 +703,4 @@ HLE(GetOverlappedResult)
     if (A2) { ST64(A2, 0); ST32(A3, (uint32_t)LD64(A2 + 8)); }
     RET(1);
 }
+HLE(RemoveDirectoryA) { char host[1200]; guest_to_host_w(GSTR(A1), host, sizeof host); host_rmdir(host); RET(1); }

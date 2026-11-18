@@ -24,7 +24,7 @@ void hle_init(int argc, char** argv)
         list[n++] = g_strdup(i == 0 ? "game.exe" : argv[i]);
     }
     g_argv_p = g_calloc(8ull * (n + 1));
-    for (int i = 0; i < n; i++) ST64(g_argv_p + 8ull * i, list[i]);
+    for (int i = 0; i < n; i++) STP(g_argv_p + (uint64_t)GP * i, list[i]);
     g_argc_p = g_calloc(8);
     ST32(g_argc_p, (uint64_t)n);
     g_env_p = g_calloc(16);
@@ -315,29 +315,30 @@ HLE(strrchr) { const char* p = strrchr(GSTR(A1), (int)(char)A2); RET(p ? (uint64
 HLE(strstr) { const char* p = strstr(GSTR(A1), GSTR(A2)); RET(p ? (uint64_t)(uint32_t)((uint8_t*)p - MEM) : 0); }
 HLE(wcslen) { uint64_t n = 0; while (LD16(A1 + 2 * n)) n++; RET(n); }
 HLE(atoi) { RET((int64_t)atoi(GSTR(A1))); }
-HLE(strtol) { char* e; long long v = strtoll(GSTR(A1), &e, (int)A3); if (A2) ST64(A2, A1 + (uint64_t)(e - GSTR(A1))); RET(v); }
-HLE(strtoul) { char* e; unsigned long long v = strtoull(GSTR(A1), &e, (int)A3); if (A2) ST64(A2, A1 + (uint64_t)(e - GSTR(A1))); RET(v); }
+HLE(strtol) { char* e; long long v = strtoll(GSTR(A1), &e, (int)A3); if (A2) STP(A2, A1 + (uint64_t)(e - GSTR(A1))); RET(v); }
+HLE(strtoul) { char* e; unsigned long long v = strtoull(GSTR(A1), &e, (int)A3); if (A2) STP(A2, A1 + (uint64_t)(e - GSTR(A1))); RET(v); }
 HLE(atof) { RETD(atof(GSTR(A1))); }
-HLE(strtod) { char* e; double v = strtod(GSTR(A1), &e); if (A2) ST64(A2, A1 + (uint64_t)(e - GSTR(A1))); RETD(v); }
+HLE(strtod) { char* e; double v = strtod(GSTR(A1), &e); if (A2) STP(A2, A1 + (uint64_t)(e - GSTR(A1))); RETD(v); }
 HLE(tolower) { RET(tolower((int)A1)); }
 HLE(toupper) { RET(toupper((int)A1)); }
 
-#define MATH1(fn) HLE(fn) { RETD(fn(c->x[0].g[0])); }
-#define MATH1F(fn) HLE(fn) { RETF(fn(c->x[0].f[0])); }
-#define MATH2(fn) HLE(fn) { RETD(fn(c->x[0].g[0], c->x[1].g[0])); }
-#define MATH2F(fn) HLE(fn) { RETF(fn(c->x[0].f[0], c->x[1].f[0])); }
+/* arguments and results in xmm registers on x64, on the stack and in x87 st(0) for 32-bit games (see DARG/RETD) */
+#define MATH1(fn) HLE(fn) { RETD(fn(DARG(1, 0))); }
+#define MATH1F(fn) HLE(fn) { RETF(fn(FARG32(1, 0))); }
+#define MATH2(fn) HLE(fn) { RETD(fn(DARG(1, 0), DARG(3, 1))); }
+#define MATH2F(fn) HLE(fn) { RETF(fn(FARG32(1, 0), FARG32(2, 1))); }
 MATH1(sin) MATH1(cos) MATH1(tan) MATH1(asin) MATH1(acos) MATH1(atan) MATH1(sqrt) MATH1(exp) MATH1(log) MATH1(log10)
 MATH1(floor) MATH1(ceil) MATH1(sinh) MATH1(cosh) MATH1(tanh) MATH1(round) MATH1(trunc) MATH1(log2) MATH1(exp2) MATH1(cbrt)
 MATH2(pow) MATH2(fmod) MATH2(atan2) MATH2(hypot)
 MATH1F(sinf) MATH1F(cosf) MATH1F(tanf) MATH1F(asinf) MATH1F(acosf) MATH1F(atanf) MATH1F(sqrtf) MATH1F(expf) MATH1F(logf)
 MATH1F(log10f) MATH1F(floorf) MATH1F(ceilf) MATH1F(roundf) MATH1F(truncf) MATH1F(log2f) MATH1F(exp2f)
 MATH2F(powf) MATH2F(fmodf) MATH2F(atan2f) MATH2F(hypotf)
-HLE(ldexp) { RETD(ldexp(c->x[0].g[0], (int)R(2))); }
-HLE(frexp) { int e; double v = frexp(c->x[0].g[0], &e); ST32(A2, (uint64_t)e); RETD(v); }
-HLE(modf) { double i; double v = modf(c->x[0].g[0], &i); memcpy(G2H(A2), &i, 8); RETD(v); }
-HLE(modff) { float i; float v = modff(c->x[0].f[0], &i); memcpy(G2H(A2), &i, 4); RETF(v); }
-HLE(_fdclass) { RET(fpclassify(c->x[0].f[0]) == FP_NAN ? 2 : fpclassify(c->x[0].f[0]) == FP_INFINITE ? 1 : 0); }
-HLE(_dclass) { RET(isnan(c->x[0].g[0]) ? 2 : isinf(c->x[0].g[0]) ? 1 : 0); }
+HLE(ldexp) { RETD(ldexp(DARG(1, 0), (int)IARG32(3, R(2)))); }
+HLE(frexp) { int e; double v = frexp(DARG(1, 0), &e); ST32(IARG32(3, A2), (uint64_t)e); RETD(v); }
+HLE(modf) { double i; double v = modf(DARG(1, 0), &i); memcpy(G2H(IARG32(3, A2)), &i, 8); RETD(v); }
+HLE(modff) { float i; float v = modff(FARG32(1, 0), &i); memcpy(G2H(A2), &i, 4); RETF(v); }
+HLE(_fdclass) { float f = FARG32(1, 0); RET(isnan(f) ? 2 : isinf(f) ? 1 : 0); }
+HLE(_dclass) { double d = DARG(1, 0); RET(isnan(d) ? 2 : isinf(d) ? 1 : 0); }
 HLE(__setusermatherr) { RET(0); }
 
 static void qsort_guest(CPU* c, uint64_t base, uint64_t n, uint64_t w, uint64_t cmp, uint8_t* tmp)
@@ -381,8 +382,8 @@ HLE(qsort)
 
 HLE(_initterm)
 {
-    for (uint64_t p = A1, e = A2; p < e; p += 8) {
-        uint64_t fn = LD64(p);
+    for (uint64_t p = A1, e = A2; p < e; p += GP) {
+        uint64_t fn = LDP(p);
         if (fn) rt_invoke(c, fn, 0, NULL);
     }
     RET(0);
@@ -390,8 +391,8 @@ HLE(_initterm)
 
 HLE(_initterm_e)
 {
-    for (uint64_t p = A1, e = A2; p < e; p += 8) {
-        uint64_t fn = LD64(p);
+    for (uint64_t p = A1, e = A2; p < e; p += GP) {
+        uint64_t fn = LDP(p);
         if (fn) {
             uint64_t r = rt_invoke(c, fn, 0, NULL);
             if ((int32_t)r) { RET(r); return; }

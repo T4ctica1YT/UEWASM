@@ -17,8 +17,7 @@
 UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssemably project.
 This tool **doesn't enable piracy on its own**, and any games redistributed with this tool are 
 **responsibility of the distributer, not T4ctica1**. As of today this tool supports games made 
-in Unreal Engine 4 and 5, while plans to add support for Unreal Engine 3 are planned, nothing 
-is implemented yet.
+in Unreal Engine 4 and 5. Unreal Engine 3 support (32-bit games and Direct3D 9) is in progress: see the status table.
 <br>
 
 > [AI Use Disclosure]
@@ -46,6 +45,9 @@ is implemented yet.
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
      condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI, or spread over
      several cores with `--threads real`;
+   - Direct3D 9 on the same backend (`d3d9.c`, Unreal Engine 3 era games): D3D9 shader bytecode (Shader Model 2/3) is
+     translated to WGSL by `d3d9_wgsl.c`, render and sampler state become cached state objects, and the parts of the
+     fixed pipeline shaders rely on (alpha test, half-pixel offset, partial clears, scaled StretchRect) are emulated;
    - Direct3D 11/DXGI on WebGPU: DXBC shaders are translated to WGSL (`dxbc_wgsl.c`), including geometry shaders
      (emulated with compute), typed buffers read and written in their real formats, UAV-only passes, background
      pipeline compilation and GPU timestamp queries;
@@ -90,6 +92,7 @@ Here are the games used for Testing and some screenshots of the tool working
 | Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 | PR 0.1.2 |
 | Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 | PR 0.1.2 |
 | Dead as Disco | ➖ Gets in game (Tutorial, Crashes mid way through) | 30-50 FPS | UE 5.7.4 | PR 0.1.3 |
+| Dishonored | 🚧 UE3 bring-up (`--threads real`): reaches the title screen and the main menu under offline Steam, with keyboard input; gameplay not reached yet | - | UE 3 (32-bit, D3D9) | Unreleased |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -126,7 +129,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--video-height` | e.g. `720` | Re-encode game videos taller than this, in their original codec family, so the game's own player still plays them. Unreal `.pak` files are rewritten with the new videos. `0` (default) keeps the originals. |
 | `--video-mode` | `fast`, `small` | `small` gives roughly 30% smaller videos but encodes about 10 times slower. Encodes are cached. |
 | `--sync-shaders` |N/A| Compile each shader when first drawn instead of in the background (exact first frames, but freezes while compiling). |
-| `--quality` | `game` (default), `low`, `medium`, `high`, `epic` | Unreal games: graphics quality for every scalability group except textures, added to the game's own settings file (`GameUserSettings.ini`) each time it starts, so it also overrides what the game saved there. Translated draw calls cost CPU time here, so lower settings run faster (Dead as Disco, single-threaded: about 10% at `low`). `low` and `medium` keep auto exposure and the full tonemapper (contrast, vignette), and shadows stay at least medium: without them scenes come out too dark, too flat, or lit through walls. A game that picks its settings with a hardware check on its very first start keeps that pick for that one session. |
+| `--quality` | `game` (default), `low`, `medium`, `high`, `epic` | Unreal Engine 4/5 games (Unreal Engine 3 keeps its own settings): graphics quality for every scalability group except textures, added to the game's own settings file (`GameUserSettings.ini`) each time it starts, so it also overrides what the game saved there. Translated draw calls cost CPU time here, so lower settings run faster (Dead as Disco, single-threaded: about 10% at `low`). `low` and `medium` keep auto exposure and the full tonemapper (contrast, vignette), and shadows stay at least medium: without them scenes come out too dark, too flat, or lit through walls. A game that picks its settings with a hardware check on its very first start keeps that pick for that one session. |
 | `--game-arg` | any | Extra launch argument for the game, added after the automatic ones (such as `-dx11`); repeat for more. |
 | `--fps` |N/A| Show an FPS counter (Ctrl+Shift+F toggles it in game). |
 | `--names` |N/A| Keep function names in the module, so the browser's profiler shows which game and runtime functions take the time. Doesn't slow the game; relinking with it doesn't recompile. |
@@ -150,7 +153,19 @@ When building a game with UEWASM, the tool give you many choices on how the game
 - Builds made with `--no-debug-panel` (or with the desktop app's *UEWASM debug toggle* unticked) contain none of
   this: the panel script, the console enabler and the debug hooks are not compiled in.
 
-Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1` and `?tracering=1` log file access, network traffic and the last engine calls before a crash.
+Steam: games that use Steam's classic interfaces (`SteamUser()`, `SteamFriends()`…, most Unreal Engine 3 games) run
+under an offline Steam: it starts, with a user who is logged off, subscribed to the game and its DLC, with no cloud
+files, stats or friends. Newer games (Unreal Engine 4/5) run as if Steam weren't there, as before.
+
+Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1` and `?tracering=1` log file access, network traffic and the last engine calls before a crash; `?gpuprof=1` logs the slowest GPU passes.
+
+## Troubleshooting
+
+- **Black screen, too dark, flickering, missing objects or garbage on screen:** see [docs/RENDERING.md](docs/RENDERING.md).
+  It explains every `[webgpu]` log line, the page switches that isolate a problem, Unreal settings that work around
+  broken effects, frame capture, and how to fix the shader translator itself.
+- **Low FPS or stutter:** see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+- **Crashes and hangs:** see [docs/DEBUGGING.md](docs/DEBUGGING.md) (readable crash stacks, `?tracering=1`, `?watch=`, debug builds).
 
 ## Hosting
 
@@ -174,6 +189,9 @@ screen. GPU work is sent in smaller batches on integrated GPUs to make that rare
 python tests/run_tests.py          # C, C++ STL, threads, files: original exe vs native recompile vs wasm
 python tests/run_tests.py --threads real   # the same with guest threads on several cores
 python tests/gfx/run_gfx.py webgpu # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
+python tests/gfx/run_gfx.py webgpu srgb  # the same on an sRGB swap chain (must not come out darker)
+python tests/gfx/run_gfx.py webgpu d3d9  # the Direct3D 9 version (32-bit, Shader Model 3)
+python tests/shaders/extract_d3d9.py "C:/Games/SomeUE3Game" tests/bin/shaders9   # a UE3 game's D3D9 shaders, for wgsl_dump/wgsl_check
 python tests/isa/run_isa.py --wasm # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
 python tests/web/run_web.py        # game files over HTTP (raw and deflated, with and without Range) and saved progress
 python tests/sse/gen_test.py       # SIMD versions of the SSE helpers against their scalar references

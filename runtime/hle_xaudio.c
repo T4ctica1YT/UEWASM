@@ -1,6 +1,6 @@
 /* XAudio2 2.7 (the DirectX SDK version games create through COM) and X3DAudio. Its headers pack every struct to 1 byte,
-   so pointers after a 32-bit field sit at offset 4 or 36, not 8 or 40. mixed here and played through the
-   host's audio output. Source voices take PCM (8/16/24/32-bit, float) and MS-ADPCM; effects are accepted and skipped. */
+   so pointers after a 32-bit field sit at offset 4, and fields after a pointer move with the pointer size (GP) between
+   32-bit and 64-bit games. Mixed here and played through the host's audio output. Source voices take PCM (8/16/24/32-bit, float) and MS-ADPCM; effects are accepted and skipped. */
 #include "com.h"
 #include "sched.h"
 
@@ -134,17 +134,17 @@ static void reverb_run(Reverb* r, float* buf, uint32_t ch)
         for (uint32_t c = right + 1; c < ch; c++) buf[i * ch + c] = 0;
     }
 }
-/* XAUDIO2_EFFECT_CHAIN { u32 count; descriptor* @4 }, descriptor { IUnknown* effect; BOOL initial @8; u32 channels @12 } */
+/* XAUDIO2_EFFECT_CHAIN { u32 count; descriptor* @4 }, descriptor { IUnknown* effect; BOOL initial @GP; u32 channels } */
 static void set_chain(Voice* v, uint64_t chain)
 {
     if (!chain) return;
     uint32_t n = LD32(chain);
-    uint64_t d = LD64(chain + 4);
+    uint64_t d = LDP(chain + 4), each = GP + 8;
     for (uint32_t i = 0; i < n && d; i++) {
-        uint64_t fx = LD64(d + 16ull * i);
+        uint64_t fx = LDP(d + each * i);
         if (fx && com_host(fx) == &reverb_tag) {
             if (!v->rv) { v->rv = reverb_new(); if (host_query_flag("audiodebug")) host_log("[adbg] voice %d has the reverb effect", v->id); }
-            v->rv->on = LD32(d + 16ull * i + 8) != 0;
+            v->rv->on = LD32(d + each * i + GP) != 0;
         }
     }
 }
@@ -158,8 +158,11 @@ static ComKind K_Source = { "IXAudio2SourceVoice", 29, {0} };
 static ComKind K_Submix = { "IXAudio2SubmixVoice", 19, {0} };
 static ComKind K_Master = { "IXAudio2MasteringVoice", 19, {0} };
 /* XAudio2 2.8/2.9 (the flat XAudio2Create API newer engines use): no device enumeration or Initialize on the engine,
-   GetChannelMask on the mastering voice; voices, buffers and callbacks are as in 2.7 */
+   GetChannelMask on the mastering voice, ActiveFlags in the voice details and a Flags argument to GetState; buffers
+   and callbacks are as in 2.7 */
 static ComKind K_Engine29 = { "IXAudio2 2.9", 13, {0}, IID_XAudio2_9, 1 };
+static ComKind K_Source29 = { "IXAudio2SourceVoice 2.9", 29, {0} };
+static ComKind K_Submix29 = { "IXAudio2SubmixVoice 2.9", 19, {0} };
 static ComKind K_Master29 = { "IXAudio2MasteringVoice 2.9", 20, {0} };
 static ComKind K_Effect = { "IXAPO", 16, {0}, IID_Any, 0 };
 
@@ -172,7 +175,7 @@ static int nengine_cb, engine_running, thread_started, mixing, nstarved, nstall,
 static uint64_t stall_max;
 static int nlimited;
 
-static float fbits(uint64_t v) { float f; uint32_t u = (uint32_t)v; memcpy(&f, &u, 4); return f; }
+static float fbits(uint64_t v) { return com_fbits(v); }
 static Voice* VO(uint64_t obj) { return obj ? (Voice*)com_host(obj) : NULL; }
 
 /* ---- calling back into the game ---- */
@@ -180,7 +183,7 @@ static Voice* VO(uint64_t obj) { return obj ? (Voice*)com_host(obj) : NULL; }
 static void cb(CPU* c, uint64_t iface, int slot, int n, uint64_t a1, uint64_t a2)
 {
     if (!iface) return;
-    uint64_t fn = LD64(LD64(iface) + 8ull * slot);
+    uint64_t fn = LDP(LDP(iface) + (uint64_t)GP * slot);
     uint64_t args[3] = { iface, a1, a2 };
     rt_invoke(c, fn, n + 1, args);
 }
@@ -466,9 +469,10 @@ static void set_sends(Voice* v, uint64_t sends)
     memset(v->has_matrix, 0, sizeof v->has_matrix);
     if (!sends) return;
     uint32_t n = LD32(sends);
-    uint64_t list = LD64(sends + 4);
+    /* XAUDIO2_VOICE_SENDS { u32 count; descriptor* @4 }, descriptor { u32 flags; IXAudio2Voice* @4 } */
+    uint64_t list = LDP(sends + 4), each = 4 + GP;
     for (uint32_t i = 0; i < n && i < MAXOUT && list; i++) {
-        Voice* d = VO(LD64(list + 12ull * i + 4));
+        Voice* d = VO(LDP(list + each * i + 4));
         if (d) v->out[v->nout++] = d;
     }
 }
@@ -521,27 +525,28 @@ static void read_format(Voice* v, uint64_t fmt)
     if (!v->align) v->align = v->ch * (v->bits ? v->bits / 8 : 2);
 }
 
+static int is29(CPU* c) { return com_kind(THIS) == &K_Engine29; }
 static void x_create_source(CPU* c)
 {
-    Voice* v = new_voice(V_SOURCE, &K_Source, 1, 0);
+    Voice* v = new_voice(V_SOURCE, is29(c) ? &K_Source29 : &K_Source, 1, 0);
     if (!v) { RET(0x8007000E); return; }
     read_format(v, A3);
     v->flags = (uint32_t)A4;
     v->callback = ARG(6);
     set_sends(v, ARG(7));
     ADBG("[adbg] source %d: %u ch %u Hz tag %u bits %u, flags %x, callback %llx, %d sends", v->id, v->ch, v->rate, v->tag, v->bits, v->flags, (unsigned long long)v->callback, v->nout);
-    ST64(A2, v->obj);
+    STP(A2, v->obj);
     RET(0);
 }
 static void x_create_submix(CPU* c)
 {
-    Voice* v = new_voice(V_SUBMIX, &K_Submix, (uint32_t)A3, (uint32_t)A4);
+    Voice* v = new_voice(V_SUBMIX, is29(c) ? &K_Submix29 : &K_Submix, (uint32_t)A3, (uint32_t)A4);
     if (!v) { RET(0x8007000E); return; }
     v->stage = (int)(ARG(6) & 63);
     set_sends(v, ARG(7));
     set_chain(v, ARG(8));
     ADBG("[adbg] submix %d: %u ch %u Hz stage %d, %d sends", v->id, v->ch, v->rate, v->stage, v->nout);
-    ST64(A2, v->obj);
+    STP(A2, v->obj);
     RET(0);
 }
 static void create_master(CPU* c, ComKind* k)
@@ -550,7 +555,7 @@ static void create_master(CPU* c, ComKind* k)
     if (!v) { RET(0x8007000E); return; }
     master = v;
     ADBG("[adbg] master %d: %u ch (asked %u)", v->id, v->ch, (unsigned)A3);
-    ST64(A2, v->obj);
+    STP(A2, v->obj);
     RET(0);
 }
 static void x_create_master(CPU* c) { create_master(c, &K_Master); }
@@ -588,11 +593,19 @@ static void x_perf(CPU* c)
 
 /* ---- IXAudio2Voice / SourceVoice ---- */
 
-static void v_details(CPU* c) { Voice* v = VO(A1); if (v) { ST32(A2, v->flags); ST32(A2 + 4, v->ch); ST32(A2 + 8, v->rate); } RET(0); }
+/* XAUDIO2_VOICE_DETAILS: flags, channels, rate; 2.8+ puts ActiveFlags after the flags */
+static void v_details(CPU* c)
+{
+    Voice* v = VO(A1);
+    ComKind* k = com_kind(A1);
+    uint64_t at = k == &K_Source29 || k == &K_Submix29 || k == &K_Master29 ? 4 : 0;
+    if (v) { ST32(A2, v->flags); if (at) ST32(A2 + 4, v->flags); ST32(A2 + 4 + at, v->ch); ST32(A2 + 8 + at, v->rate); }
+    RET(0);
+}
 static void v_set_outputs(CPU* c) { Voice* v = VO(A1); if (v) set_sends(v, A2); RET(0); }
 static void v_get_filter(CPU* c) { ST32(A2, 0); ST32(A2 + 4, 0x3F800000); ST32(A2 + 8, 0x3F800000); RET(0); }
 static void v_get_out_filter(CPU* c) { ST32(A3, 0); ST32(A3 + 4, 0x3F800000); ST32(A3 + 8, 0x3F800000); RET(0); }
-static void v_set_volume(CPU* c) { Voice* v = VO(A1); if (v) v->volume = c->x[1].f[0]; RET(0); }
+static void v_set_volume(CPU* c) { Voice* v = VO(A1); if (v) v->volume = FARG(2); RET(0); }
 static void v_get_volume(CPU* c) { Voice* v = VO(A1); float f = v ? v->volume : 1; uint32_t u; memcpy(&u, &f, 4); ST32(A2, u); RET(0); }
 static void v_set_chvol(CPU* c)
 {
@@ -681,13 +694,14 @@ static void s_submit(CPU* c)
     memset(b, 0, sizeof *b);
     b->flags = LD32(x);
     b->bytes = LD32(x + 4);
-    b->data = LD64(x + 8);
-    b->play_begin = LD32(x + 16);
-    b->play_len = LD32(x + 20);
-    b->loop_begin = LD32(x + 24);
-    b->loop_len = LD32(x + 28);
-    b->loop_count = LD32(x + 32);
-    b->ctx = LD64(x + 36);
+    /* XAUDIO2_BUFFER (packed): flags, bytes, data @8, then the play and loop fields and the context after the pointer */
+    b->data = LDP(x + 8);
+    b->play_begin = LD32(x + 8 + GP);
+    b->play_len = LD32(x + 12 + GP);
+    b->loop_begin = LD32(x + 16 + GP);
+    b->loop_len = LD32(x + 20 + GP);
+    b->loop_count = LD32(x + 24 + GP);
+    b->ctx = LDP(x + 28 + GP);
     b->frames = v->tag == 2 ? b->bytes / (v->align ? v->align : 1) * v->spb : b->bytes / (v->align ? v->align : 1);
     b->cursor = b->play_begin;
     b->end = b->play_len ? b->play_begin + b->play_len : b->frames;
@@ -720,12 +734,13 @@ static void s_exit_loop(CPU* c) { Voice* v = VO(A1); if (v && v->qn) v->q[0].loo
 static void s_state(CPU* c)
 {
     Voice* v = VO(A1);
-    ST64(A2, v && v->qn ? v->q[0].ctx : 0);
-    ST32(A2 + 8, v ? (uint32_t)v->qn : 0);
-    ST64(A2 + 12, v ? v->played : 0);
+    /* XAUDIO2_VOICE_STATE (packed): context, buffers queued, samples played (64-bit) */
+    STP(A2, v && v->qn ? v->q[0].ctx : 0);
+    ST32(A2 + GP, v ? (uint32_t)v->qn : 0);
+    ST64(A2 + GP + 4, v ? v->played : 0);
     RET(0);
 }
-static void s_set_ratio(CPU* c) { Voice* v = VO(A1); if (v) { float r = c->x[1].f[0]; v->ratio = r < 0.0005f ? 0.0005f : r > 1024 ? 1024 : r; } RET(0); }
+static void s_set_ratio(CPU* c) { Voice* v = VO(A1); if (v) { float r = FARG(2); v->ratio = r < 0.0005f ? 0.0005f : r > 1024 ? 1024 : r; } RET(0); }
 static void s_get_ratio(CPU* c) { Voice* v = VO(A1); float f = v ? v->ratio : 1; uint32_t u; memcpy(&u, &f, 4); ST32(A2, u); RET(0); }
 static void s_set_rate(CPU* c) { Voice* v = VO(A1); if (v && A2) v->rate = (uint32_t)A2; RET(0); }
 
@@ -739,38 +754,53 @@ static void setup(void)
     k->slots[3] = x_device_count; k->slots[4] = x_device_details; k->slots[5] = x_ok; k->slots[6] = x_register; k->slots[7] = x_unregister;
     k->slots[8] = x_create_source; k->slots[9] = x_create_submix; k->slots[10] = x_create_master; k->slots[11] = x_start;
     k->slots[12] = x_stop; k->slots[13] = x_ok; k->slots[14] = x_perf; k->slots[15] = x_ok;
-    ComKind* vk[3] = { &K_Source, &K_Submix, &K_Master };
-    for (int i = 0; i < 3; i++) {
+    /* 32-bit: stack arguments per method, `this` included */
+    com_nargs(k, "3112332288711223");
+    /* IXAudio2Voice (no IUnknown): GetVoiceDetails .. DestroyVoice */
+    static const char voice_args[] = "2223335432433243651";
+    ComKind* vk[6] = { &K_Source, &K_Submix, &K_Master, &K_Source29, &K_Submix29, &K_Master29 };
+    for (int i = 0; i < 6; i++) {
         GuestFn base[19] = { v_details, v_set_outputs, v_set_chain, v_enable_fx, v_disable_fx, x_ok, v_fx_params, x_ok, x_ok, v_get_filter, x_ok, v_get_out_filter,
                              v_set_volume, v_get_volume, v_set_chvol, v_get_chvol, v_set_matrix, v_get_matrix, v_destroy };
         for (int s = 0; s < 19; s++) vk[i]->slots[s] = base[s];
+        com_nargs(vk[i], voice_args);
     }
-    K_Source.slots[19] = s_start; K_Source.slots[20] = s_stop; K_Source.slots[21] = s_submit; K_Source.slots[22] = s_flush;
-    K_Source.slots[23] = x_ok; K_Source.slots[24] = s_exit_loop; K_Source.slots[25] = s_state; K_Source.slots[26] = s_set_ratio;
-    K_Source.slots[27] = s_get_ratio; K_Source.slots[28] = s_set_rate;
+    ComKind* sk[2] = { &K_Source, &K_Source29 };
+    for (int i = 0; i < 2; i++) {
+        ComKind* s = sk[i];
+        s->slots[19] = s_start; s->slots[20] = s_stop; s->slots[21] = s_submit; s->slots[22] = s_flush;
+        s->slots[23] = x_ok; s->slots[24] = s_exit_loop; s->slots[25] = s_state; s->slots[26] = s_set_ratio;
+        s->slots[27] = s_get_ratio; s->slots[28] = s_set_rate;
+    }
+    /* then Start .. SetSourceSampleRate; GetState gained a Flags argument in 2.8 */
+    com_nargs(&K_Source, "22233354324332436513331122322");
+    com_nargs(&K_Source29, "22233354324332436513331123322");
     com_iunknown(&K_Effect);
     for (int s = 3; s < 16; s++) K_Effect.slots[s] = x_ok;
+    /* IXAPO, then IXAPOParameters' SetParameters/GetParameters */
+    com_nargs(&K_Effect, "3112443151622331");
     k = &K_Engine29;
     com_iunknown(k);
     k->slots[3] = x_register; k->slots[4] = x_unregister; k->slots[5] = x_create_source; k->slots[6] = x_create_submix;
     k->slots[7] = x_create_master29; k->slots[8] = x_start; k->slots[9] = x_stop; k->slots[10] = x_ok; k->slots[11] = x_perf;
     k->slots[12] = x_ok;
-    for (int s = 0; s < 19; s++) K_Master29.slots[s] = K_Master.slots[s];
+    com_nargs(k, "3112288811223");
     K_Master29.slots[19] = m_channel_mask;
+    K_Master29.nargs[19] = 2;
 }
 
 /* XAudio2 2.9 entry points (xaudio2_9.dll / xaudio2_9redist.dll) */
 static void create29(CPU* c)
 {
     setup();
-    if (A1) ST64(A1, com_new(&K_Engine29, NULL, 0));
+    if (A1) STP(A1, com_new(&K_Engine29, NULL, 0));
     start_engine();
     RET(0);
 }
 HLE(XAudio2Create) { create29(c); }
 HLE(XAudio2CreateWithVersionInfo) { create29(c); }
-HLE(CreateAudioReverb) { setup(); if (A1) ST64(A1, com_new(&K_Effect, &reverb_tag, 0)); RET(0); }
-HLE(CreateAudioVolumeMeter) { setup(); if (A1) ST64(A1, com_new(&K_Effect, NULL, 0)); RET(0); }
+HLE(CreateAudioReverb) { setup(); if (A1) STP(A1, com_new(&K_Effect, &reverb_tag, 0)); RET(0); }
+HLE(CreateAudioVolumeMeter) { setup(); if (A1) STP(A1, com_new(&K_Effect, NULL, 0)); RET(0); }
 
 /* ---- the one audio endpoint (MMDevice API), so engines that enumerate devices find speakers ---- */
 
@@ -787,11 +817,11 @@ static uint64_t task_wstr(const char* s)
     return p;
 }
 static uint64_t device(void) { if (!mm_device) mm_device = com_new(&K_MMDevice, NULL, 0); return mm_device; }
-static void mm_enum(CPU* c) { if (A4) ST64(A4, com_new(&K_MMCollection, NULL, 0)); RET(0); }
-static void mm_default(CPU* c) { if (A4) ST64(A4, device()); RET(0); }
-static void mm_get(CPU* c) { if (A3) ST64(A3, device()); RET(0); }
+static void mm_enum(CPU* c) { if (A4) STP(A4, com_new(&K_MMCollection, NULL, 0)); RET(0); }
+static void mm_default(CPU* c) { if (A4) STP(A4, device()); RET(0); }
+static void mm_get(CPU* c) { if (A3) STP(A3, device()); RET(0); }
 static void mm_count(CPU* c) { if (A2) ST32(A2, 1); RET(0); }
-static void mm_item(CPU* c) { if (A3) ST64(A3, A2 == 0 ? device() : 0); RET(A2 == 0 ? 0 : 0x80070490); }
+static void mm_item(CPU* c) { if (A3) STP(A3, A2 == 0 ? device() : 0); RET(A2 == 0 ? 0 : 0x80070490); }
 /* ---- WASAPI shared mode (FMOD, Wwise and others): float stereo at RATE straight to the host output; the period
    event is signalled by a green thread every 10 ms ---- */
 static const uint8_t IID_AudioClient[][16] = { I(0x1CB9AD4C, 0xDBFA, 0x4c32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2),
@@ -803,7 +833,8 @@ static const uint8_t IID_SimpleVolume[][16] = { I(0x87CE5498, 0x68D6, 0x44E5, 0x
 static ComKind K_AudioClient = { "IAudioClient", 20, {0}, IID_AudioClient, 3 };
 static ComKind K_RenderClient = { "IAudioRenderClient", 5, {0}, IID_RenderClient, 1 };
 static ComKind K_AudioClock = { "IAudioClock", 6, {0}, IID_AudioClock, 1 };
-static ComKind K_Volume = { "ISimpleAudioVolume", 12, {0}, IID_SimpleVolume, 2 };
+static ComKind K_Volume = { "ISimpleAudioVolume", 7, {0}, IID_SimpleVolume, 1 };
+static ComKind K_StreamVolume = { "IAudioStreamVolume", 8, {0}, IID_SimpleVolume + 1, 1 };
 void sync_set_event(uint64_t h);
 static struct { uint32_t frames, bits, channels, started; uint64_t staging, event, written; int ticker; } wa;
 
@@ -825,7 +856,9 @@ static void wa_thread(CPU* c)
 }
 static void ac_init(CPU* c)
 {
-    uint64_t dur = A4, fmt = ARG(6);
+    /* Initialize(mode, flags, REFERENCE_TIME duration, REFERENCE_TIME period, format, session): on x86 each 64-bit
+       time takes two stack slots */
+    uint64_t dur = RT_G32 ? (uint32_t)A4 | (uint64_t)(uint32_t)ARG(5) << 32 : A4, fmt = RT_G32 ? ARG(8) : ARG(6);
     uint32_t want = (uint32_t)(dur * RATE / 10000000ull);
     wa.frames = want < RATE / 20 ? RATE / 20 : want > RATE ? RATE : want;
     wa.channels = fmt ? (uint32_t)LD16(fmt + 2) : 2;
@@ -838,8 +871,8 @@ static void ac_init(CPU* c)
 static void ac_buffer_size(CPU* c) { if (A2) ST32(A2, wa.frames); RET(0); }
 static void ac_latency(CPU* c) { if (A2) ST64(A2, 100000); RET(0); }
 static void ac_padding(CPU* c) { if (A2) ST32(A2, wa_padding()); RET(0); }
-static void ac_supported(CPU* c) { if (A4) ST64(A4, 0); RET(0); }
-static void ac_mix_format(CPU* c) { uint64_t f = g_alloc(40); wa_format(f); if (A2) ST64(A2, f); RET(0); }
+static void ac_supported(CPU* c) { if (A4) STP(A4, 0); RET(0); }
+static void ac_mix_format(CPU* c) { uint64_t f = g_alloc(40); wa_format(f); if (A2) STP(A2, f); RET(0); }
 static void ac_period(CPU* c) { if (A2) ST64(A2, 100000); if (A3) ST64(A3, 30000); RET(0); }
 static void ac_start(CPU* c)
 {
@@ -852,15 +885,15 @@ static void ac_event(CPU* c) { wa.event = A2; RET(0); }
 static void ac_service(CPU* c)
 {
     ComKind* k = iid_eq(A2, IID_RenderClient[0]) ? &K_RenderClient : iid_eq(A2, IID_AudioClock[0]) ? &K_AudioClock
-               : iid_eq(A2, IID_SimpleVolume[0]) || iid_eq(A2, IID_SimpleVolume[1]) ? &K_Volume : NULL;
-    if (A3) ST64(A3, k ? com_new(k, NULL, 0) : 0);
+               : iid_eq(A2, IID_SimpleVolume[0]) ? &K_Volume : iid_eq(A2, IID_SimpleVolume[1]) ? &K_StreamVolume : NULL;
+    if (A3) STP(A3, k ? com_new(k, NULL, 0) : 0);
     RET(k ? 0 : 0x80004002);
 }
 static void rc_get(CPU* c)
 {
     uint32_t n = (uint32_t)A2;
-    if (n > wa.frames - wa_padding()) { if (A3) ST64(A3, 0); RET(0x88890006); return; }
-    if (A3) ST64(A3, wa.staging);
+    if (n > wa.frames - wa_padding()) { if (A3) STP(A3, 0); RET(0x88890006); return; }
+    if (A3) STP(A3, wa.staging);
     RET(0);
 }
 static void rc_release(CPU* c)
@@ -888,41 +921,53 @@ static void clk_pos(CPU* c)
 }
 static void vol_get(CPU* c) { if (A2) ST32(A2, 0x3F800000); RET(0); }
 static void mute_get(CPU* c) { if (A2) ST32(A2, 0); RET(0); }
+/* IAudioStreamVolume: every channel at full volume */
+static void sv_count(CPU* c) { if (A2) ST32(A2, wa.channels ? wa.channels : 2); RET(0); }
+static void sv_get(CPU* c) { if (A3) ST32(A3, 0x3F800000); RET(0); }
+static void sv_get_all(CPU* c) { for (uint32_t i = 0; A3 && i < (uint32_t)A2 && i < 64; i++) ST32(A3 + 4ull * i, 0x3F800000); RET(0); }
 static void wa_setup(void)
 {
     static int done;
     if (done) return;
     done = 1;
-    ComKind* ks[4] = { &K_AudioClient, &K_RenderClient, &K_AudioClock, &K_Volume };
-    for (int i = 0; i < 4; i++) { com_iunknown(ks[i]); for (int s = 3; s < ks[i]->nslots; s++) ks[i]->slots[s] = x_ok; }
+    ComKind* ks[5] = { &K_AudioClient, &K_RenderClient, &K_AudioClock, &K_Volume, &K_StreamVolume };
+    for (int i = 0; i < 5; i++) { com_iunknown(ks[i]); for (int s = 3; s < ks[i]->nslots; s++) ks[i]->slots[s] = x_ok; }
     GuestFn ac[] = { ac_init, ac_buffer_size, ac_latency, ac_padding, ac_supported, ac_mix_format, ac_period, ac_start, ac_stop, x_ok, ac_event, ac_service };
     for (int i = 0; i < 12; i++) K_AudioClient.slots[3 + i] = ac[i];
     K_RenderClient.slots[3] = rc_get; K_RenderClient.slots[4] = rc_release;
     K_AudioClock.slots[3] = clk_freq; K_AudioClock.slots[4] = clk_pos;
     K_Volume.slots[4] = vol_get; K_Volume.slots[6] = mute_get;
+    K_StreamVolume.slots[3] = sv_count; K_StreamVolume.slots[5] = sv_get; K_StreamVolume.slots[7] = sv_get_all;
+    /* 32-bit: IAudioClient (Initialize's two REFERENCE_TIMEs are two slots each) to IAudioClient3 */
+    com_nargs(&K_AudioClient, "31192224231112332563");
+    com_nargs(&K_RenderClient, "31133");
+    com_nargs(&K_AudioClock, "311232");
+    com_nargs(&K_Volume, "3113232");
+    com_nargs(&K_StreamVolume, "31123333");
 }
 static void mm_activate(CPU* c)
 {
     if (iid_eq(A2, IID_AudioClient[0]) || iid_eq(A2, IID_AudioClient[1]) || iid_eq(A2, IID_AudioClient[2])) {
         wa_setup();
-        if (ARG(5)) ST64(ARG(5), com_new(&K_AudioClient, NULL, 0));
+        if (ARG(5)) STP(ARG(5), com_new(&K_AudioClient, NULL, 0));
         RET(0);
         return;
     }
-    if (ARG(5)) ST64(ARG(5), 0);
+    if (ARG(5)) STP(ARG(5), 0);
     RET(0x80004002);
 }
-static void mm_props(CPU* c) { if (A3) ST64(A3, com_new(&K_PropStore, NULL, 0)); RET(0); }
-static void mm_id(CPU* c) { if (A2) ST64(A2, task_wstr("{0.0.0.00000000}.{uew-audio-out}")); RET(0); }
+static void mm_props(CPU* c) { if (A3) STP(A3, com_new(&K_PropStore, NULL, 0)); RET(0); }
+static void mm_id(CPU* c) { if (A2) STP(A2, task_wstr("{0.0.0.00000000}.{uew-audio-out}")); RET(0); }
 static void mm_state(CPU* c) { if (A2) ST32(A2, 1); RET(0); }
 static void ps_count(CPU* c) { if (A2) ST32(A2, 0); RET(0); }
 static void ps_value(CPU* c)
 {
+    /* PROPVARIANT: type, then the value at 8 (a VT_BLOB's size there and its pointer after it) */
     uint64_t key = A2, pv = A3;
-    memset(G2H(pv), 0, 24);
+    memset(G2H(pv), 0, 8 + 2 * GP);
     if (iid_eq(key, PKEY_FriendlyName) && LD32(key + 16) == 14) {
         ST16(pv, 31);
-        ST64(pv + 8, task_wstr("Speakers (Browser)"));
+        STP(pv + 8, task_wstr("Speakers (Browser)"));
     } else if (iid_eq(key, PKEY_DeviceFormat)) {
         uint64_t f = g_alloc(40);
         memset(G2H(f), 0, 40);
@@ -932,7 +977,7 @@ static void ps_value(CPU* c)
         memcpy(G2H(f + 24), ieee, 16);
         ST16(pv, 65);
         ST32(pv + 8, 40);
-        ST64(pv + 16, f);
+        STP(pv + 8 + GP, f);
     }
     RET(0);
 }
@@ -948,6 +993,10 @@ static void mm_setup(void)
     K_MMCollection.slots[3] = mm_count; K_MMCollection.slots[4] = mm_item;
     K_MMDevice.slots[3] = mm_activate; K_MMDevice.slots[4] = mm_props; K_MMDevice.slots[5] = mm_id; K_MMDevice.slots[6] = mm_state;
     K_PropStore.slots[3] = ps_count; K_PropStore.slots[5] = ps_value;
+    com_nargs(&K_MMEnum, "31144322");
+    com_nargs(&K_MMCollection, "31123");
+    com_nargs(&K_MMDevice, "3115322");
+    com_nargs(&K_PropStore, "31123331");
 }
 
 /* called by CoCreateInstance for classes we provide */
@@ -956,7 +1005,7 @@ int xaudio_create(CPU* c, uint64_t clsid, uint64_t out)
     ComKind* k = NULL;
     if (iid_eq(clsid, CLSID_MMDeviceEnumerator)) {
         mm_setup();
-        if (out) ST64(out, com_new(&K_MMEnum, NULL, 0));
+        if (out) STP(out, com_new(&K_MMEnum, NULL, 0));
         RET(0);
         return 1;
     }
@@ -965,7 +1014,7 @@ int xaudio_create(CPU* c, uint64_t clsid, uint64_t out)
     if (!k) return 0;
     setup();
     int rev = iid_eq(clsid, CLSID_Reverb) || iid_eq(clsid, CLSID_ReverbDbg);
-    if (out) ST64(out, com_new(k, rev ? &reverb_tag : NULL, 0));
+    if (out) STP(out, com_new(k, rev ? &reverb_tag : NULL, 0));
     if (k == &K_Engine) start_engine();
     RET(0);
     return 1;
@@ -981,8 +1030,9 @@ static V3 cross3(V3 a, V3 b) { V3 r = { a.y * b.z - a.z * b.y, a.z * b.x - a.x *
 static float curve(uint64_t cv, float d, float def)
 {
     if (!cv) return def;
-    uint64_t pts = LD64(cv);
-    uint32_t n = LD32(cv + 8);
+    /* X3DAUDIO_DISTANCE_CURVE (packed): points*, count */
+    uint64_t pts = LDP(cv);
+    uint32_t n = LD32(cv + GP);
     if (!pts || !n) return def;
     float pd = fbits(LD32(pts)), pv = fbits(LD32(pts + 4));
     if (d <= pd) return pv;
@@ -1000,25 +1050,27 @@ HLE(X3DAudioInitialize)
 {
     /* handle: speaker mask, speed of sound */
     ST32(A3, (uint32_t)A1);
-    stf(A3 + 4, c->x[1].f[0]);
+    stf(A3 + 4, FARG(2));
     RET(0);
 }
 
 HLE(X3DAudioCalculate)
 {
+    /* the structs are packed: the emitter starts with its cone pointer, the DSP settings with two pointers */
     uint64_t L = A2, E = A3, D = ARG(5);
     uint32_t flags = (uint32_t)A4;
-    V3 lf = v3(L), lt = v3(L + 12), lp = v3(L + 24), ep = v3(E + 32);
+    V3 lf = v3(L), lt = v3(L + 12), lp = v3(L + 24), ep = v3(E + GP + 24);
     V3 rel = { ep.x - lp.x, ep.y - lp.y, ep.z - lp.z };
     float dist = sqrtf(dot3(rel, rel));
     V3 right = cross3(lt, lf);
     float az = atan2f(dot3(rel, right), dot3(rel, lf));
-    float scaler = fbits(LD32(E + 120));
+    float scaler = fbits(LD32(E + 7 * GP + 64));
     if (scaler <= 0) scaler = 1;
     float nd = dist / scaler;
-    float gain = curve(LD64(E + 80), nd, nd <= 1 ? 1.0f : 1.0f / nd);
-    uint32_t sc = LD32(D + 16), dc = LD32(D + 20), ech = LD32(E + 64);
-    uint64_t mat = LD64(D), azs = LD64(E + 72);
+    float gain = curve(LDP(E + 2 * GP + 64), nd, nd <= 1 ? 1.0f : 1.0f / nd);
+    uint64_t ds = D + 2 * GP;
+    uint32_t sc = LD32(ds), dc = LD32(ds + 4), ech = LD32(E + GP + 56);
+    uint64_t mat = LDP(D), azs = LDP(E + GP + 64);
     if ((flags & 1) && mat) {
         for (uint32_t s = 0; s < sc; s++) {
             float a = az + (s < ech && azs ? fbits(LD32(azs + 4ull * s)) : 0);
@@ -1029,12 +1081,12 @@ HLE(X3DAudioCalculate)
             if (dc == 1) stf(mat + 4ull * s, gain);
         }
     }
-    stf(D + 24, 1); stf(D + 28, 1);
-    stf(D + 32, (flags & 0x10) ? curve(LD64(E + 112), nd, 0) : 0);
-    stf(D + 36, 1);
-    stf(D + 40, az);
-    stf(D + 44, dist);
-    stf(D + 48, 0); stf(D + 52, 0);
+    stf(ds + 8, 1); stf(ds + 12, 1);
+    stf(ds + 16, (flags & 0x10) ? curve(LDP(E + 6 * GP + 64), nd, 0) : 0);
+    stf(ds + 20, 1);
+    stf(ds + 24, az);
+    stf(ds + 28, dist);
+    stf(ds + 32, 0); stf(ds + 36, 0);
     RET(0);
 }
 
@@ -1042,7 +1094,7 @@ HLE(X3DAudioCalculate)
 HLE(CreateFX)
 {
     setup();
-    if (A2) ST64(A2, com_new(&K_Effect, NULL, 0));
+    if (A2) STP(A2, com_new(&K_Effect, NULL, 0));
     RET(0);
 }
 
@@ -1062,7 +1114,8 @@ static WaveOut wo;
 static int wo_thread;
 void user32_post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
 
-/* WAVEHDR: data +0, length +8, recorded +12, user +16, flags +24 (DONE 1, PREPARED 2, INQUEUE 0x10), loops +28 */
+/* WAVEHDR: data +0, length +GP, recorded, user, flags (DONE 1, PREPARED 2, INQUEUE 0x10) at 2 * GP + 8, loops */
+#define WH_FLAGS(h) ((h) + 2 * GP + 8)
 static void wo_notify(CPU* c, uint32_t msg, uint64_t hdr)
 {
     if (wo.cb_type == 3 && wo.cb) { uint64_t a[5] = { 0x7C000001, msg, wo.inst, hdr, 0 }; rt_invoke(c, wo.cb, 5, a); }
@@ -1089,8 +1142,8 @@ static void wo_loop(CPU* c)
         uint32_t fs = wo.ch * (wo.flt ? 4 : wo.bits / 8);
         while (n < PASS && wo.qn) {
             uint64_t h = wo.q[0];
-            uint32_t frames = fs ? (uint32_t)LD32(h + 8) / fs : 0;
-            const uint8_t* p = G2H(LD64(h));
+            uint32_t frames = fs ? (uint32_t)LD32(h + GP) / fs : 0;
+            const uint8_t* p = G2H(LDP(h));
             while (n < PASS && wo.pos < frames) {
                 uint32_t i = (uint32_t)wo.pos;
                 out[2 * n] = wo_sample(p, i, 0) * wo.vol;
@@ -1101,7 +1154,7 @@ static void wo_loop(CPU* c)
             if (wo.pos >= frames) {
                 wo.pos -= frames;
                 memmove(wo.q, wo.q + 1, sizeof wo.q[0] * (size_t)--wo.qn);
-                ST32(h + 24, ((uint32_t)LD32(h + 24) & ~0x10u) | 1);
+                ST32(WH_FLAGS(h), ((uint32_t)LD32(WH_FLAGS(h)) & ~0x10u) | 1);
                 wo_notify(c, 0x3BD, h);   /* WOM_DONE */
             }
         }
@@ -1122,25 +1175,25 @@ HLE(waveOutOpen)
     memset(&wo, 0, sizeof wo);
     wo.open = 1; wo.ch = ch; wo.rate = rate; wo.bits = bits; wo.flt = flt; wo.vol = 1;
     wo.cb = A4; wo.inst = ARG(5); wo.cb_type = (flags >> 16) & 7;
-    if (A1) ST64(A1, 0x7C000001);
+    if (A1) STP(A1, 0x7C000001);
     host_audio_open(RATE);
     if (!wo_thread) { wo_thread = 1; sched_create(rt_dyn_thunk(wo_loop, "waveout"), 0, 0); }
     wo_notify(c, 0x3BB, 0);   /* WOM_OPEN */
     RET(0);
 }
-HLE(waveOutPrepareHeader) { if (A2) ST32(A2 + 24, (uint32_t)LD32(A2 + 24) | 2); RET(0); }
-HLE(waveOutUnprepareHeader) { if (A2) ST32(A2 + 24, (uint32_t)LD32(A2 + 24) & ~2u); RET(0); }
+HLE(waveOutPrepareHeader) { if (A2) ST32(WH_FLAGS(A2), (uint32_t)LD32(WH_FLAGS(A2)) | 2); RET(0); }
+HLE(waveOutUnprepareHeader) { if (A2) ST32(WH_FLAGS(A2), (uint32_t)LD32(WH_FLAGS(A2)) & ~2u); RET(0); }
 HLE(waveOutWrite)
 {
     if (!wo.open || !A2) { RET(5); return; }   /* MMSYSERR_INVALHANDLE */
     if (wo.qn == 64) { RET(4); return; }      /* MMSYSERR_ALLOCATED: queue full */
-    ST32(A2 + 24, ((uint32_t)LD32(A2 + 24) & ~1u) | 0x10);
+    ST32(WH_FLAGS(A2), ((uint32_t)LD32(WH_FLAGS(A2)) & ~1u) | 0x10);
     wo.q[wo.qn++] = A2;
     RET(0);
 }
 HLE(waveOutReset)
 {
-    while (wo.qn) { uint64_t h = wo.q[0]; memmove(wo.q, wo.q + 1, sizeof wo.q[0] * (size_t)--wo.qn); ST32(h + 24, ((uint32_t)LD32(h + 24) & ~0x10u) | 1); wo_notify(c, 0x3BD, h); }
+    while (wo.qn) { uint64_t h = wo.q[0]; memmove(wo.q, wo.q + 1, sizeof wo.q[0] * (size_t)--wo.qn); ST32(WH_FLAGS(h), ((uint32_t)LD32(WH_FLAGS(h)) & ~0x10u) | 1); wo_notify(c, 0x3BD, h); }
     wo.pos = 0;
     RET(0);
 }

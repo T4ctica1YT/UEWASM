@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include "dxbc_parse.h"
+#include "d3d9_wgsl.h"
 
 #include <math.h>
 #define NL "\n"
@@ -1131,6 +1132,8 @@ static char* prefix_names(char* s, const char* pre)
 
 int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxWgsl* out)
 {
+    /* Direct3D 9 bytecode (version token 0xFFFE.... / 0xFFFF....) has its own translator, with the same output */
+    if (size >= 4 && (*(const uint32_t*)code & 0xFFFE0000u) == 0xFFFE0000u) return d3d9_to_wgsl(code, size, opt, out);
     const DxSig* vs_out = opt ? opt->vs_out : NULL;
     memset(out, 0, sizeof *out);
     if (opt) for (int i = 0; i < 128; i++) if (opt->depth_srv[i >> 5] >> (i & 31) & 1) out->srv[i].compare = 1;

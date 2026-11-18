@@ -12,8 +12,10 @@ static ComKind K_WIC = { "IWICImagingFactory", 28 };
 
 static void ok(CPU* c) { RET(0); }
 static void wic_fail(CPU* c) { RET(0x88982F50u); }
-static void connect_server(CPU* c) { if (ARG(9)) ST64(ARG(9), com_new(&K_Services, NULL, 0)); RET(0); }
-static void exec_query(CPU* c) { if (ARG(6)) ST64(ARG(6), com_new(&K_Enum, NULL, 0)); RET(0); }
+static void connect_server(CPU* c) { if (ARG(9)) STP(ARG(9), com_new(&K_Services, NULL, 0)); RET(0); }
+/* ExecQuery(language, query, flags, context, &enum) and CreateInstanceEnum(class, flags, context, &enum) */
+static void exec_query(CPU* c) { if (ARG(6)) STP(ARG(6), com_new(&K_Enum, NULL, 0)); RET(0); }
+static void instance_enum(CPU* c) { if (ARG(5)) STP(ARG(5), com_new(&K_Enum, NULL, 0)); RET(0); }
 static void enum_next(CPU* c) { if (ARG(5)) ST32(ARG(5), 0); RET(1); }
 
 static void setup(void)
@@ -26,25 +28,32 @@ static void setup(void)
     com_iunknown(&K_Enum);
     K_Locator.slots[3] = connect_server;
     for (int i = 3; i < 23; i++) K_Services.slots[i] = ok;
-    K_Services.slots[18] = exec_query;
+    K_Services.slots[18] = instance_enum;
     K_Services.slots[20] = exec_query;
     K_Enum.slots[3] = ok;
     K_Enum.slots[4] = enum_next;
     K_Enum.slots[7] = ok;
     com_iunknown(&K_WIC);
     for (int i = 3; i < 28; i++) K_WIC.slots[i] = wic_fail;
+    /* 32-bit: stack arguments per method, `this` included */
+    com_nargs(&K_Locator, "3119");
+    com_nargs(&K_Services, "31162365555555555555666");
+    com_nargs(&K_Enum, "31115323");
+    com_nargs(&K_WIC, "3116553442222222264785343344");
 }
 
 /* returns 1 if handled */
 int xaudio_create(CPU* c, uint64_t clsid, uint64_t out);
 
+int dsound_create(CPU* c, uint64_t clsid, uint64_t out);
 int com_create_known(CPU* c, uint64_t clsid, uint64_t out)
 {
     if (xaudio_create(c, clsid, out)) return 1;
+    if (dsound_create(c, clsid, out)) return 1;
     ComKind* k = iid_eq(clsid, CLSID_WbemLocator) ? &K_Locator : iid_eq(clsid, CLSID_WICImagingFactory) ? &K_WIC : NULL;
     if (!k) return 0;
     setup();
-    if (out) ST64(out, com_new(k, NULL, 0));
+    if (out) STP(out, com_new(k, NULL, 0));
     RET(0);
     return 1;
 }

@@ -13,7 +13,10 @@ from uewasm.recomp import build  # noqa: E402
 from uewasm.serve import background  # noqa: E402
 
 FXC = next(Path(r"C:\Program Files (x86)\Windows Kits\10\bin").glob("*/x64/fxc.exe"))
-OUT = ROOT / "tests" / "bin" / "gfx"
+# "d3d9": the Direct3D 9 version (triangle9.cpp, Shader Model 3, built 32-bit like most D3D9 games)
+D3D9 = "d3d9" in sys.argv[1:]
+OUT = ROOT / "tests" / "bin" / ("gfx9" if D3D9 else "gfx")
+NAME = "triangle9" if D3D9 else "triangle"
 
 
 def png_pixels(data):
@@ -51,20 +54,24 @@ def png_pixels(data):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    env = build.msvc_env()
-    for entry, prof, name in (("VSMain", "vs_5_0", "triangle_vs.h"), ("PSMain", "ps_5_0", "triangle_ps.h")):
-        subprocess.run([str(FXC), "/nologo", f"/T{prof}", f"/E{entry}", f"/Vn", f"g_{entry}", f"/Fh{OUT / name}", str(HERE / "triangle.hlsl")],
+    env = build.msvc_env("x86" if D3D9 else "x64")
+    sm = "3_0" if D3D9 else "5_0"
+    for entry, prof, name in (("VSMain", "vs_" + sm, NAME + "_vs.h"), ("PSMain", "ps_" + sm, NAME + "_ps.h")):
+        subprocess.run([str(FXC), "/nologo", f"/T{prof}", f"/E{entry}", f"/Vn", f"g_{entry}", f"/Fh{OUT / name}", str(HERE / (NAME + ".hlsl"))],
                        check=True, capture_output=True)
-    exe = OUT / "triangle.exe"
-    r = subprocess.run([build.tool(env, "cl"), "/nologo", "/O2", "/MD", "/EHsc", f"/I{OUT}", f"/Fe:{exe}", f"/Fo:{OUT}\\", str(HERE / "triangle.cpp")],
+    exe = OUT / (NAME + ".exe")
+    r = subprocess.run([build.tool(env, "cl"), "/nologo", "/O2", "/MT" if D3D9 else "/MD", "/EHsc", f"/I{OUT}", f"/Fe:{exe}", f"/Fo:{OUT}\\", str(HERE / (NAME + ".cpp"))],
                        env=env, capture_output=True, text=True, cwd=OUT)
     if r.returncode:
         sys.exit(r.stdout[-2000:])
-    ref = subprocess.run([str(exe)], capture_output=True, text=True, cwd=OUT).stdout
+    # srgb: the same scene on an sRGB back buffer, which must reach the screen gamma-encoded like on Windows
+    srgb = "srgb" in sys.argv[1:]
+    extra = ["srgb"] if srgb else []
+    ref = subprocess.run([str(exe), *extra], capture_output=True, text=True, cwd=OUT).stdout
     out = OUT / "recomp"
     build.recompile(exe, out, mem_mb=256, log=lambda *_: None)
     native = build.build_native(out, log=lambda *_: None)
-    got = subprocess.run([str(native), "--image", str(out / "image.bin"), "--root", str(OUT), "--exe", exe.name], capture_output=True, text=True)
+    got = subprocess.run([str(native), "--image", str(out / "image.bin"), "--root", str(OUT), "--exe", exe.name, *extra], capture_output=True, text=True)
     print("original:", ref.strip().replace("\n", " | "))
     print("native  :", got.stdout.strip().replace("\n", " | "), "MATCH" if got.stdout.replace("\r", "") == ref.replace("\r", "") else "DIFF")
     if got.stderr.strip():
@@ -74,7 +81,7 @@ def main():
     print("renderer:", renderer)
     web = build.build_wasm(out, log=lambda *_: None, renderer=renderer)
     (web / "index.html").write_text('<!doctype html><body style="margin:0;background:#000"><canvas id="canvas" width="640" height="360"></canvas>'
-                                    '<script>var Module={canvas:document.getElementById("canvas"),arguments:["--exe","triangle.exe"],'
+                                    '<script>var Module={canvas:document.getElementById("canvas"),arguments:["--exe","' + NAME + '.exe"' + (',"srgb"' if srgb else '') + '],'
                                     'uewgDebug:location.search.includes("debug"),print:t=>console.log(t),printErr:t=>console.log(t)};</script><script src="game.js"></script></body>')
     from playwright.sync_api import sync_playwright
     srv = background(web)
@@ -93,11 +100,15 @@ def main():
     px = png_pixels(shot)
     center, corner = px(320, 200), px(10, 10)
     print("browser log:", " | ".join(l for l in logs if l.strip())[:900 if "debug" not in sys.argv else 20000])
-    print("corner pixel", corner, "(expect about (13, 25, 76) clear colour)")
+    # clear colour (0.05, 0.1, 0.3): stored as is, or sRGB-encoded on an sRGB back buffer
+    want = (63, 89, 149) if srgb else (13, 25, 76)
+    print("corner pixel", corner, f"(expect about {want} clear colour)")
     print("center pixel", center, "(expect a mix of red/green/blue from the triangle)")
-    ok_corner = all(abs(a - b) < 12 for a, b in zip(corner, (13, 25, 76)))
+    ok_corner = all(abs(a - b) < 12 for a, b in zip(corner, want))
     ok_center = center != corner and max(center) > 40
     print("RENDER", "PASS" if ok_corner and ok_center else "FAIL")
+    if not (ok_corner and ok_center):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

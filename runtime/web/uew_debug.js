@@ -167,7 +167,7 @@
     const gpu = (lines.find(l => l.includes("[webgpu] GPU:")) || "").replace(/.*GPU: /, "").replace(/;.*/, "") || "?";
     const heap = typeof HEAPU8 !== "undefined" ? (HEAPU8.length / 1048576).toFixed(0) + " MB" : "?";
     panel.querySelector("#uewdbg-live").textContent =
-      `FPS ${fps.toFixed(0)}   frames ${n}\nGPU ${gpu}\nshaders compiling ${g ? g.pendingPipes || 0 : 0}   draws skipped ${g && g.skip ? g.skip.nopipe : 0}\n` +
+      `FPS ${fps.toFixed(0)}   frames ${n}\nGPU ${gpu}${g && g.lost ? `\nGPU DEVICE LOST (${g.lost.reason}): reload the page` : ""}\nshaders compiling ${g ? g.pendingPipes || 0 : 0}   draws skipped ${g && g.skip ? g.skip.nopipe : 0}\n` +
       `speed ${window.uewSpeed || 1}x
 ` + `video ${V ? `hardware, ${V.s.size} open stream(s)` : q.get("swvideo") === "1" ? "software (switch)" : "software"}\nwasm memory ${heap}`;
     panel.querySelector("#uewdbg-hitch").textContent = lines.filter(l => l.includes("[hitch]") || l.includes("[watchdog]")).slice(-6).join("\n") || "none";

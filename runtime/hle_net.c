@@ -54,7 +54,14 @@ static int idx(Sock* k) { return (int)(k - socks); }
 
 HLE(WSAStartup)
 {
-    if (A2) { memset(G2H(A2), 0, 408); ST16(A2, (uint16_t)A1); ST16(A2 + 2, 0x0202); ST16(A2 + 4, 32767); memcpy(G2H(A2 + 16), "WinSock 2.0", 12); memcpy(G2H(A2 + 273), "Running", 8); }
+    /* WSADATA differs by bitness: 64-bit puts iMaxSockets, iMaxUdpDg and lpVendorInfo before the strings (408 bytes),
+       32-bit after them (400 bytes); writing the 64-bit form overran 32-bit callers' stack buffers */
+    if (A2 && RT_G32) {
+        memset(G2H(A2), 0, 400);
+        ST16(A2, (uint16_t)A1); ST16(A2 + 2, 0x0202);
+        memcpy(G2H(A2 + 4), "WinSock 2.0", 12); memcpy(G2H(A2 + 261), "Running", 8);
+        ST16(A2 + 390, 32767);
+    } else if (A2) { memset(G2H(A2), 0, 408); ST16(A2, (uint16_t)A1); ST16(A2 + 2, 0x0202); ST16(A2 + 4, 32767); memcpy(G2H(A2 + 16), "WinSock 2.0", 12); memcpy(G2H(A2 + 273), "Running", 8); }
     RET(0);
 }
 STUB(WSACleanup, 0)

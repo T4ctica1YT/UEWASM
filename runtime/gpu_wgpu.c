@@ -206,6 +206,7 @@ typedef struct WTex {
     TexFmt fmt;
     uint32_t w, h, layers, mips;
     uint32_t version, used;
+    uint32_t ring_sub;      /* g_submits when a ring copy into this texture was last recorded */
     int buf_usage;
     /* last copy of this constant buffer in the ring: reused while the contents and frame are the same */
     uint32_t cb_serial, cb_version, cb_first, cb_size, cb_off;
@@ -286,6 +287,9 @@ static Program* programs[1024];
 static Pipe* pipes[1024];
 static int g_ok, g_errors;
 static uint32_t g_serial = 1;
+/* C-side submissions of the command encoder (ring_submit, ring_flush, present); flushes the JS side starts on its own
+   (pass budget, readbacks) are not counted, which only errs toward ordering an upload behind work already submitted */
+static uint32_t g_submits = 1;
 static uint8_t* ring;
 /* the constant ring runs on across frames: a constant buffer the game has not touched keeps its copy until the ring wraps
    over it (ring_gen counts wraps) */
@@ -338,12 +342,14 @@ void uewg_buffer_copy(int src, int src_off, int dst, int dst_off, int size);
 static void ring_submit(void)
 {
     uewg_submit((int)ring_used);
+    g_submits++;
     PASS_BREAK();
 }
 /* the ring is full: submit, then start over from the front */
 static void ring_flush(void)
 {
     uewg_flush((int)ring_used);
+    g_submits++;
     ring_used = 0;
     ring_gen++;
     PASS_BREAK();
@@ -584,12 +590,14 @@ static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint3
 }
 
 /* a texture already used by this frame's unsubmitted commands is written through the ring, in order with them:
-   queue writes land before those commands (staging textures refilled between copies would hand the copies the new data) */
+   queue writes land before those commands (staging textures refilled between copies would hand the copies the new data).
+   So is one with a ring copy still unsubmitted: a queue write would land first and that older copy over it (a glyph
+   cache re-uploaded once per new glyph then loses the last glyphs) */
 static void tex_write(WTex* t, int mip, int x, int y, int z, int w, int h, int d, const uint8_t* p, int pitch, int rows, int size)
 {
     uint32_t blocks = (uint32_t)(w + t->fmt.block - 1) / t->fmt.block, row = blocks * t->fmt.bpb, bpr = (row + 255) & ~255u;
     uint64_t need = (uint64_t)bpr * (uint32_t)rows * (uint32_t)d;
-    if (t->used != g_serial || need > ring_size / 4) { uewg_texture_write(t->id, mip, x, y, z, w, h, d, p, pitch, rows, size); return; }
+    if ((t->used != g_serial && t->ring_sub != g_submits) || need > ring_size / 4) { uewg_texture_write(t->id, mip, x, y, z, w, h, d, p, pitch, rows, size); return; }
     uint32_t off = ring_put(NULL, 0, 0);
     if (off + need > ring_size) { ring_flush(); off = 0; }
     for (int k = 0; k < d; k++)
@@ -598,6 +606,7 @@ static void tex_write(WTex* t, int mip, int x, int y, int z, int w, int h, int d
     ring_used = off + (uint32_t)need;
     st_ring_bytes += need;
     uewg_texture_copy_ring((int)off, t->id, mip, x, y, z, w, h, d, (int)bpr, rows);
+    t->ring_sub = g_submits;
     PASS_BREAK();
 }
 
@@ -2599,7 +2608,12 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
     if (t && t->id) {
         if (!t->view_all) {
             breset(&jb);
-            bp(&jb, "{\"tex\":%d,\"dim\":\"2d\",\"mip\":0,\"mips\":1,\"layer\":0,\"layers\":1,\"aspect\":\"all\"}", t->id);
+            bp(&jb, "{\"tex\":%d,\"dim\":\"2d\",\"mip\":0,\"mips\":1,\"layer\":0,\"layers\":1,\"aspect\":\"all\"", t->id);
+            /* an sRGB back buffer holds gamma-encoded bytes, and the screen shows those bytes as they are. Sampled
+               through its sRGB view they would come back linear and land on the (non-sRGB) canvas far too dark, so
+               the blit reads it through the plain twin (created in its viewFormats) */
+            if (t->fmt.view_pair && strstr(t->fmt.name, "-srgb")) bp(&jb, ",\"format\":\"%s\"", t->fmt.view_pair);
+            bp(&jb, "}");
             t->view_all = uewg_view_create(jb.p);
         }
         view = t->view_all;
@@ -2635,6 +2649,7 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
         drawn = 0;
     }
     uewg_present(view, (int)ring_used);
+    g_submits++;
     if (dbg_flag("ringreset", &ring_reset)) { ring_used = 0; ring_gen++; uewg_ring_reset(); }
     for (int i = 0; i < ntemp; i++) uewg_release(temp_bg[i]);
     ntemp = 0;
