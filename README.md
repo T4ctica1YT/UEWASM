@@ -16,7 +16,7 @@
 
 UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssembly project.
 This tool **doesn't enable piracy on its own**, and any games redistributed with this tool are 
-**responsibility of the distributer, not T4ctica1**. As of today this tool supports games made 
+**responsibility of the distributer, not T4ctica1 or zay, nor anyone afiliated with this project**. As of today this tool supports games made 
 in Unreal Engine 3, 4 and 5. Unreal Engine 3 games run both as 32-bit Direct3D 9 titles (Dishonored) and as 64-bit
 Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 games](#unreal-engine-3-games).
 <br>
