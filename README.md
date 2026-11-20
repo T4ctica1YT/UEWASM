@@ -249,10 +249,12 @@ so there is no separate mode to pick. What differs:
 
 ## Extra Credits
 
+- **[zay](https://github.com/squidward5)** - Helped with UE3 support
+
 - **[IdiotOnline](https://github.com/anIdiotonline)** - Tester
 
 - **[teaser.lua](https://github.com/teaserlua)** - Tester
 
-- **[NotRexed](https://github.com/notrexed)** - Took too long to make his tool (Rexcomp) / Inspired the making of UEWASM
+- **[NotRexed](https://github.com/notrexed)** - Inspired the making of UEWASM
 
 
