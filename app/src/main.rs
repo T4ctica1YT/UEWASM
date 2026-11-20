@@ -253,7 +253,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("UEWASM").strong());
-                ui.label(egui::RichText::new("Windows x64 games to WebAssembly").weak());
+                ui.label(egui::RichText::new("Windows x64 and x86 games to WebAssembly").weak());
             });
             ui.add_space(6.0);
             ui.group(|ui| {

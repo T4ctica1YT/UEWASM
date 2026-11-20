@@ -17,7 +17,8 @@ problem leaves a line in the log that names its cause.
 
 ## How rendering works here
 
-The game still thinks it talks to Direct3D 11. UEWASM's runtime takes each D3D11 call and replays it on
+The game still thinks it talks to Direct3D 11 (or Direct3D 9: 32-bit Unreal Engine 3 games, see
+[Direct3D 9 games](#direct3d-9-games-unreal-engine-3)). UEWASM's runtime takes each D3D11 call and replays it on
 **WebGPU** (`runtime/gpu_wgpu.c`, `runtime/web/uew_webgpu.js`), or on **WebGL 2** (`runtime/gpu_web.c`) when
 WebGPU isn't available. The game's shaders are DXBC bytecode, and the runtime translates each one to WGSL
 (`runtime/dxbc_wgsl.c`) the first time it's used. The browser then compiles the WGSL into a pipeline in the background.
@@ -377,8 +378,10 @@ belongs in `dxbc_wgsl.c`, not in the game.
 
 ## Direct3D 9 games (Unreal Engine 3)
 
-D3D9 games go through `runtime/d3d9.c` and `runtime/d3d9_wgsl.c` on the same WebGPU backend, so everything above
-applies, plus a few D3D9 specifics:
+32-bit Unreal Engine 3 games (Dishonored, for one) render through Direct3D 9: `runtime/d3d9.c` maps it onto the same
+WebGPU backend, and `runtime/d3d9_wgsl.c` translates their Shader Model 2/3 shaders. Everything above applies, plus a
+few D3D9 specifics. 64-bit UE3 games such as Rocket League use Direct3D 11 like UE4 games, so only the sections
+above apply to them.
 
 | Symptom | Cause | What to do |
 |---|---|---|

@@ -9,7 +9,7 @@
   <br>
 </h1>
 
-<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 4/5 built games into WebAssembly (WASM)
+<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 3, 4 and 5 built games into WebAssembly (WASM)
 </h4>
 
 </p>
@@ -17,7 +17,8 @@
 UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssemably project.
 This tool **doesn't enable piracy on its own**, and any games redistributed with this tool are 
 **responsibility of the distributer, not T4ctica1**. As of today this tool supports games made 
-in Unreal Engine 4 and 5. Unreal Engine 3 support (32-bit games and Direct3D 9) is in progress: see the status table.
+in Unreal Engine 3, 4 and 5. Unreal Engine 3 games run both as 32-bit Direct3D 9 titles (Dishonored) and as 64-bit
+Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 games](#unreal-engine-3-games).
 <br>
 
 > [AI Use Disclosure]
@@ -96,7 +97,8 @@ Here are the games used for Testing and some screenshots of the tool working
 | Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 | PR 0.1.2 |
 | Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 | PR 0.1.2 |
 | Dead as Disco | ➖ Gets in game (Tutorial, Crashes mid way through) | 30-50 FPS | UE 5.7.4 | PR 0.1.3 |
-| Dishonored | 🚧 UE3 bring-up (`--threads real`): reaches the title screen and the main menu under offline Steam, with keyboard input; gameplay not reached yet | - | UE 3 (32-bit, D3D9) | Unreleased |
+| Rocket League | ✅ Works (menus and offline matches, with readable UI text; needs about 7 GB of game memory, `--mem64`) | - | UE 3 (64-bit, D3D11) | PR #2 |
+| Dishonored | ➖ Reaches the title screen and main menu with keyboard input (`--threads real`, offline Steam); gameplay not reached yet | - | UE 3 (32-bit, D3D9) | PR #1 |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -207,6 +209,27 @@ python tests/sse/gen_test.py       # SIMD versions of the SSE helpers against th
 The browser tests need Playwright (`pip install playwright`, then `playwright install msedge` or use an installed
 Edge/Chrome).
 
+## Unreal Engine 3 games
+
+Unreal Engine 3 games build with the same command as UE4/5 games. The tool reads the engine from the install folder,
+so there is no separate mode to pick. What differs:
+
+- **32-bit games** (most UE3 titles, e.g. Dishonored) are recompiled with the x87 FPU, stdcall/cdecl conventions,
+  32-bit SEH and C++ exceptions, and render through **Direct3D 9 on WebGPU** (`runtime/d3d9.c`, with its own shader
+  translator for Shader Model 2/3). Their audio goes through DirectSound or XAudio2, and input through DirectInput 8,
+  XInput or window messages. Build them with `--threads real`: Dishonored doesn't get past its start-up in the default
+  cooperative mode.
+- **64-bit games** (e.g. Rocket League) use the Direct3D 11 path like UE4 games. Games that unpack large shader caches
+  at start need more than the 3.5 GB a normal build holds: give them `--mem-mb 7168` (this turns on `--mem64`, 64-bit
+  WebAssembly memory, which needs current Chrome, Edge or Brave). A running copy then takes about 10 GB of RAM, so
+  run one at a time.
+- **Steam**: the classic interfaces (`SteamUser()`, `SteamFriends()`…) answer as an offline Steam session, so games
+  that insist on Steam start, without online features.
+- **Settings**: `--quality` only applies to UE4/5 games. UE3 games keep their own settings, so change graphics in the
+  game's options menu.
+- **Shaders**: `tests/shaders/extract_d3d9.py` pulls every D3D9 shader out of a UE3 game's caches, to check the
+  translator against a whole game before building it (see [docs/RENDERING.md](docs/RENDERING.md)).
+
 ## Known limitations
 
 - Cooperative builds run every game thread on one browser thread, so CPU-heavy games are limited to roughly what
@@ -215,6 +238,10 @@ Edge/Chrome).
 - Shaders compile the first time an effect appears, which can cause short stutters on a first run; browsers cache
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
+- Unreal Engine 3 support is the newest: Rocket League plays offline matches and Dishonored reaches its main menu.
+  Other UE3 games haven't been tried and may stop at a call nothing tested has needed yet. The Direct3D 9 layer has no
+  fixed-function pipeline (shader-based engines like UE3 don't need it) and no hardware shadow maps, so UE3 falls back
+  to its colour shadow maps.
 - Unreal Engine 5 support is newer than UE4: tested UE5 games reach their menus and gameplay, but they run slower
   than UE4 titles and the first visit to each area stutters while shaders compile.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.

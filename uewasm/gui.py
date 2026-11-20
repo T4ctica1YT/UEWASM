@@ -248,7 +248,7 @@ class App:
             root.iconphoto(True, self.logo)
             ttk.Label(head, image=self.logo).pack(side="left", padx=(0, 8))
         ttk.Label(head, text=TITLE, style="Head.TLabel").pack(side="left")
-        ttk.Label(head, text="  Windows x64 games to WebAssembly", style="Sub.TLabel").pack(side="left", pady=(6, 0))
+        ttk.Label(head, text="  Windows x64 and x86 games to WebAssembly", style="Sub.TLabel").pack(side="left", pady=(6, 0))
 
         # game
         g = ttk.LabelFrame(main, text="Game", padding=10)
