@@ -25,7 +25,7 @@ Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 ga
 > This project was made mostly by AI, but WAS overlooked and corrected by a human.
 
 > [!IMPORTANT]
-> This repository **does not contain any games or built recomplilations, this project is also not affiliated with Epic Games or any Publishers (or other) of games mentioned**.
+> This repository **does not contain any games or built recompilations, this project is also not affiliated with Epic Games or any Publishers (or other) of games mentioned**.
 > You need your own copy of any game you would like to recompile. Everything this tool creates 
 > comes from your game and stays on your PC. Never share the generated files publicly.
 
