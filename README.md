@@ -9,12 +9,12 @@
   <br>
 </h1>
 
-<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 3, 4 and 5 built games into WebAssembly (WASM)
+<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 3, 4 and 5 built games into WebAssembly (.wasm)
 </h4>
 
 </p>
 
-UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssemably project.
+UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssembly project.
 This tool **doesn't enable piracy on its own**, and any games redistributed with this tool are 
 **responsibility of the distributer, not T4ctica1**. As of today this tool supports games made 
 in Unreal Engine 3, 4 and 5. Unreal Engine 3 games run both as 32-bit Direct3D 9 titles (Dishonored) and as 64-bit
