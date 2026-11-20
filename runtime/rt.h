@@ -49,7 +49,18 @@ extern uint64_t MEM_SIZE;
 #else
 #define R(i) (c->r[i])
 #endif
-#define G2H(a) (MEM + (uint32_t)(a))
+/* guest address -> offset into MEM. 32-bit modules wrap at 4 GB (wasm32 can't address more, and stray high bits in a
+   pointer land where Windows would have faulted anyway). With UEW_MEM64 (a wasm64 module) guest memory can be larger
+   than 4 GB: only bits past 64 GB are dropped, and an address past the end of guest memory traps. A 32-bit game
+   (UEW_G32, set by the build) always wraps at 4 GB: its lifted code leaves address sums like esp+4 or eax-4 (added as
+   0xFFFFFFFC) to that wrap */
+#if defined(UEW_MEM64) && !defined(UEW_G32)
+#define GA(a) ((uint64_t)(a) & 0xFFFFFFFFFull)
+#else
+#define GA(a) ((uint32_t)(a))
+#endif
+#define G2H(a) (MEM + GA(a))
+#define H2G(p) ((uint64_t)((const uint8_t*)(p) - MEM))
 
 #ifdef LIFTED
 #define MEMB mem_
@@ -62,14 +73,14 @@ extern uint64_t MEM_SIZE;
 typedef uint16_t __attribute__((aligned(1), may_alias)) u16u_;
 typedef uint32_t __attribute__((aligned(1), may_alias)) u32u_;
 typedef uint64_t __attribute__((aligned(1), may_alias)) u64u_;
-static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return *(volatile uint8_t*)(m + (uint32_t)a); }
-static inline uint64_t ld16_(uint8_t* m, uint64_t a) { return *(volatile u16u_*)(m + (uint32_t)a); }
-static inline uint64_t ld32_(uint8_t* m, uint64_t a) { return *(volatile u32u_*)(m + (uint32_t)a); }
-static inline uint64_t ld64_(uint8_t* m, uint64_t a) { return *(volatile u64u_*)(m + (uint32_t)a); }
-static inline void st8_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile uint8_t*)(m + (uint32_t)a) = (uint8_t)v; }
-static inline void st16_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u16u_*)(m + (uint32_t)a) = (uint16_t)v; }
-static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u32u_*)(m + (uint32_t)a) = (uint32_t)v; }
-static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u64u_*)(m + (uint32_t)a) = v; }
+static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return *(volatile uint8_t*)(m + GA(a)); }
+static inline uint64_t ld16_(uint8_t* m, uint64_t a) { return *(volatile u16u_*)(m + GA(a)); }
+static inline uint64_t ld32_(uint8_t* m, uint64_t a) { return *(volatile u32u_*)(m + GA(a)); }
+static inline uint64_t ld64_(uint8_t* m, uint64_t a) { return *(volatile u64u_*)(m + GA(a)); }
+static inline void st8_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile uint8_t*)(m + GA(a)) = (uint8_t)v; }
+static inline void st16_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u16u_*)(m + GA(a)) = (uint16_t)v; }
+static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u32u_*)(m + GA(a)) = (uint32_t)v; }
+static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { *(volatile u64u_*)(m + GA(a)) = v; }
 static inline XMM xld_(uint8_t* m, uint64_t a, int n)
 {
     XMM x; memset(&x, 0, 16);
@@ -87,16 +98,16 @@ static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n)
     else for (int i = 0; i < n; i++) st8_(m, a + i, x.b[i]);
 }
 #else
-static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return m[(uint32_t)a]; }
-static inline uint64_t ld16_(uint8_t* m, uint64_t a) { uint16_t v; memcpy(&v, m + (uint32_t)a, 2); return v; }
-static inline uint64_t ld32_(uint8_t* m, uint64_t a) { uint32_t v; memcpy(&v, m + (uint32_t)a, 4); return v; }
-static inline uint64_t ld64_(uint8_t* m, uint64_t a) { uint64_t v; memcpy(&v, m + (uint32_t)a, 8); return v; }
-static inline void st8_(uint8_t* m, uint64_t a, uint64_t v) { m[(uint32_t)a] = (uint8_t)v; }
-static inline void st16_(uint8_t* m, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; memcpy(m + (uint32_t)a, &t, 2); }
-static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; memcpy(m + (uint32_t)a, &t, 4); }
-static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { memcpy(m + (uint32_t)a, &v, 8); }
-static inline XMM xld_(uint8_t* m, uint64_t a, int n) { XMM x; memset(&x, 0, 16); memcpy(&x, m + (uint32_t)a, n); return x; }
-static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n) { memcpy(m + (uint32_t)a, &x, n); }
+static inline uint64_t ld8_(uint8_t* m, uint64_t a) { return m[GA(a)]; }
+static inline uint64_t ld16_(uint8_t* m, uint64_t a) { uint16_t v; memcpy(&v, m + GA(a), 2); return v; }
+static inline uint64_t ld32_(uint8_t* m, uint64_t a) { uint32_t v; memcpy(&v, m + GA(a), 4); return v; }
+static inline uint64_t ld64_(uint8_t* m, uint64_t a) { uint64_t v; memcpy(&v, m + GA(a), 8); return v; }
+static inline void st8_(uint8_t* m, uint64_t a, uint64_t v) { m[GA(a)] = (uint8_t)v; }
+static inline void st16_(uint8_t* m, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; memcpy(m + GA(a), &t, 2); }
+static inline void st32_(uint8_t* m, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; memcpy(m + GA(a), &t, 4); }
+static inline void st64_(uint8_t* m, uint64_t a, uint64_t v) { memcpy(m + GA(a), &v, 8); }
+static inline XMM xld_(uint8_t* m, uint64_t a, int n) { XMM x; memset(&x, 0, 16); memcpy(&x, m + GA(a), n); return x; }
+static inline void xst_(uint8_t* m, uint64_t a, XMM x, int n) { memcpy(m + GA(a), &x, n); }
 #endif
 #define LD8(a) ld8_(MEMB, (a))
 #define LD16(a) ld16_(MEMB, (a))
@@ -158,13 +169,13 @@ void rt_atomic_end(uint64_t a);
 #ifdef UEW_THREADS
 #define AT_OP(N, T, name, body_atomic, body_plain) \
 static inline uint64_t at_##name##N(uint8_t* m, uint64_t a, uint64_t x, uint64_t y) { \
-    T* p = (T*)(m + (uint32_t)a); (void)y; \
+    T* p = (T*)(m + GA(a)); (void)y; \
     if (!((uint32_t)a & (sizeof(T) - 1))) return (uint64_t)(body_atomic); \
     rt_atomic_begin(a); T o; memcpy(&o, p, sizeof o); { T n_ = (body_plain); memcpy(p, &n_, sizeof n_); } rt_atomic_end(a); return o; }
 #else
 #define AT_OP(N, T, name, body_atomic, body_plain) \
 static inline uint64_t at_##name##N(uint8_t* m, uint64_t a, uint64_t x, uint64_t y) { \
-    T* p = (T*)(m + (uint32_t)a); (void)y; T o; memcpy(&o, p, sizeof o); { T n_ = (body_plain); memcpy(p, &n_, sizeof n_); } return o; }
+    T* p = (T*)(m + GA(a)); (void)y; T o; memcpy(&o, p, sizeof o); { T n_ = (body_plain); memcpy(p, &n_, sizeof n_); } return o; }
 #endif
 #define AT_ALL(N, T) \
     AT_OP(N, T, xchg, __atomic_exchange_n(p, (T)x, __ATOMIC_SEQ_CST), (T)x) \

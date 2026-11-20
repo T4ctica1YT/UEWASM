@@ -4,7 +4,7 @@
   if (typeof ENVIRONMENT_IS_PTHREAD != "undefined" && ENVIRONMENT_IS_PTHREAD) return;   // page-side only; worker threads skip it
   const BLOCK = 1 << 20;
   const F = Module.uewFiles = {
-    base: Module.uewDataUrl || "data/", part: 16 << 20, cacheMax: (Module.uewCacheMB || 640) << 20,
+    base: Module.uewDataUrl || "data/", part: 16 << 20, cacheMax: (+new URLSearchParams(location.search).get("cachemb") || Module.uewCacheMB || 640) << 20,
     files: [], byPath: new Map(), dirs: new Map(), cache: new Map(), cacheBytes: 0, pending: new Map(), next: new Map(),
     fetched: 0,
   };
@@ -58,8 +58,15 @@
     if (v) { F.cache.delete(k); F.cache.set(k, v); }
     return v;
   };
+  F.seen = new Set(); F.refetched = 0;
+  // ?cachetrace=1: every block the game reads (its key) and every block that arrives (-key-1), in order, to replay
+  // against other cache sizes and policies offline
+  const TR = F.trace = new URLSearchParams(location.search).get("cachetrace") ? [] : null;
   const put = (k, buf) => {
     if (F.cache.has(k)) return;
+    if (TR) TR.push(-k - 1);
+    // a block downloaded before and evicted since: what a too-small cache costs
+    if (F.seen.has(k)) F.refetched += buf.byteLength; else F.seen.add(k);
     F.cache.set(k, buf);
     F.cacheBytes += buf.byteLength;
     while (F.cacheBytes > F.cacheMax) {
@@ -233,6 +240,7 @@
   const touch = (id, b0, b1) => {
     for (let b = b0; b <= b1; b++) {
       const k = key(id, b);
+      if (TR) TR.push(k);
       // the game reached a planned block: everything planned before it is behind us too
       if (T.qset.has(k)) { let x; do { x = T.q.shift(); T.qset.delete(x); } while (x !== k); pump(); }
       if (T.rec && !T.seen.has(k)) { T.seen.add(k); T.order.push(k); }
@@ -273,7 +281,6 @@
   };
 
   F.readCached = (id, off, len, dst) => {
-    dst >>>= 0;
     if (!len) return 0;
     const b0 = Math.floor(off / BLOCK), b1 = Math.floor((off + len - 1) / BLOCK), bufs = [];
     for (let b = b0; b <= b1; b++) {
@@ -315,7 +322,6 @@
   };
 
   F.read = async (id, off, len, dst) => {
-    dst >>>= 0;
     const b0 = Math.floor(off / BLOCK), b1 = Math.floor((off + len - 1) / BLOCK), want = [];
     for (let b = b0; b <= b1; b++) want.push(block(id, b));
     touch(id, b0, b1);

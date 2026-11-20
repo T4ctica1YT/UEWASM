@@ -488,6 +488,34 @@ SHELL = """<!doctype html>
 </head>
 <body>
 <canvas id="canvas" width="__W__" height="__H__" tabindex="0"></canvas>
+<script>
+  // render size, read once by the game at start: "native" (--resolution native, or ?res=native) draws at the window's own
+  // pixel count instead of a fixed size the page scales up, so text and UI stay sharp; ?res=WxH picks a size
+  (() => {
+    const c = document.getElementById("canvas");
+    const want = new URLSearchParams(location.search).get("res") || "__RES__";
+    let w = 0, h = 0;
+    if (want === "native") {
+      const d = Math.min(window.devicePixelRatio || 1, 3);
+      // a page loading in a hidden or not yet laid out view reads a 0x0 window: the screen stands in
+      w = (innerWidth || screen.availWidth || 1280) * d; h = (innerHeight || screen.availHeight || 720) * d;
+      const s = Math.min(1, 3840 / w, 2160 / h);
+      w = Math.round(w * s); h = Math.round(h * s);
+    } else {
+      const m = /^(\\d{3,5})x(\\d{3,5})$/.exec(want);
+      if (m) { w = +m[1]; h = +m[2]; }
+    }
+    if (w >= 320 && h >= 200) {
+      // multiples of 8: Unreal Engine 3 rounds its depth buffer up to 8 pixels, and D3D11 draws to a smaller back
+      // buffer with it while WebGPU wants attachments of one size (at 1600x900 every frame failed: depth 1600x904)
+      w &= ~7; h &= ~7;
+      c.width = w; c.height = h; c.style.aspectRatio = `${w} / ${h}`;
+      // Unreal Engine 3 takes its render size from its settings files (Rocket League: 1280x720) unless the command line
+      // gives one
+      window.uewResArgs = [`-ResX=${w}`, `-ResY=${h}`];
+    }
+  })();
+</script>
 <div id="status">Loading…</div>
 <div id="fps"></div>
 <script>
@@ -526,7 +554,7 @@ SHELL = """<!doctype html>
   const parts = __PARTS__;
   var Module = {
     canvas: document.getElementById("canvas"),
-    arguments: __ARGS__.concat(new URLSearchParams(location.search).getAll("arg")),
+    arguments: __ARGS__.concat(window.uewResArgs || [], new URLSearchParams(location.search).getAll("arg")),
     uewSave: __SAVE__,
     uewSeed: __SEED__,
     uewAsyncShaders: __ASYNC__,
@@ -666,6 +694,13 @@ self.addEventListener("fetch", e => {
 });
 """
 
+# 64-bit memory builds: a module whose one memory has the memory64 flag validates only where memory64 is supported
+MEM64_CHECK = """<script>
+  window.uewMem64Ok = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0]));
+  if (!uewMem64Ok) status.textContent = "This game needs 64-bit WebAssembly memory (memory64): use a current Chrome, Edge or Brave.";
+</script>
+"""
+
 COI_LOAD = """<script>
   // real threads: start once the page is cross-origin isolated (headers from the host, or coi-sw.js)
   if (self.crossOriginIsolated) document.write('<script src="game.js"><\\/script>');
@@ -681,8 +716,9 @@ COI_LOAD = """<script>
 
 
 def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
-                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop", seed=None):
-    """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts"""
+                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop", seed=None, mem64=False):
+    """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts. mem64: the page
+    checks for WebAssembly memory64 first and says so instead of failing to compile"""
     import json
     wasm = web / "game.wasm"
     for old in web.glob("game.wasm.*"):
@@ -697,17 +733,27 @@ def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, 
         wasm.unlink()
     from .icon import write_favicon
     icon = write_favicon(web, exe) or "data:,"
+    # size "native": the page sizes the canvas to the window's pixels at start (1280x720 until then, and as the fallback)
+    res = "native" if size == "native" else ""
+    if size == "native":
+        size = (1280, 720)
     html = (SHELL.replace("__ICON__", icon).replace("__TITLE__", title).replace("__W__", str(size[0])).replace("__H__", str(size[1]))
+            .replace("__RES__", res)
             .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save)).replace("__SEED__", json.dumps(seed or {}))
             .replace("__FPS__", "true" if show_fps else "false")
             .replace("__ASYNC__", "true" if async_shaders else "false")
             .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false")
             .replace("__CACHEMB__", str(int(cache_mb))).replace("__GPUMB__", str(int(gpu_mb))))
     if threads == "real":
-        html = html.replace('<script src="game.js"></script>\n', COI_LOAD)
+        load = COI_LOAD.replace("  if (self.crossOriginIsolated)", "  if (!window.uewMem64Ok) {}\n  else if (self.crossOriginIsolated)") if mem64 else COI_LOAD
+        html = html.replace('<script src="game.js"></script>\n', (MEM64_CHECK if mem64 else "") + load)
         (web / "coi-sw.js").write_text(COI_SW, encoding="utf-8")
-    elif (web / "coi-sw.js").exists():
-        (web / "coi-sw.js").unlink()
+    else:
+        if mem64:
+            html = html.replace('<script src="game.js"></script>\n',
+                                MEM64_CHECK + """<script>if (window.uewMem64Ok) document.write('<script src="game.js"><\\/script>');</script>\n""")
+        if (web / "coi-sw.js").exists():
+            (web / "coi-sw.js").unlink()
     (web / "index.html").write_text(html, encoding="utf-8")
     # Cloudflare Pages reads this; other hosts ignore it
     (web / "_headers").write_text("\n".join([
@@ -845,8 +891,11 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
                wasm_opt=False, game_args=None, quality=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
-               placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web"):
-    """aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
+               placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web", mem64=False):
+    """mem64: build a wasm64 module (64-bit memory), so guest memory can be larger than the 4 GB a wasm32 module can
+    address (games that need more than ~3 GB). Needs a browser with WebAssembly memory64 (Chrome/Edge/Brave 133+); 64-bit
+    addressing costs some speed, so it is only used when asked for.
+    aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
     older-format ones are packaged decrypted, so they compress.
     wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
     module size in RAM (11 GB for a 550 MB game), so it is off unless asked for."""
@@ -865,7 +914,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     # real threads compile every file differently (shared memory, atomics), so their objects are kept apart
     # developer hook: UEW_LTO=thin builds with ThinLTO (small lifted functions inlined across files) into its own objects
     lto = os.environ.get("UEW_LTO") == "thin"
-    obj = out / (("wobj_mt" if mt else "wobj") + ("_lto" if lto else ""))
+    obj = out / (("wobj_mt" if mt else "wobj") + ("_m64" if mem64 else "") + ("_lto" if lto else ""))
     obj.mkdir(exist_ok=True)
     env, emcc, _ = emsdk_env()
     # simd: wasm SIMD (every current browser) lets clang turn the emulated SSE lanes into real vector ops
@@ -876,6 +925,8 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         cflags.append("-DUEW_WEBGPU")
     if mt:
         cflags += ["-pthread", "-DUEW_THREADS"]
+    if mem64:
+        cflags += ["-sMEMORY64=1", *(f"-D{d}" for d in mem64_defines(out))]
     if lto:
         cflags.append("-flto=thin")
     # generated code only depends on rt.h/sse.h and the opt level; the runtime is always rebuilt (it is small)
@@ -925,7 +976,7 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     orsp = out / "emlink.rsp"
     orsp.write_text("\n".join(f'"{p.as_posix()}"' for p in obj.glob("*.o")), encoding="utf-8")
     link = [emcc, opt if wasm_opt else "-O1", *(["-flto=thin", "-Wl,--lto-O2", f"-Wl,--thinlto-jobs={resources.plan()['compile_jobs']}"] if lto else []), "-mtail-call", *(["-msimd128"] if simd else []), f"@{orsp}", "-o", str(web / "game.js"),
-            "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=64MB", "-sMAXIMUM_MEMORY=4GB", "-sSTACK_SIZE=16MB", "-sENVIRONMENT=web,node",
+            "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=64MB", f"-sMAXIMUM_MEMORY={'16GB' if mem64 else '4GB'}", *(["-sMEMORY64=1"] if mem64 else []), "-sSTACK_SIZE=16MB", "-sENVIRONMENT=web,node",
             "-sEXIT_RUNTIME=1", "-sMODULARIZE=0", "-sINVOKE_RUN=1", *PORTS,
             "-sMIN_WEBGL_VERSION=2", "-sMAX_WEBGL_VERSION=2", "-sSUPPORT_LONGJMP=wasm", "-sJSPI", "-sJSPI_EXPORTS=['uew_ctx_start']", "-sEXPORTED_FUNCTIONS=" + ",".join(exports)]
     link += ["--js-library", str(RUNTIME / "web" / "uew_host.js")]
@@ -983,11 +1034,11 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         log(f"memory limit {mem_limit_gb} GB: {guest} MB game memory, {cache_mb} MB download cache, {gpu_mb} MB video memory")
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
                     exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb,
-                    threads=threads, seed=quality_files(exe_rel, quality))
+                    threads=threads, seed=quality_files(exe_rel, quality), mem64=mem64)
         if single_file:
             name = re.sub(r'[<>:"/\\|?*]', "", title or Path(exe_rel).stem).strip() or "game"
             write_single_file(web, out / "single" / f"{name}.html", log=log)
-    log(f"wasm build: {web} ({renderer}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
+    log(f"wasm build: {web} ({renderer}{', 64-bit memory' if mem64 else ''}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
     return web
 
 
@@ -1015,9 +1066,18 @@ def tool(env, name):
     return p
 
 
-def build_native(out, log=print, debug=False, progress=nop_progress):
+def mem64_defines(out):
+    """C defines for a 64-bit memory build: a 32-bit game keeps its addresses wrapping at 4 GB (UEW_G32, rt.h)"""
+    meta = Path(out) / "gen" / "meta.c"
+    g32 = meta.exists() and "const int RT_G32 = 1;" in meta.read_text(encoding="utf-8", errors="replace")
+    return ["UEW_MEM64", *(["UEW_G32"] if g32 else [])]
+
+
+def build_native(out, log=print, debug=False, progress=nop_progress, mem64=False):
+    """mem64: guest addresses past 4 GB, as in a --mem64 web build (the native build is 64-bit, so only the address
+    macros change)"""
     out = Path(out)
-    obj = out / "obj"
+    obj = out / ("obj_m64" if mem64 else "obj")
     obj.mkdir(exist_ok=True)
     env = msvc_env()
     gen = sorted((out / "gen").glob("*.c"))
@@ -1033,6 +1093,8 @@ def build_native(out, log=print, debug=False, progress=nop_progress):
              f"/I{RUNTIME}", f"/I{out / 'gen'}", f"/Fo{obj}\\", "/D_CRT_SECURE_NO_WARNINGS", "/std:c11"]
     if debug:
         flags.append("/Z7")
+    if mem64:
+        flags += [f"/D{d}" for d in mem64_defines(out)]
     t0 = time.time()
     cl = tool(env, "cl")
     run_jobs([(p.name, [cl, *flags, str(p)], env, 80 + 40 * p.stat().st_size / 1048576) for p in srcs], "native compile", progress)

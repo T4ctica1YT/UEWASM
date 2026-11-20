@@ -221,14 +221,24 @@ HLE(VirtualAlloc)
     if (watch && ((r && watch - r < size) || (addr && watch - addr < size)))
         host_log("[memwatch] VirtualAlloc(%llx, %llx, %llx) = %llx from %llx thread %u", (unsigned long long)addr, (unsigned long long)size,
                  (unsigned long long)A3, (unsigned long long)r, (unsigned long long)LDP(R(4)), sched_current_id());
-    if (dbg && (size >= (64u << 20) || !r) && said++ < 200)
-        host_log("[mem] VirtualAlloc(%llx, %llx, %llx, %llx) = %llx from %llx", (unsigned long long)addr, (unsigned long long)size,
-                 (unsigned long long)A3, (unsigned long long)A4, (unsigned long long)r, (unsigned long long)LDP(R(4)));
+    if (dbg && (size >= (64u << 20) || !r) && said++ < 200) {
+        host_log("[mem] VirtualAlloc(%llx, %llx, %llx, %llx) = %llx from %llx thread %u", (unsigned long long)addr, (unsigned long long)size,
+                 (unsigned long long)A3, (unsigned long long)A4, (unsigned long long)r, (unsigned long long)LDP(R(4)), sched_current_id());
+        /* the allocator's own frames come first; a deep scan reaches whoever asked for the block */
+        void rt_backtrace_n(CPU* c, const char* tag, int max);
+        if (r && !RT_G32) rt_backtrace_n(c, "mem", 48);
+    }
     RET(r);
 }
 HLE(VirtualFree)
 {
     uint64_t len, base = g_pages_query(A1, &len);
+    static int dbg = -1;
+    if (dbg < 0) dbg = host_query_flag("memdebug");
+    if (dbg && base && len >= (64u << 20))
+        host_log("[mem] VirtualFree(%llx, %llx, %llx): block %llx+%llx%s from %llx", (unsigned long long)A1, (unsigned long long)A2,
+                 (unsigned long long)A3, (unsigned long long)base, (unsigned long long)len, A3 & 0x8000 ? " released" : " decommitted",
+                 (unsigned long long)LDP(R(4)));
     static uint64_t watch = ~0ull;
     if (watch == ~0ull) watch = (uint64_t)host_query_hex("memwatch");
     if (watch && base && watch - base < len)
@@ -251,8 +261,13 @@ HLE(GetSystemInfo)
     ST32(A1 + 4, 4096);
     STP(A1 + 8, 0x10000);
     STP(A1 + 8 + p, (RT_G32 && MEM_SIZE > 0x7FFF0000ull ? 0x7FFF0000ull : MEM_SIZE) - 1);
-    STP(A1 + 8 + 2 * p, 1);
-    ST32(A1 + 8 + 3 * p, 1);
+    /* the same core count as GetActiveProcessorCount and GetLogicalProcessorInformation: Unreal Engine 3 sizes its
+       threads from this one, and with a single core it never starts its rendering thread (Rocket League then uses
+       that thread's memory stack uninitialized and divides by zero) */
+    int hle_cores(void);
+    int ncores = hle_cores();
+    STP(A1 + 8 + 2 * p, ncores >= 64 ? ~0ull : (1ull << ncores) - 1);
+    ST32(A1 + 8 + 3 * p, (uint32_t)ncores);
     ST32(A1 + 12 + 3 * p, RT_G32 ? 586 : 8664);
     ST32(A1 + 16 + 3 * p, 65536);
     ST16(A1 + 20 + 3 * p, 6);

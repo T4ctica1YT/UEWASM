@@ -62,6 +62,10 @@ Desktop apps:
   files*, *Online*, *Tools*), each with a note on what it does. `pip install pyinstaller`, then `python build_exe.py`
   (writes `dist/UEWASM.exe`, with the Rust recompiler built in).
 
+Both apps build Unreal Engine 3 games the same way the command line does: *Guest memory* goes up to 15360 MB, and
+more than 3584 MB builds with 64-bit memory (`--mem64`; Rocket League needs about 7168 MB). *Resolution* offers
+`native` for the window's own pixel size.
+
 ## Requirements
 
 - Windows 10/11, x64
@@ -119,10 +123,11 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
 | `--emsdk` | folder | Where the Emscripten SDK is, if not in `%USERPROFILE%\emsdk` or `EMSDK` (the desktop app's choice is used otherwise). |
 | `--lifter` | `python` (default), `rust` | Which recompiler turns the machine code into C. `rust` (`rustlift/`) produces the same output several times faster; it needs a Rust toolchain and is built automatically the first time. |
-| `--mem-mb` | number | Guest memory; browsers allow 4096 MB total. |
+| `--mem-mb` | number (default `3072`) | Guest memory. A normal build holds up to 3584 MB (the whole module gets 4 GB); more than that turns on `--mem64`, which allows up to 15360 MB. |
+| `--mem64` |N/A| Build with 64-bit WebAssembly memory (wasm64), for games that need more than ~3.5 GB. Browsers give such a module up to 16 GB. A little slower (64-bit addresses and bounds checks), so it is only used when asked for or when `--mem-mb` is over 3584. Needs a browser with WebAssembly memory64 (current Chrome, Edge or Brave); in others the page says so instead of starting. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md#more-than-35-gb-of-game-memory---mem64). |
 | `--mem-limit-gb` | number (default `8`) | How much memory the built game may use when run, split between game memory, the download cache and video memory. |
 | `--aes-key` | `0x` + 64 hex digits | Decrypt AES-encrypted `.pak` files with your own key so the browser can read them. The key is checked before the build starts; a wrong key stops the build. |
-| `--resolution` | e.g. `1280x720` | Render size. The page scales it to fit the window, so a lower value helps slow machines. |
+| `--resolution` | e.g. `1280x720`, `native` | Render size. The page scales it to fit the window, so a lower value helps slow machines. `native` renders at the window's own pixel size (rounded down to a multiple of 8) so text and menus stay sharp; Unreal Engine 3 games are given it with `-ResX`/`-ResY`. `?res=native` or `?res=WxH` in the page address overrides it. |
 | `--part-mb` | number | Largest file in the output. The default of 16 stays under Cloudflare Pages' 25 MiB limit. |
 | `--compress` |N/A| Compress the game's files (audio excluded) for a smaller download. |
 | `--single-file` |N/A| Also write one `.html` file holding the whole game (code and files), which plays when opened straight from disk with no server. Cooperative threads only; best for smaller games, since the whole page is loaded at once. |
@@ -165,7 +170,8 @@ Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1
   It explains every `[webgpu]` log line, the page switches that isolate a problem, Unreal settings that work around
   broken effects, frame capture, and how to fix the shader translator itself.
 - **Low FPS or stutter:** see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-- **Crashes and hangs:** see [docs/DEBUGGING.md](docs/DEBUGGING.md) (readable crash stacks, `?tracering=1`, `?watch=`, debug builds).
+- **Crashes and hangs:** see [docs/DEBUGGING.md](docs/DEBUGGING.md) (writing the log to a file with `uewasm serve --log`,
+  readable crash stacks, `?tracering=1`, `?watch=`, `?memdebug=1`, debug builds).
 
 ## Hosting
 
@@ -188,6 +194,7 @@ screen. GPU work is sent in smaller batches on integrated GPUs to make that rare
 ```
 python tests/run_tests.py          # C, C++ STL, threads, files: original exe vs native recompile vs wasm
 python tests/run_tests.py --threads real   # the same with guest threads on several cores
+python tests/run_tests.py --mem64  # the same with 64-bit memory and 5 GB of guest memory (addresses past 4 GB)
 python tests/gfx/run_gfx.py webgpu # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
 python tests/gfx/run_gfx.py webgpu srgb  # the same on an sRGB swap chain (must not come out darker)
 python tests/gfx/run_gfx.py webgpu d3d9  # the Direct3D 9 version (32-bit, Shader Model 3)

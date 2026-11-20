@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--x86", action="store_true", help="build the tests as 32-bit programs")
     ap.add_argument("--threads", choices=["coop", "real"], default="coop", help="web build threading (real: guest threads on several cores)")
     ap.add_argument("--lifter", choices=["python", "rust"], default="python", help="which lifter recompiles the tests")
+    ap.add_argument("--mem64", action="store_true", help="64-bit memory (wasm64) with 5 GB of guest memory, so guest addresses pass 4 GB")
     a = ap.parse_args()
     env = build.msvc_env("x86" if a.x86 else "x64")
     srcs = sorted(p for p in HERE.iterdir() if p.suffix in FLAGS and (not a.names or p.stem in a.names))
@@ -53,8 +54,8 @@ def main():
     for src in srcs:
         exe = compile_test(src, env, a.x86)
         out = exe.parent / "recomp"
-        build.recompile(exe, out, mem_mb=256, log=lambda *_: None, lifter=a.lifter)
-        native = build.build_native(out, log=lambda *_: None)
+        build.recompile(exe, out, mem_mb=5120 if a.mem64 else 256, log=lambda *_: None, lifter=a.lifter)
+        native = build.build_native(out, log=lambda *_: None, mem64=a.mem64)
         clean_saved(exe.parent)
         ref = run([str(exe)], cwd=exe.parent)
         clean_saved(exe.parent)
@@ -65,7 +66,7 @@ def main():
         args = ["--image", str(out / "image.bin"), "--root", str(exe.parent), "--exe", exe.name, "--save", str(save)]
         got = {"native": run([str(native), *args])}
         if not a.no_wasm:
-            build.build_wasm(out, log=lambda *_: None, node_fs=True, threads=a.threads)
+            build.build_wasm(out, log=lambda *_: None, node_fs=True, threads=a.threads, mem64=a.mem64)
             node = build.emsdk_env()[2]
             got["wasm"] = run([node, *build.jspi_flag(node), "game.js", *args], cwd=out / "web")
         ok = True

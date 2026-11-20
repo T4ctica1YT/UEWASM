@@ -254,7 +254,7 @@ HLE(RaiseException)
         if (A4 && A3 >= 3 && LD32(A4) == 0x1000) {
             uint32_t tid = (uint32_t)LD32(A4 + 2 * GP);
             GThread* t = tid == 0xFFFFFFFFu ? sched_current() : sched_by_tid(tid);
-            if (t) { const char* n = GSTR(LDP(A4 + GP)); snprintf(t->name, sizeof t->name, "%s", n); }
+            if (t) { const char* n = GSTR(LDP(A4 + GP)); snprintf(t->name, sizeof t->name, "%s", n); sched_named(t); }
         }
         RET(0);
         return;

@@ -9,6 +9,7 @@ GpuBackend* gpu;
 static GpuCtx ctx;
 static uint64_t g_device, g_context, g_factory, g_adapter, g_output, g_dxgidevice, g_swapchain, g_backbuffer;
 static uint64_t sc_desc;
+static int sc_fs;   /* the swap chain's fullscreen state, as the game last set it (sc_fullscreen) */
 
 #define I(a, b, c_, d0, d1, d2, d3, d4, d5, d6, d7) { (a) & 0xFF, ((a) >> 8) & 0xFF, ((a) >> 16) & 0xFF, ((a) >> 24) & 0xFF, (b) & 0xFF, ((b) >> 8) & 0xFF, (c_) & 0xFF, ((c_) >> 8) & 0xFF, d0, d1, d2, d3, d4, d5, d6, d7 }
 static const uint8_t IID_Device[][16] = { I(0xdb6f6ddb, 0xac77, 0x4e88, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40) };
@@ -91,9 +92,11 @@ static uint64_t backing(GpuRes* r)
 
 static ComKind* res_kind(GpuRes* r) { return r->type == RES_BUFFER ? &K_Buffer : &K_Tex; }
 
+static int glyph_dbg(GpuRes* a, GpuRes* b);
 static uint64_t new_res(GpuRes* r, uint64_t desc, uint32_t desc_size, uint64_t init)
 {
     uint64_t o = com_new(res_kind(r), r, 64);
+    if (glyph_dbg(r, NULL)) host_log("[glyph] create %p %ux%u u%u bind %x cpu %x mips %u init %d", (void*)r, r->width, r->height, r->usage, r->bind, LD32(desc + 36), r->mips, init != 0);
     memcpy(G2H(PAY(o)), G2H(desc), desc_size);
     if (gpu->res_create) gpu->res_create(r, init);
     if (init) {
@@ -133,10 +136,12 @@ static void view_get_desc(CPU* c) { memcpy(G2H(A2), G2H(PAY(THIS) + 8), 40); RET
 static void state_get_desc(CPU* c) { GpuState* s = com_host(THIS); memcpy(G2H(A2), s->desc, s->kind == 3 ? 52 : s->kind == 2 ? 52 : s->kind == 1 ? 264 : 40); RET(0); }
 
 /* ---- device ---- */
+uint64_t g_res_live;   /* buffers and textures alive (the [mem] log line) */
 static void dev_create_buffer(CPU* c)
 {
     uint64_t d = A2;
     GpuRes* r = calloc(1, sizeof *r);
+    g_res_live++;
     r->type = RES_BUFFER;
     r->width = (uint32_t)LD32(d);
     r->usage = (uint32_t)LD32(d + 4);
@@ -156,6 +161,7 @@ static void dev_create_buffer(CPU* c)
 static uint64_t make_tex(int type, uint64_t d, uint64_t init)
 {
     GpuRes* r = calloc(1, sizeof *r);
+    g_res_live++;
     r->type = type;
     r->width = (uint32_t)LD32(d);
     uint32_t sz;
@@ -220,8 +226,43 @@ static void dev_create_uav(CPU* c) { make_view(c, 1, A4); }
 static void dev_create_rtv(CPU* c) { make_view(c, 2, A4); }
 static void dev_create_dsv(CPU* c) { make_view(c, 3, A4); }
 
+/* identical input layouts share one GpuLayout. D3D11 makes a new object for each CreateInputLayout, and Rocket League
+   creates the same layouts over and over as it draws; render pipelines are keyed by layout, so every copy meant new
+   pipelines each frame (draws skipped while they compiled: missing menus and text). Each call still gets its own COM
+   object; layouts are never freed, so sharing the host side is safe */
+typedef struct LayoutEnt { struct LayoutEnt* next; uint64_t h; GpuLayout* l; } LayoutEnt;
+static LayoutEnt* layout_tab[256];
 static void dev_create_layout(CPU* c)
 {
+    uint32_t n = (uint32_t)A3 < 32 ? (uint32_t)A3 : 32, sig_size = (uint32_t)ARG(5);
+    GpuLayout tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.count = n;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t e = A2 + 32ull * i;
+        snprintf(tmp.el[i].semantic, sizeof tmp.el[i].semantic, "%s", GSTR(LD64(e)));
+        tmp.el[i].index = (uint32_t)LD32(e + 8);
+        tmp.el[i].format = (uint32_t)LD32(e + 12);
+        tmp.el[i].slot = (uint32_t)LD32(e + 16);
+        tmp.el[i].offset = (uint32_t)LD32(e + 20);
+        tmp.el[i].per_instance = (uint32_t)LD32(e + 24);
+        tmp.el[i].step = (uint32_t)LD32(e + 28);
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint8_t* b = (const uint8_t*)&tmp.count;
+    for (size_t i = 0; i < sizeof tmp.count + sizeof tmp.el[0] * n; i++) h = (h ^ b[i]) * 0x100000001B3ull;
+    const uint8_t* sigp = sig_size ? G2H(A4) : NULL;
+    for (uint32_t i = 0; i < sig_size; i++) h = (h ^ sigp[i]) * 0x100000001B3ull;
+    LayoutEnt** slot = &layout_tab[h & 255];
+    for (LayoutEnt* e = *slot; e; e = e->next) {
+        GpuLayout* l = e->l;
+        if (e->h == h && l->count == n && !memcmp(l->el, tmp.el, sizeof tmp.el[0] * n) && l->vs_sig && l->vs_sig->size == sig_size &&
+            (!sig_size || !memcmp(l->vs_sig->code, sigp, sig_size))) {
+            if (ARG(6)) ST64(ARG(6), com_new(&K_Layout, l, 0));
+            RET(0);
+            return;
+        }
+    }
     GpuLayout* l = calloc(1, sizeof *l);
     l->count = (uint32_t)A3 < 32 ? (uint32_t)A3 : 32;
     for (uint32_t i = 0; i < l->count; i++) {
@@ -240,36 +281,84 @@ static void dev_create_layout(CPU* c)
     memcpy(sig->code, G2H(A4), sig->size);
     l->vs_sig = sig;
     if (gpu->layout_create) gpu->layout_create(l);
+    LayoutEnt* ent = calloc(1, sizeof *ent);
+    if (ent) { ent->h = h; ent->l = l; ent->next = *slot; *slot = ent; }
     if (ARG(6)) ST64(ARG(6), com_new(&K_Layout, l, 0));
     RET(0);
 }
 
-static void make_shader(CPU* c, int stage, uint64_t out)
+/* identical bytecode shares one GpuShader. D3D11 makes a new object for every Create*Shader, and Rocket League creates
+   about a fifth of its shaders more than once (21,036 made, 16,311 distinct by a match). Each copy kept its own bytecode
+   and, once drawn, its own WGSL translations, GPU shader modules and render pipelines, all keyed by the shader. Every
+   call still gets its own COM object; shaders are never freed, so sharing the host side is safe. Stream-output geometry
+   shaders are left out (their output declaration is part of what they are) */
+uint64_t g_shader_count, g_shader_bytes, g_shader_distinct, g_shader_distinct_bytes;   /* the [mem] log line */
+typedef struct ShaderEnt { struct ShaderEnt* next; uint64_t h; GpuShader* s; } ShaderEnt;
+static ShaderEnt* shader_tab[8192];
+static void make_shader_ex(CPU* c, int stage, uint64_t out, int share)
 {
+    uint32_t size = (uint32_t)A3;
+    const uint8_t* code = G2H(A2);
+    g_shader_count++;
+    g_shader_bytes += size;
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)stage << 56 ^ size;
+    for (uint32_t i = 0; i < size; i += 8) { uint64_t w = 0; memcpy(&w, code + i, size - i < 8 ? size - i : 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    ShaderEnt** slot = &shader_tab[h & 8191];
+    if (share)
+        for (ShaderEnt* e = *slot; e; e = e->next)
+            if (e->h == h && e->s->stage == stage && e->s->size == size && !memcmp(e->s->code, code, size)) {
+                if (out) ST64(out, com_new(&K_Shader, e->s, 0));
+                RET(0);
+                return;
+            }
+    g_shader_distinct++;
+    g_shader_distinct_bytes += size;
     GpuShader* s = calloc(1, sizeof *s);
     s->stage = stage;
-    s->size = (uint32_t)A3;
-    s->code = malloc(s->size);
-    memcpy(s->code, G2H(A2), s->size);
+    s->size = size;
+    s->code = malloc(size);
+    memcpy(s->code, code, size);
     if (gpu->shader_create) gpu->shader_create(s);
+    if (share) { ShaderEnt* e = calloc(1, sizeof *e); if (e) { e->h = h; e->s = s; e->next = *slot; *slot = e; } }
     if (out) ST64(out, com_new(&K_Shader, s, 0));
     RET(0);
 }
+static void make_shader(CPU* c, int stage, uint64_t out) { make_shader_ex(c, stage, out, 1); }
 static void dev_create_vs(CPU* c) { make_shader(c, SH_VS, ARG(5)); }
 static void dev_create_gs(CPU* c) { make_shader(c, SH_GS, ARG(5)); }
-static void dev_create_gs_so(CPU* c) { make_shader(c, SH_GS, ARG(10)); }
+static void dev_create_gs_so(CPU* c) { make_shader_ex(c, SH_GS, ARG(10), 0); }
 static void dev_create_ps(CPU* c) { make_shader(c, SH_PS, ARG(5)); }
 static void dev_create_hs(CPU* c) { make_shader(c, SH_HS, ARG(5)); }
 static void dev_create_ds(CPU* c) { make_shader(c, SH_DS, ARG(5)); }
 static void dev_create_cs(CPU* c) { make_shader(c, SH_CS, ARG(5)); }
 
+/* D3D11 hands back the object it already has for a state description it has seen (AddRef'd), and engines rely on it:
+   Rocket League's UI (Scaleform) creates its blend/depth/raster states as it draws. A new object each time meant new
+   render pipelines every frame (they are keyed by state object), and its draws were skipped while those compiled,
+   so menus and text came and went. States are never freed (as before), so one released to zero is simply reused */
+typedef struct StateEnt { struct StateEnt* next; uint64_t obj, h; GpuState* s; uint32_t size; } StateEnt;
+static StateEnt* state_tab[512];
 static void make_state(CPU* c, int kind, uint32_t size)
 {
+    const uint8_t* d = G2H(A2);
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)kind;
+    for (uint32_t i = 0; i < size; i++) h = (h ^ d[i]) * 0x100000001B3ull;
+    StateEnt** slot = &state_tab[h & 511];
+    for (StateEnt* e = *slot; e; e = e->next)
+        if (e->h == h && e->s->kind == kind && e->size == size && !memcmp(e->s->desc, d, size)) {
+            if (A3) { ST32(e->obj + 8, LD32(e->obj + 8) + 1); ST64(A3, e->obj); }
+            RET(A3 ? 0 : 1);
+            return;
+        }
+    if (!A3) { RET(1); return; }   /* S_FALSE: the description is valid, nothing was asked for back */
     GpuState* s = calloc(1, sizeof *s);
     s->kind = kind;
-    memcpy(s->desc, G2H(A2), size);
+    memcpy(s->desc, d, size);
     if (gpu->state_create) gpu->state_create(s);
-    if (A3) ST64(A3, com_new(&K_State, s, 0));
+    uint64_t o = com_new(&K_State, s, 0);
+    StateEnt* e = calloc(1, sizeof *e);
+    if (e) { e->obj = o; e->h = h; e->s = s; e->size = size; e->next = *slot; *slot = e; }
+    ST64(A3, o);
     RET(0);
 }
 static void dev_create_blend(CPU* c) { make_state(c, 1, 264); }
@@ -381,6 +470,18 @@ static void ctx_draw_indirect(CPU* c) { indirect(c, 0); }
 static void ctx_dispatch_indirect(CPU* c) { indirect(c, 2); }
 static void ctx_gen_mips(CPU* c) { if (gpu->gen_mips && com_host(A2)) gpu->gen_mips(com_host(A2)); RET(0); }
 
+/* ?glyphdebug=1: maps, updates and copies that touch single-channel 8-bit textures (Scaleform's glyph cache) */
+static int glyph_dbg(GpuRes* a, GpuRes* b)
+{
+    static int on = -1, n;
+    if (on < 0) on = host_query_flag("glyphdebug");
+    if (!on || n >= 600) return 0;
+    if (!((a && a->type != RES_BUFFER && (a->format == 61 || a->format == 65)) || (b && b->type != RES_BUFFER && (b->format == 61 || b->format == 65)))) return 0;
+    n++;
+    return 1;
+}
+#define GRES(r) (r) ? (r)->width : 0, (r) ? (r)->height : 0, (r) ? (r)->usage : 0
+
 static void ctx_map(CPU* c)
 {
     GpuRes* r = com_host(A2);
@@ -399,7 +500,15 @@ static void ctx_map(CPU* c)
         return;
     }
     r->map_type = type;
-    if ((type == 1 || type == 3) && gpu->readback) gpu->readback(r, sub);
+    if (glyph_dbg(r, NULL)) host_log("[glyph] map %p %ux%u u%u sub %u type %u flags %x pitch %u dirty %d", (void*)r, GRES(r), sub, type, (unsigned)ARG(5), r->sub_pitch[sub], r->gpu_dirty);
+    /* a staging resource keeps its contents across maps, WRITE ones included: what the GPU copied into it shows through.
+       Scaleform adds glyphs to its cache by copying the cache into a staging texture, mapping it for WRITE, drawing the
+       new glyphs and uploading the whole thing back; without the copy's data every update wiped the cache but for the
+       newest glyphs (most letters missing) */
+    if ((type == 1 || type == 3 || (type == 2 && r->usage == 3 && r->gpu_dirty)) && gpu->readback) {
+        gpu->readback(r, sub);
+        if (r->nsub <= 1) r->gpu_dirty = 0;
+    }
     ST64(out, b + r->sub_offset[sub]);
     ST32(out + 8, r->sub_pitch[sub]);
     ST32(out + 12, r->sub_slice[sub]);
@@ -409,6 +518,7 @@ static void ctx_unmap(CPU* c)
 {
     GpuRes* r = com_host(A2);
     uint32_t sub = (uint32_t)A3;
+    if (glyph_dbg(r, NULL)) host_log("[glyph] unmap %p %ux%u u%u sub %u", (void*)r, GRES(r), sub);
     /* staging memory only goes to the GPU when it was mapped for writing */
     if (r && r->backing && gpu->res_upload && (r->usage != 3 || r->map_type == 2 || r->map_type == 3))
         gpu->res_upload(r, sub, NULL, r->backing + r->sub_offset[sub], r->sub_pitch[sub], r->sub_slice[sub]);
@@ -423,6 +533,7 @@ static void ctx_update(CPU* c)
     if (!r) { RET(0); return; }
     int32_t b[6];
     if (box) for (int i = 0; i < 6; i++) b[i] = (int32_t)LD32(box + 4ull * i);
+    if (glyph_dbg(r, NULL)) host_log("[glyph] update %p %ux%u u%u sub %u box %d,%d-%d,%d pitch %u", (void*)r, GRES(r), sub, box ? b[0] : -1, box ? b[1] : -1, box ? b[3] : -1, box ? b[4] : -1, pitch);
     if (r->type == RES_BUFFER) {
         uint64_t dst = backing(r) + (box ? (uint32_t)b[0] : 0);
         uint32_t n = box ? (uint32_t)(b[3] - b[0]) : r->width;
@@ -562,13 +673,19 @@ static void ctx_copy_region(CPU* c)
     int32_t b[6];
     uint64_t box = ARG(9);
     if (box) for (int i = 0; i < 6; i++) b[i] = (int32_t)LD32(box + 4ull * i);
-    if (gpu->copy) gpu->copy(com_host(A2), (uint32_t)A3, (uint32_t)A4, (uint32_t)ARG(5), (uint32_t)ARG(6), com_host(ARG(7)), (uint32_t)ARG(8), box ? b : NULL);
+    if (glyph_dbg(com_host(A2), com_host(ARG(7)))) { GpuRes *gd = com_host(A2), *gs = com_host(ARG(7));
+        host_log("[glyph] copyregion %p %ux%u u%u at %u,%u <- %p %ux%u u%u box %d,%d-%d,%d", (void*)gd, GRES(gd), (unsigned)A4, (unsigned)ARG(5), (void*)gs, GRES(gs), box ? b[0] : -1, box ? b[1] : -1, box ? b[3] : -1, box ? b[4] : -1); }
+    GpuRes *cd = com_host(A2), *cs = com_host(ARG(7));
+    if (cd && cd->usage == 3 && cs && !(cd->type == RES_BUFFER && cs->backing)) cd->gpu_dirty = 1;
+    if (gpu->copy) gpu->copy(cd, (uint32_t)A3, (uint32_t)A4, (uint32_t)ARG(5), (uint32_t)ARG(6), cs, (uint32_t)ARG(8), box ? b : NULL);
     RET(0);
 }
 static void ctx_copy(CPU* c)
 {
     GpuRes *d = com_host(A2), *s = com_host(A3);
+    if (glyph_dbg(d, s)) host_log("[glyph] copy %p %ux%u u%u <- %p %ux%u u%u", (void*)d, GRES(d), (void*)s, GRES(s));
     if (d && s && s->backing) { backing(d); memcpy(G2H(d->backing), G2H(s->backing), (size_t)(d->bytes < s->bytes ? d->bytes : s->bytes)); }
+    else if (d && s && d->usage == 3) d->gpu_dirty = 1;
     if (gpu->copy && d && s) for (int i = 0; i < (d->nsub ? d->nsub : 1); i++) gpu->copy(d, (uint32_t)i, 0, 0, 0, s, (uint32_t)i, NULL);
     RET(0);
 }
@@ -579,6 +696,7 @@ static void ctx_resolve(CPU* c)
     static int off = -1;
     if (off < 0) off = host_query_flag("noresolve");
     if (off) { RET(0); return; }
+    if (d && d->usage == 3) d->gpu_dirty = 1;
     if (gpu->copy && d && s) gpu->copy(d, (uint32_t)A3, 0, 0, 0, s, (uint32_t)ARG(5), NULL);
     RET(0);
 }
@@ -618,7 +736,9 @@ static void factory_create_swapchain(CPU* c)
     memcpy(G2H(sc_desc), G2H(d), 72);
     uint32_t w = (uint32_t)LD32(d), h = (uint32_t)LD32(d + 4);
     if (!w || !h) { int cw, ch; host_canvas_size(&cw, &ch); w = (uint32_t)cw; h = (uint32_t)ch; ST32(sc_desc, w); ST32(sc_desc + 4, h); }
-    host_log("[d3d11] swapchain %ux%u", w, h);
+    /* DXGI_SWAP_CHAIN_DESC.Windowed follows the window handle (pointer-sized) */
+    sc_fs = !LD32(d + (RT_G32 ? 48 : 56));
+    host_log("[d3d11] swapchain %ux%u%s", w, h, sc_fs ? " (fullscreen)" : "");
     sc_make_backbuffer(w, h, (uint32_t)LD32(d + 16));
     g_swapchain = com_new(&K_SwapChain, NULL, 0);
     ST64(A4, g_swapchain);
@@ -734,6 +854,7 @@ static void reap(void)
                 if (gpu->res_destroy) gpu->res_destroy(r);
                 if (r->backing_raw) g_free(r->backing_raw);
                 free(r);
+                g_res_live--;
             }
             com_free(o);
             freed++;
@@ -754,8 +875,19 @@ static void sc_present(CPU* c)
     RET(0);
 }
 static void sc_get_buffer(CPU* c) { ST32(g_backbuffer + 8, LD32(g_backbuffer + 8) + 1); ST64(A4, g_backbuffer); RET(0); }
-static void sc_fullscreen(CPU* c) { RET(0); }
-static void sc_get_fullscreen(CPU* c) { if (A2) ST32(A2, 0); if (A3) ST64(A3, 0); RET(0); }
+/* fullscreen state: the page decides how big the picture is, but the state the game set has to read back as set.
+   Unreal Engine 3 compares GetFullscreenState with the mode it asked for every frame; a fullscreen game that reads
+   "windowed" thinks it was alt-tabbed out, minimizes its window and stops presenting (Rocket League stayed black) */
+static void sc_fullscreen(CPU* c) { sc_fs = (uint32_t)A2 != 0; RET(0); }
+static void sc_get_fullscreen(CPU* c)
+{
+    if (A2) ST32(A2, sc_fs);
+    if (A3) {
+        if (sc_fs) { ST32(g_output + 8, LD32(g_output + 8) + 1); ST64(A3, g_output); }
+        else ST64(A3, 0);
+    }
+    RET(0);
+}
 static void sc_get_desc(CPU* c) { memcpy(G2H(A2), G2H(sc_desc), 72); RET(0); }
 static void sc_resize(CPU* c)
 {

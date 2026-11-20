@@ -17,7 +17,8 @@ int uew_rf_find(const char* path, double* size, double* mtime);
 char* uew_rf_list(const char* path);
 int uew_rf_read_cached(int id, double off, int len, uint8_t* dst);
 EM_ASYNC_JS(int, uew_rf_read, (int id, double off, int len, uint8_t* dst), {
-    return await Module.uewFiles.read(id, off, len, dst);
+    // dst: a BigInt in a 64-bit (memory64) module; read() takes a plain, non-negative byte address
+    return await Module.uewFiles.read(id, off, len, typeof dst == "bigint" ? Number(dst) : dst >>> 0);
 });
 void uew_rf_start(int id, double off, int len);
 int uew_rf_ready(int id, double off, int len);

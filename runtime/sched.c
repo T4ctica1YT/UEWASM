@@ -374,5 +374,6 @@ void rt_cas_miss(CPU* c)
 CPU* sched_current_cpu(void) { return current->cpu; }
 void sched_set_prio(void) { if (!current->prio) { current->prio = 1; nprio++; } }
 void sched_named(GThread* t) { (void)t; }
+void sched_create_hint(GThread* t, CPU* creator) { (void)t; (void)creator; }
 int sched_run_main(int (*fn)(void*), void* arg) { return fn(arg); }
 #endif

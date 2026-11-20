@@ -24,7 +24,7 @@ const BACKENDS: &[(&str, &str)] = &[("None (games play offline as usual)", ""), 
 /// video choice: (label, height (0 keep, -1 render height), mode)
 const VIDEOS: &[(&str, i32, &str)] = &[("Keep original videos", 0, "fast"), ("Shrink to render height, fast encode", -1, "fast"),
     ("Shrink to render height, smallest files (slow)", -1, "small"), ("Shrink to 1080p, fast encode", 1080, "fast")];
-const RESOLUTIONS: &[&str] = &["1280x720", "1600x900", "1920x1080", "960x540"];
+const RESOLUTIONS: &[&str] = &["1280x720", "1600x900", "1920x1080", "960x540", "native"];
 
 fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../uewasm/assets/logo_44.png")).ok();
@@ -121,9 +121,16 @@ impl App {
             self.error = Some("Choose the game's install folder or .exe first.".into());
             return;
         };
-        let Some((w, h)) = self.s.resolution.to_lowercase().split_once('x').and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))) else {
-            self.error = Some("Resolution should look like 1280x720.".into());
-            return;
+        // native: the window's own pixel size, chosen by the page; videos "at render height" then use 1080
+        let res = self.s.resolution.trim().to_lowercase();
+        let (res_arg, h) = if res == "native" {
+            ("native".to_string(), 1080)
+        } else {
+            let Some((w, h)) = res.split_once('x').and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))) else {
+                self.error = Some("Resolution should look like 1280x720, or native.".into());
+                return;
+            };
+            (format!("{w}x{h}"), h)
         };
         let threads = pick(THREADS, &self.s.threads);
         if threads == "real" && self.s.single {
@@ -138,7 +145,7 @@ impl App {
         let mut args: Vec<String> = vec!["recomp".into(), exe.to_string_lossy().into(), "-o".into(), out.to_string_lossy().into(), "-y".into(), "--progress".into(),
             "--renderer".into(), pick(RENDERERS, &self.s.renderer).into(), "--threads".into(), threads.into(), "--opt".into(), pick(OPTS, &self.s.opt).into(),
             "--lifter".into(), pick(LIFTERS, &self.s.lifter).into(), "--priority".into(), pick(PRIORITIES, &self.s.priority).into(), "--quality".into(), pick(QUALITY, &self.s.quality).into(),
-            "--mem-mb".into(), self.s.mem.to_string(), "--mem-limit-gb".into(), self.s.mem_limit.to_string(), "--resolution".into(), format!("{w}x{h}"),
+            "--mem-mb".into(), self.s.mem.to_string(), "--mem-limit-gb".into(), self.s.mem_limit.to_string(), "--resolution".into(), res_arg,
             "--part-mb".into(), self.s.part.to_string(), "--game-dlls".into(), if self.s.game_dlls { "auto".into() } else { "none".into() }];
         let video_h = if video.1 < 0 { h as i32 } else { video.1 };
         if video_h > 0 {
@@ -288,7 +295,8 @@ impl eframe::App for App {
                     });
                     ui.end_row();
                     ui.label("Threading"); combo(ui, "threads", &mut self.s.threads, &labels(THREADS));
-                    ui.label("Guest memory (MB)"); ui.add(egui::DragValue::new(&mut self.s.mem).range(1024..=3584).speed(256.0));
+                    ui.label("Guest memory (MB)"); ui.add(egui::DragValue::new(&mut self.s.mem).range(1024..=15360).speed(256.0))
+                        .on_hover_text("Above 3584 MB the build uses 64-bit memory (current Chrome, Edge or Brave); Unreal Engine 3 games such as Rocket League need about 7168");
                     ui.end_row();
                     ui.label("Optimisation"); combo(ui, "opt", &mut self.s.opt, &labels(OPTS));
                     ui.label("Largest file (MB)"); ui.add(egui::DragValue::new(&mut self.s.part).range(4..=24));

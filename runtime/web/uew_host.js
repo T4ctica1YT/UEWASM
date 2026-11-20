@@ -3,6 +3,7 @@
 addToLibrary({
   web_input_init__proxy: 'sync',
   web_input_init__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  web_input_init__sig: 'v',
   web_input_init: function () {
     if (Module.uewInput) return;
     const q = Module.uewInput = [];
@@ -53,6 +54,7 @@ addToLibrary({
 },
   host_gamepad__proxy: 'sync',
   host_gamepad__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_gamepad__sig: 'iippp',
   host_gamepad: function (index, buttons, triggers, sticks) {
     const pads = typeof navigator !== "undefined" && navigator.getGamepads ? navigator.getGamepads() : [];
     const p = Array.from(pads).filter(x => x && x.connected)[index];
@@ -62,19 +64,20 @@ addToLibrary({
                   [5, 0x200], [16, 0x400], [0, 0x1000], [1, 0x2000], [2, 0x4000], [3, 0x8000]];
     let m = 0;
     for (const [i, bit] of bits) if (on(i)) m |= bit;
-    HEAPU16[buttons >>> 1] = m;
-    HEAPU8[triggers >>> 0] = Math.round((b[6] ? b[6].value : 0) * 255);
-    HEAPU8[(triggers >>> 0) + 1] = Math.round((b[7] ? b[7].value : 0) * 255);
+    HEAPU16[buttons / 2] = m;
+    HEAPU8[triggers] = Math.round((b[6] ? b[6].value : 0) * 255);
+    HEAPU8[triggers + 1] = Math.round((b[7] ? b[7].value : 0) * 255);
     const ax = (i, flip) => {
         const v = (p.axes[i] || 0) * (flip ? -1 : 1);
         return Math.max(-32768, Math.min(32767, Math.round(v * 32767)));
     };
-    HEAP16[sticks >>> 1] = ax(0); HEAP16[(sticks >>> 1) + 1] = ax(1, true);
-    HEAP16[(sticks >>> 1) + 2] = ax(2); HEAP16[(sticks >>> 1) + 3] = ax(3, true);
+    HEAP16[sticks / 2] = ax(0); HEAP16[sticks / 2 + 1] = ax(1, true);
+    HEAP16[sticks / 2 + 2] = ax(2); HEAP16[sticks / 2 + 3] = ax(3, true);
     return 1;
 },
   js_audio_open__proxy: 'sync',
   js_audio_open__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  js_audio_open__sig: 'ii',
   js_audio_open: function (rate) {
     if (Module.uewAudio) return 1;
     if (typeof AudioContext === "undefined" || !globalThis.AudioWorkletNode) return 0;
@@ -104,6 +107,7 @@ addToLibrary({
 },
   js_audio_queued__proxy: 'sync',
   js_audio_queued__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  js_audio_queued__sig: 'i',
   js_audio_queued: function () {
     const A = Module.uewAudio;
     if (!A) return 0;
@@ -118,13 +122,15 @@ addToLibrary({
 },
   js_audio_restart__proxy: 'sync',
   js_audio_restart__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  js_audio_restart__sig: 'v',
   js_audio_restart: function () { const A = Module.uewAudio; if (A) A.start = -1; },
   js_audio_write__proxy: 'sync',
   js_audio_write__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  js_audio_write__sig: 'vpi',
   js_audio_write: function (frames, count) {
     const A = Module.uewAudio;
     if (!A) return;
-    const src = HEAPF32.subarray((frames >>> 2), (frames >>> 2) + count * 2);
+    const src = HEAPF32.subarray(frames / 4, frames / 4 + count * 2);
     // loudest recent sample (every 8th), for tests that check sound is really produced
     for (let i = 0; i < src.length; i += 8) { const v = Math.abs(src[i]); if (v > (A.peak || 0)) A.peak = v; }
     if (!A.live) { A.pushed += count; return; }
@@ -136,6 +142,7 @@ addToLibrary({
 },
   host_rumble__proxy: 'sync',
   host_rumble__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_rumble__sig: 'viii',
   host_rumble: function (index, lo, hi) {
     const pads = typeof navigator !== "undefined" && navigator.getGamepads ? navigator.getGamepads() : [];
     const p = Array.from(pads).filter(x => x && x.connected)[index];
@@ -144,11 +151,12 @@ addToLibrary({
 },
   web_next_event__proxy: 'sync',
   web_next_event__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  web_next_event__sig: 'ip',
   web_next_event: function (out) {
     const q = Module.uewInput;
     if (!q || !q.length) return 0;
     const e = q.shift();
-    for (let i = 0; i < 5; i++) HEAP32[(out >>> 2) + i] = e[i];
+    for (let i = 0; i < 5; i++) HEAP32[out / 4 + i] = e[i];
     return 1;
 },
   host_query_flag__proxy: 'sync',
@@ -158,48 +166,56 @@ addToLibrary({
     // a crash on another core reaches the page as a bare message; print the wasm stack (function names) from where it happened
     "if (typeof ENVIRONMENT_IS_PTHREAD != 'undefined' && ENVIRONMENT_IS_PTHREAD && typeof self != 'undefined' && typeof self.addEventListener == 'function') self.addEventListener('error', e => { if (e.error && e.error.stack) err('[worker crash] ' + e.error.stack); });",
   host_query_flag__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_query_flag__sig: 'ip',
   host_query_flag: function (name) {
     if (typeof location === "undefined") return 0;
-    return new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=1(&|$)").test(location.search) ? 1 : 0;
+    return new RegExp("[?&]" + UTF8ToString(name) + "=1(&|$)").test(location.search) ? 1 : 0;
 },
   host_query_hex__proxy: 'sync',
   host_query_hex__deps: ['$UTF8ToString'],
   host_query_hex__sig: 'dp',
   host_query_hex: function (name) {
     if (typeof location === "undefined") return 0;
-    const m = new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=([0-9a-fA-F]+)(&|$)").exec(location.search);
+    const m = new RegExp("[?&]" + UTF8ToString(name) + "=([0-9a-fA-F]+)(&|$)").exec(location.search);
     return m ? parseInt(m[1], 16) : 0;
   },
   host_page_int__proxy: 'sync',
   host_page_int__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_page_int__sig: 'ip',
   host_page_int: function (name) {
-    const v = typeof Module !== "undefined" ? Module[UTF8ToString(name >>> 0)] : 0;
+    const v = typeof Module !== "undefined" ? Module[UTF8ToString(name)] : 0;
     return v ? v | 0 : 0;
 },
   host_query_int__proxy: 'sync',
   host_query_int__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_query_int__sig: 'ip',
   host_query_int: function (name) {
     if (typeof location === "undefined") return 0;
-    const m = new RegExp("[?&]" + UTF8ToString(name >>> 0) + "=(\\d+)").exec(location.search);
+    const m = new RegExp("[?&]" + UTF8ToString(name) + "=(\\d+)").exec(location.search);
     return m ? +m[1] : 0;
 },
   web_trace_filter__proxy: 'sync',
   web_trace_filter__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  web_trace_filter__sig: 'p',
   web_trace_filter: function () {
     const s = (typeof window !== "undefined" && window.uewTraceOnly) || "";
     return stringToNewUTF8(s ? "," + s + "," : "");
 },
   web_canvas_w__proxy: 'sync',
   web_canvas_w__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  web_canvas_w__sig: 'i',
   web_canvas_w: function () { const c = Module.canvas || (typeof document !== "undefined" && document.getElementById("canvas")); return c ? c.width : 1280; },
   web_canvas_h__proxy: 'sync',
   web_canvas_h__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  web_canvas_h__sig: 'i',
   web_canvas_h: function () { const c = Module.canvas || (typeof document !== "undefined" && document.getElementById("canvas")); return c ? c.height : 720; },
   host_show_cursor__proxy: 'sync',
   host_show_cursor__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_show_cursor__sig: 'vi',
   host_show_cursor: function (show) { const c = Module.canvas; if (c) c.style.cursor = show ? "default" : "none"; },
   host_lock_pointer__proxy: 'sync',
   host_lock_pointer__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  host_lock_pointer__sig: 'vi',
   host_lock_pointer: function (lock) {
     const c = Module.canvas;
     if (!c || typeof document === "undefined") return;
@@ -216,44 +232,51 @@ addToLibrary({
 },
   uew_rf_find__proxy: 'sync',
   uew_rf_find__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_rf_find__sig: 'ippp',
   uew_rf_find: function (path, size, mtime) {
-    const f = Module.uewFiles && Module.uewFiles.lookup(UTF8ToString(path >>> 0));
+    const f = Module.uewFiles && Module.uewFiles.lookup(UTF8ToString(path));
     if (!f) return -2;
-    HEAPF64[size >>> 3] = f.size || 0;
-    HEAPF64[mtime >>> 3] = f.mtime || 0;
+    HEAPF64[size / 8] = f.size || 0;
+    HEAPF64[mtime / 8] = f.mtime || 0;
     return f.dir ? -1 : f.id;
 },
   uew_rf_list__proxy: 'sync',
   uew_rf_list__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_rf_list__sig: 'pp',
   uew_rf_list: function (path) {
-    const s = Module.uewFiles && Module.uewFiles.list(UTF8ToString(path >>> 0));
+    const s = Module.uewFiles && Module.uewFiles.list(UTF8ToString(path));
     return s == null ? 0 : stringToNewUTF8(s);
 },
   uew_rf_read_cached__proxy: 'sync',
   uew_rf_read_cached__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_rf_read_cached__sig: 'iidip',
   uew_rf_read_cached: function (id, off, len, dst) {
     return Module.uewFiles.readCached(id, off, len, dst);
 },
   uew_rf_start__proxy: 'sync',
   uew_rf_start__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_rf_start__sig: 'vidi',
   uew_rf_start: function (id, off, len) { Module.uewFiles.start(id, off, len); },
   uew_rf_ready__proxy: 'sync',
   uew_rf_ready__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_rf_ready__sig: 'iidi',
   uew_rf_ready: function (id, off, len) { return Module.uewFiles.ready(id, off, len); },
   inet_claims__proxy: 'sync',
   inet_claims__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  inet_claims__sig: 'ip',
   inet_claims: function (host) {
     const n = Module.uewNet;
-    return n && n.http && (!n.claim || n.claim(UTF8ToString(host >>> 0))) ? 1 : 0;
+    return n && n.http && (!n.claim || n.claim(UTF8ToString(host))) ? 1 : 0;
 },
   inet_request__proxy: 'sync',
   inet_request__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  inet_request__sig: 'ippppipp',
   inet_request: function (method, url, headers, body, len, status, hlen) {
     const n = Module.uewNet;
     let r;
     try {
-        r = n.http({ method: UTF8ToString(method >>> 0), url: UTF8ToString(url >>> 0), headers: UTF8ToString(headers >>> 0),
-                     body: HEAPU8.slice(body >>> 0, (body >>> 0) + len) });
+        r = n.http({ method: UTF8ToString(method), url: UTF8ToString(url), headers: UTF8ToString(headers),
+                     body: HEAPU8.slice(body, body + len) });
     } catch (e) { console.log("[net] handler failed: " + e); r = { status: 500, headers: {}, body: "" }; }
     r = r || { status: 404, headers: {}, body: "" };
     let b = r.body;
@@ -264,24 +287,26 @@ addToLibrary({
     const hs = Object.assign({ "Content-Length": String(b.length) }, r.headers || {});
     for (const k in hs) h += k + ": " + hs[k] + "\r\n";
     n.last = { h: new TextEncoder().encode(h), b };
-    HEAP32[(status >>> 0) >> 2] = r.status || 200;
-    HEAP32[(hlen >>> 0) >> 2] = n.last.h.length;
+    HEAP32[status / 4] = r.status || 200;
+    HEAP32[hlen / 4] = n.last.h.length;
     return b.length;
 },
   inet_take__proxy: 'sync',
   inet_take__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  inet_take__sig: 'vpp',
   inet_take: function (headers, body) {
     const l = Module.uewNet.last;
-    HEAPU8.set(l.h, headers >>> 0);
-    HEAPU8.set(l.b, body >>> 0);
+    HEAPU8.set(l.h, headers);
+    HEAPU8.set(l.b, body);
     Module.uewNet.last = null;
 },
   net_claim__proxy: 'sync',
   net_claim__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_claim__sig: 'ip',
   net_claim: function (name) {
     const n = Module.uewNet;
     if (!n || !n.claim) return 0;
-    const s = UTF8ToString(name >>> 0);
+    const s = UTF8ToString(name);
     if (!n.claim(s)) return 0;
     n.names = n.names || [""];
     let i = n.names.indexOf(s);
@@ -290,6 +315,7 @@ addToLibrary({
 },
   net_open__proxy: 'sync',
   net_open__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_open__sig: 'iii',
   net_open: function (route, port) {
     const n = Module.uewNet;
     const c = n && n.open ? n.open(n.names[route], port) : null;
@@ -304,12 +330,14 @@ addToLibrary({
 },
   net_send__proxy: 'sync',
   net_send__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_send__sig: 'vipi',
   net_send: function (id, p, n) {
     const c = Module.uewNet.conns[id];
-    if (c && c.send) c.send(HEAPU8.slice(p >>> 0, (p >>> 0) + n));
+    if (c && c.send) c.send(HEAPU8.slice(p, p + n));
 },
   net_avail__proxy: 'sync',
   net_avail__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_avail__sig: 'ii',
   net_avail: function (id) {
     const c = Module.uewNet && Module.uewNet.conns ? Module.uewNet.conns[id] : null;
     if (!c) return -1;
@@ -317,6 +345,7 @@ addToLibrary({
 },
   net_recv__proxy: 'sync',
   net_recv__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_recv__sig: 'iipi',
   net_recv: function (id, p, cap) {
     const c = Module.uewNet.conns[id];
     if (!c) return -1;
@@ -324,7 +353,7 @@ addToLibrary({
     let n = 0;
     while (n < cap && c.q.length) {
         const d = c.q[0], k = Math.min(cap - n, d.length);
-        HEAPU8.set(d.subarray(0, k), (p >>> 0) + n);
+        HEAPU8.set(d.subarray(0, k), p + n);
         n += k;
         if (k == d.length) c.q.shift(); else c.q[0] = d.subarray(k);
     }
@@ -333,12 +362,14 @@ addToLibrary({
 },
   net_close__proxy: 'sync',
   net_close__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_close__sig: 'vi',
   net_close: function (id) {
     const c = Module.uewNet && Module.uewNet.conns ? Module.uewNet.conns[id] : null;
     if (c) { if (c.close) c.close(); Module.uewNet.conns[id] = null; }
 },
   uew_vpx_available__proxy: 'sync',
   uew_vpx_available__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_available__sig: 'i',
   uew_vpx_available: function () {
     if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") return 0;
     if (typeof location !== "undefined" && /[?&]swvideo=1/.test(location.search)) return 0;
@@ -346,6 +377,7 @@ addToLibrary({
 },
   uew_vpx_open__proxy: 'sync',
   uew_vpx_open__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_open__sig: 'ii',
   uew_vpx_open: function (vp9) {
     const V = Module.uewVpx || (Module.uewVpx = { n: 0, s: new Map() });
     const id = ++V.n, s = { vp9, ready: [], err: false, ts: 0 };
@@ -371,6 +403,7 @@ addToLibrary({
 },
   uew_vpx_decode__proxy: 'sync',
   uew_vpx_decode__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_decode__sig: 'iipii',
   uew_vpx_decode: function (id, p, n, key) {
     const s = Module.uewVpx.s.get(id);
     if (!s || s.err) return -1;
@@ -379,13 +412,13 @@ addToLibrary({
             if (!key) return -1;
             s.dec.configure({ codec: s.vp9 ? "vp09.00.10.08" : "vp8", optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
         }
-        p >>>= 0;
         s.dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ++s.ts, data: HEAPU8.slice(p, p + n) }));
         return 0;
     } catch (e) { s.err = true; return -1; }
 },
   uew_vpx_poll__proxy: 'sync',
   uew_vpx_poll__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_poll__sig: 'ii',
   uew_vpx_poll: function (id) {
     const s = Module.uewVpx.s.get(id);
     if (!s || s.err) return 2;
@@ -393,10 +426,11 @@ addToLibrary({
 },
   uew_vpx_info__proxy: 'sync',
   uew_vpx_info__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_info__sig: 'iip',
   uew_vpx_info: function (id, out) {
     const s = Module.uewVpx.s.get(id), f = s && s.ready[0];
     if (!f) return 0;
-    out >>>= 2;
+    out /= 4;
     HEAP32[out] = f.w; HEAP32[out + 1] = f.h;
     HEAP32[out + 2] = f.matrix === "bt709" ? 2 : f.matrix === "bt470bg" ? 1 : f.matrix === "smpte170m" ? 3 : f.matrix === "smpte240m" ? 4 : f.matrix.startsWith("bt2020") ? 5 : f.matrix === "rgb" ? 7 : 0;
     HEAP32[out + 3] = f.full ? 1 : 0;
@@ -404,11 +438,11 @@ addToLibrary({
 },
   uew_vpx_take__proxy: 'sync',
   uew_vpx_take__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_take__sig: 'vipipipi',
   uew_vpx_take: function (id, y, ys, u, us, v, vs) {
     const s = Module.uewVpx.s.get(id), f = s && s.ready.shift();
     if (!f) return;
     const L = f.layout, b = f.buf, w = f.w, h = f.h, cw = (w + 1) >> 1, ch = (h + 1) >> 1, H = HEAPU8;
-    y >>>= 0; u >>>= 0; v >>>= 0;
     for (let r = 0; r < h; r++) H.set(b.subarray(L[0].offset + r * L[0].stride, L[0].offset + r * L[0].stride + w), y + r * ys);
     if (f.fmt === "I420") {
         for (let r = 0; r < ch; r++) {
@@ -424,6 +458,7 @@ addToLibrary({
 },
   uew_vpx_close__proxy: 'sync',
   uew_vpx_close__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  uew_vpx_close__sig: 'vi',
   uew_vpx_close: function (id) {
     const V = Module.uewVpx, s = V && V.s.get(id);
     if (!s) return;
@@ -431,6 +466,7 @@ addToLibrary({
     V.s.delete(id);
 },
   uew_js_frame_request__proxy: 'sync',
+  uew_js_frame_request__sig: 'vp',
   uew_js_frame_request: function (seq) {
     if (!Module.uewWatchdog && typeof setInterval !== "undefined" && typeof document !== "undefined") {
       // a game that stops presenting while the page is visible: log what every thread is doing, once per stall
@@ -445,14 +481,14 @@ addToLibrary({
         }
       }, 1000);
     }
-    Module.uewFrameSeqPtr = seq >>> 0;
+    Module.uewFrameSeqPtr = seq;
     if (Module.uewFramePending) return;
     Module.uewFramePending = 1;
     const go = () => {
       Module.uewFramePending = 0;
       Module.uewFrameSeq = (Module.uewFrameSeq | 0) + 1;
       // the count lives in wasm memory, so threads on every core see it
-      HEAP32[Module.uewFrameSeqPtr >>> 2] = Module.uewFrameSeq;
+      HEAP32[Module.uewFrameSeqPtr / 4] = Module.uewFrameSeq;
       const w = Module.uewIdleWake;
       if (w) { Module.uewIdleWake = null; w(); }
     };

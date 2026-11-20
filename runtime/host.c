@@ -200,8 +200,10 @@ EM_ASYNC_JS(void, uew_js_idle, (double ms, volatile uint32_t* wake), {
         let done = false;
         const fin = () => { if (!done) { done = true; Module.uewIdleWake = null; r(); } };
         // real threads: another core's notify (sched_notify) ends the wait too
-        if (wake && typeof SharedArrayBuffer != "undefined" && HEAP32.buffer instanceof SharedArrayBuffer) {
-            const w = Atomics.waitAsync(HEAP32, wake >>> 2, Atomics.load(HEAP32, wake >>> 2), ms);
+        // a pointer is a BigInt in a 64-bit (memory64) module and may be past 2 GB (negative) in a 32-bit one
+        const wp = typeof wake == "bigint" ? Number(wake) : wake >>> 0;
+        if (wp && typeof SharedArrayBuffer != "undefined" && HEAP32.buffer instanceof SharedArrayBuffer) {
+            const w = Atomics.waitAsync(HEAP32, wp / 4, Atomics.load(HEAP32, wp / 4), ms);
             if (w.async) w.value.then(fin);
         }
         // a finished download, pipeline or readback ends the wait early (Module.uewWake)
