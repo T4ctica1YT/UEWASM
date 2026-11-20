@@ -93,3 +93,4 @@ static inline void sched_notify(void) {}
 int sched_run_main(int (*fn)(void*), void* arg);
 /* a thread the game named (SetThreadDescription, or the name UE stores before starting it) */
 void sched_named(GThread* t);
+void sched_create_hint(GThread* t, CPU* creator);

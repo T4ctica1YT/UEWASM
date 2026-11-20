@@ -13,6 +13,7 @@ typedef struct GpuRes {
     uint32_t sub_slice[256];
     int nsub;
     uint32_t map_type;          /* D3D11_MAP of the current Map */
+    int gpu_dirty;              /* staging: the GPU wrote it (a copy or resolve into it) since its CPU copy was refreshed */
     void* backend;
 } GpuRes;
 

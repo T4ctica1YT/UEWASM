@@ -1,8 +1,7 @@
 const UEWG = {
   uewg_init__async: true,
+  uewg_init__sig: 'iiipi',
   uewg_init: async function (canvasW, canvasH, ringPtr, ringSize) {
-    // pointers above 2 GB arrive as negative numbers
-    ringPtr >>>= 0;
     if (!navigator.gpu) return 0;
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return 0;
@@ -142,7 +141,7 @@ ${P.shaders.get(sh)}`); break; }
     // ring data written since the last upload
     g.flush = (used) => {
       g.endPass();
-      if (!used && Module.uewRingUsedPtr) used = HEAPU32[Module.uewRingUsedPtr >>> 2];
+      if (!used && Module.uewRingUsedPtr) used = HEAPU32[Module.uewRingUsedPtr / 4];
       used = (used + 3) & ~3;
       if (used < g.ringDone) g.ringDone = 0;
       if (used > g.ringDone) g.queue.writeBuffer(g.ring, g.ringDone, HEAPU8, g.ringPtr + g.ringDone, used - g.ringDone);
@@ -409,11 +408,15 @@ ${P.shaders.get(sh)}`); break; }
     return 1 | (g.features.has("depth32float-stencil8") ? 2 : 0);
   },
 
+  uewg_max_dynamic_ubo__sig: 'i',
   uewg_max_dynamic_ubo: function () { return Module.uewg.device.limits.maxDynamicUniformBuffersPerPipelineLayout; },
+  uewg_max_storage__sig: 'i',
   uewg_max_storage: function () { return Module.uewg.device.limits.maxStorageBuffersPerShaderStage; },
 
+  uewg_has_feature__sig: 'ip',
   uewg_has_feature: function (name) { return Module.uewg.features.has(UTF8ToString(name)) ? 1 : 0; },
 
+  uewg_buffer_create__sig: 'iii',
   uewg_buffer_create: function (size, usage) {
     const g = Module.uewg;
     let u = GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
@@ -428,6 +431,7 @@ ${P.shaders.get(sh)}`); break; }
 
   // typed buffer views read through an expanded copy (one vec4<u32> per element); for buffers the GPU writes, the copy
   // is made on the GPU from the real buffer, so compute results reach later reads
+  uewg_expand_typed__sig: 'viiiiii',
   uewg_expand_typed: function (srcId, dstId, first, n, fmt, bpe) {
     const g = Module.uewg, src = g.o[srcId], dst = g.o[dstId];
     if (!src || !dst || !n) return;
@@ -509,8 +513,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     (g.expandTmp || (g.expandTmp = [])).push(ub);
   },
 
+  uewg_buffer_write__sig: 'viipi',
   uewg_buffer_write: function (id, offset, ptr, size) {
-    ptr >>>= 0;
     const g = Module.uewg, b = g.o[id];
     if (!b) return;
     const n = Math.min((size + 3) & ~3, b.size - offset);
@@ -521,6 +525,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     }
   },
 
+  uewg_buffer_copy__sig: 'viiiii',
   uewg_buffer_copy: function (src, srcOff, dst, dstOff, size) {
     const g = Module.uewg, a = g.o[src], b = g.o[dst];
     if (!a || !b) return;
@@ -529,6 +534,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (n > 0) g.encoder().copyBufferToBuffer(a, srcOff, b, dstOff, n);
   },
 
+  uewg_buffer_copy_ring__sig: 'viiiii',
   uewg_buffer_copy_ring: function (ringOff, dst, dstOff, size, ringUsed) {
     const g = Module.uewg, b = g.o[dst];
     if (!b) return;
@@ -537,9 +543,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (n > 0) { g.encoder().copyBufferToBuffer(g.ring, ringOff, b, dstOff, n); g.stat.ringCopy++; }
   },
 
+  uewg_texture_create__sig: 'ip',
   uewg_texture_create: function (jsonPtr) {
     const g = Module.uewg;
-    const d = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+    const d = JSON.parse(UTF8ToString(jsonPtr));
     let usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC;
     if (d.rt) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
     if (d.uav) usage |= GPUTextureUsage.STORAGE_BINDING;
@@ -552,8 +559,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     } catch (e) { console.log("[webgpu] texture " + d.format + ": " + e.message); return 0; }
   },
 
+  uewg_texture_write__sig: 'viiiiiiiipiii',
   uewg_texture_write: function (id, mip, x, y, z, w, h, d, ptr, bpr, rows, size) {
-    ptr >>>= 0;
     const g = Module.uewg, t = g.o[id];
     if (!t) return;
     // compressed uploads cover whole blocks, even for mips smaller than one
@@ -565,6 +572,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // an upload ordered with the encoder's commands: the rows are in the ring (bytesPerRow a multiple of 256)
+  uewg_texture_copy_ring__sig: 'viiiiiiiiiii',
   uewg_texture_copy_ring: function (ringOff, id, mip, x, y, z, w, h, d, bpr, rows) {
     const g = Module.uewg, t = g.o[id];
     if (!t) return;
@@ -575,9 +583,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] ring upload " + e.message); }
   },
 
+  uewg_view_create__sig: 'ip',
   uewg_view_create: function (jsonPtr) {
     const g = Module.uewg;
-    const d = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+    const d = JSON.parse(UTF8ToString(jsonPtr));
     const t = g.o[d.tex];
     if (!t) return 0;
     const desc = { dimension: d.dim, baseMipLevel: d.mip, mipLevelCount: d.mips, baseArrayLayer: d.layer, arrayLayerCount: d.layers, aspect: d.aspect };
@@ -590,14 +599,16 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     } catch (e) { if (g.errors++ < 40) console.log("[webgpu] view " + e.message); return 0; }
   },
 
+  uewg_sampler_create__sig: 'ip',
   uewg_sampler_create: function (jsonPtr) {
     const g = Module.uewg;
-    return g.add(g.device.createSampler(JSON.parse(UTF8ToString(jsonPtr >>> 0))));
+    return g.add(g.device.createSampler(JSON.parse(UTF8ToString(jsonPtr))));
   },
 
+  uewg_shader_create__sig: 'ip',
   uewg_shader_create: function (srcPtr) {
     const g = Module.uewg;
-    let code = UTF8ToString(srcPtr >>> 0);
+    let code = UTF8ToString(srcPtr);
     // debug: window.uewShaderPatch(code) may return a replacement source
     if (window.uewShaderPatch) code = window.uewShaderPatch(code) || code;
     g.hitch.sh++;
@@ -613,17 +624,19 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     return id;
   },
 
+  uewg_layout_create__sig: 'ip',
   uewg_layout_create: function (jsonPtr) {
     const g = Module.uewg;
-    const groups = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+    const groups = JSON.parse(UTF8ToString(jsonPtr));
     const bgls = groups.map(entries => entries.length ? g.device.createBindGroupLayout({ entries }) : g.emptyLayout);
     return g.add({ pl: g.device.createPipelineLayout({ bindGroupLayouts: bgls }), bgls });
   },
 
+  uewg_render_pipeline_create__sig: 'ip',
   uewg_render_pipeline_create: function (jsonPtr) {
     const g = Module.uewg;
-    const d = JSON.parse(UTF8ToString(jsonPtr >>> 0));
-    if (Module.uewgDebug) console.log("[webgpu] pipeline " + UTF8ToString(jsonPtr >>> 0));
+    const d = JSON.parse(UTF8ToString(jsonPtr));
+    if (Module.uewgDebug) console.log("[webgpu] pipeline " + UTF8ToString(jsonPtr));
     g.hitch.pipe++;
     if (window.uewLogCreates) console.log(`[create] pipeline vs ${d.vs} ps ${d.ps}`);
     const desc = {
@@ -649,8 +662,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // 1 when the pipeline can be used (or failed), 0 while it is still compiling and should be waited for
+  uewg_pipe_ready__sig: 'ii',
   uewg_pipe_ready: function (id) { const g = Module.uewg; return g.skipPending || !g.pending.has(id) ? 1 : 0; },
 
+  uewg_compute_pipeline_create__sig: 'iii',
   uewg_compute_pipeline_create: function (layoutId, cs) {
     const g = Module.uewg;
     const desc = { layout: g.o[layoutId].pl, compute: { module: g.o[cs], entryPoint: "main" } };
@@ -667,12 +682,13 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] compute pipeline " + e.message); return 0; }
   },
 
+  uewg_bindgroup_create__sig: 'iiip',
   uewg_bindgroup_create: function (layoutId, group, jsonPtr) {
     const g = Module.uewg;
     if (window.uewLogCreates > 1) console.log(`[create] bindgroup`);
     g.stat.bg++;
     const layout = layoutId < 0 ? g.emptyLayout : g.o[layoutId].bgls[group];
-    const entries = JSON.parse(UTF8ToString(jsonPtr >>> 0)).map(e => {
+    const entries = JSON.parse(UTF8ToString(jsonPtr)).map(e => {
       if (e.ring) return { binding: e.b, resource: { buffer: g.ring, offset: e.off || 0, size: e.size } };
       if (e.buf !== undefined) return { binding: e.b, resource: { buffer: g.o[e.buf], offset: e.off || 0, size: e.size } };
       if (e.dummy) { const x = g.dummy(e.dummy); return { binding: e.b, resource: x instanceof GPUBuffer ? { buffer: x } : x }; }
@@ -680,8 +696,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     });
     try {
       const bg = g.device.createBindGroup({ layout, entries });
-      if (g.capFrame) bg.__sz = JSON.parse(UTF8ToString(jsonPtr >>> 0)).filter(e => e.ring).map(e => [e.b, e.off || -1, e.size]);
-      if (g.capFrame) { const js = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+      if (g.capFrame) bg.__sz = JSON.parse(UTF8ToString(jsonPtr)).filter(e => e.ring).map(e => [e.b, e.off || -1, e.size]);
+      if (g.capFrame) { const js = JSON.parse(UTF8ToString(jsonPtr));
         bg.__r = entries.map((e, i) => e.resource && e.resource.__tex ? e.resource.__tex.__id : e.resource && e.resource.buffer ? (js[i].buf !== undefined ? `b${js[i].buf}@${js[i].off || 0}+${js[i].size || 0}` : "b") : e.resource instanceof GPUSampler ? "s" : "?"); }
       return g.add(bg);
     }
@@ -689,6 +705,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // the same from a packed entry list (7 ints each: binding, kind, id, offset, size, dim, return type), no JSON
+  uewg_bindgroup_bin__sig: 'iiipi',
   uewg_bindgroup_bin: function (layoutId, group, ptr, n) {
     const g = Module.uewg;
     g.stat.bg++;
@@ -697,7 +714,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     const rets = ["float", "sint", "uint", "depth"];
     const dummies = [null, null, null, "buf", "sbuf", "stex"];
     const entries = [];
-    for (let i = 0, p = ptr >>> 2; i < n; i++, p += 7) {
+    for (let i = 0, p = ptr / 4; i < n; i++, p += 7) {
       const b = HEAP32[p], kind = HEAP32[p + 1], id = HEAP32[p + 2];
       if (kind == 0) entries.push({ binding: b, resource: g.o[id] });
       else if (kind == 1) entries.push({ binding: b, resource: { buffer: g.o[id], offset: HEAPU32[p + 3], size: HEAPU32[p + 4] } });
@@ -709,13 +726,14 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     try {
       const bg = g.device.createBindGroup({ layout, entries });
       if (g.capFrame) bg.__r = entries.map((e, i) => e.resource && e.resource.__tex ? e.resource.__tex.__id : e.resource && e.resource.buffer
-        ? (HEAP32[(ptr >>> 2) + 7 * i + 1] == 1 ? `b${HEAP32[(ptr >>> 2) + 7 * i + 2]}@${e.resource.offset}+${e.resource.size}` : "b") : e.resource instanceof GPUSampler ? "s" : "?");
+        ? (HEAP32[ptr / 4 + 7 * i + 1] == 1 ? `b${HEAP32[ptr / 4 + 7 * i + 2]}@${e.resource.offset}+${e.resource.size}` : "b") : e.resource instanceof GPUSampler ? "s" : "?");
       return g.add(bg);
     }
     catch (e) { if (g.errors++ < 40) console.log("[webgpu] bind group " + e.message); return 0; }
   },
 
   // like release, but the id is never handed out again (cached bind groups may still name it)
+  uewg_retire__sig: 'vi',
   uewg_retire: function (id) {
     const g = Module.uewg, x = g.o[id];
     if (!x) return;
@@ -725,6 +743,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (g.rbl && g.rbl.size) for (const k of g.rbl.keys()) if (k.startsWith(id + ":")) g.rbl.delete(k);
   },
 
+  uewg_release__sig: 'vi',
   uewg_release: function (id) {
     const g = Module.uewg, x = g.o[id];
     if (!x) return;
@@ -734,11 +753,12 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     g.free.push(id);
   },
 
+  uewg_begin_pass__sig: 'vp',
   uewg_begin_pass: function (jsonPtr) {
     const g = Module.uewg;
     g.passBudget();
     g.endPass(true);
-    const d = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+    const d = JSON.parse(UTF8ToString(jsonPtr));
     const colorAttachments = d.color.map(c => c ? { view: g.o[c.view], loadOp: "load", storeOp: "store", depthSlice: c.slice >= 0 ? c.slice : undefined } : null);
     let depthStencilAttachment;
     if (d.depth) {
@@ -778,10 +798,11 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (g.cap) g.cap.cur = { pass: g.cap.events.length, desc: g.lastPass, draws: [] };
   },
 
+  uewg_clear__sig: 'vpi',
   uewg_clear: function (jsonPtr, ringUsed) {
     const g = Module.uewg;
     g.endPass(true);
-    const d = JSON.parse(UTF8ToString(jsonPtr >>> 0));
+    const d = JSON.parse(UTF8ToString(jsonPtr));
     g.capEvent({ clear: JSON.parse(JSON.stringify(d)) });
     for (const c of d.color) c.view = g.o[c.view];
     if (d.depth) d.depth.view = g.o[d.depth.view];
@@ -795,6 +816,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // the hottest call (thousands a frame): an inline try instead of a closure per draw
+  uewg_draw__sig: 'vp',
   uewg_draw: function (p) { try {
     const g = Module.uewg;
     // a copy or dispatch since the last draw ended the pass: carry on with the same targets
@@ -802,7 +824,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     const pass = g.pass;
     if (!pass) { g.skip.nopass++; return; }
     const I = HEAP32, F = HEAPF32;
-    let i = p >>> 2;
+    let i = p / 4;
     const pipeId = I[i++], pipe = g.o[pipeId];
     if (!pipe) { g.skip.nopipe++; return; }
     // state already set in this pass is not set again
@@ -843,12 +865,12 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     }
     if (st.vp[0] !== F[i] || st.vp[1] !== F[i + 1] || st.vp[2] !== F[i + 2] || st.vp[3] !== F[i + 3] || st.vp[4] !== F[i + 4] || st.vp[5] !== F[i + 5]) {
       pass.setViewport(F[i], F[i + 1], F[i + 2], F[i + 3], F[i + 4], F[i + 5]);
-      st.vp.set(F.subarray(i, i + 6));
+      for (let k = 0; k < 6; k++) st.vp[k] = F[i + k];
     }
     i += 6;
     if (st.sc[0] !== I[i] || st.sc[1] !== I[i + 1] || st.sc[2] !== I[i + 2] || st.sc[3] !== I[i + 3]) {
       pass.setScissorRect(I[i], I[i + 1], I[i + 2], I[i + 3]);
-      st.sc.set(I.subarray(i, i + 4));
+      st.sc[0] = I[i]; st.sc[1] = I[i + 1]; st.sc[2] = I[i + 2]; st.sc[3] = I[i + 3];
     }
     i += 4;
     const sref = I[i] >>> 0;
@@ -874,7 +896,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (g.cap && g.cap.cur && g.cap.cur.draws.length < 3000) {
       const pd = pipe.__d || {};
       const groups = [], cbs = {};
-      for (let k = 0, j = (p >>> 2) + 2; k < ngroups; k++) {
+      for (let k = 0, j = p / 4 + 2; k < ngroups; k++) {
         const bg = g.o[I[j]], nd = I[j + 1];
         groups.push(bg && bg.__r);
         // constant buffer contents straight from the ring (first draws of a pass only)
@@ -882,7 +904,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
           let d = 0;
           for (const [b, off, size] of bg.__sz) {
             const o = off >= 0 ? off : HEAPU32[j + 2 + d++];
-            cbs[`${k}:${b}`] = Array.from(HEAPF32.subarray((g.ringPtr + o) >>> 2, (g.ringPtr + o + size) >>> 2)).map(x => +x.toPrecision(5));
+            cbs[`${k}:${b}`] = Array.from(HEAPF32.subarray((g.ringPtr + o) / 4, (g.ringPtr + o + size) / 4)).map(x => +x.toPrecision(5));
           }
         }
         j += 2 + nd;
@@ -919,9 +941,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     g.draws++;
   } catch (e) { Module.uewg.fail("draw", e); } },
 
+  uewg_dispatch__sig: 'vp',
   uewg_dispatch: function (p) { Module.uewg.guard("dispatch", () => {
     const g = Module.uewg, I = HEAP32;
-    let i = p >>> 2;
+    let i = p / 4;
     const pipe = g.o[I[i++]];
     const cb = I[i++], ndyn = I[i++];
     const dyn0 = i;
@@ -932,7 +955,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     g.endPass();
     const cp = g.encoder().beginComputePass();
     cp.setPipeline(pipe);
-    if (g.prof && g.prof.cur) { g.prof.cur.draws++; g.prof.cur.pipes.set(I[p >>> 2], 1); }
+    if (g.prof && g.prof.cur) { g.prof.cur.draws++; g.prof.cur.pipes.set(I[p / 4], 1); }
     cp.setBindGroup(0, g.o[cb], HEAPU32, dyn0, ndyn);
     cp.setBindGroup(1, g.o[res]);
     if (x === -1) cp.dispatchWorkgroupsIndirect(g.o[y], z);
@@ -942,9 +965,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   }); },
 
   // geometry shader emulation: compute pass that buckets triangles per layer, then one indirect draw per layer
+  uewg_gs__sig: 'vp',
   uewg_gs: function (p) { Module.uewg.guard("gs", () => {
     const g = Module.uewg, I = HEAP32, F = HEAPF32;
-    let i = p >>> 2;
+    let i = p / 4;
     const cpipe = g.o[I[i++]], wx = I[i++], wy = I[i++], nl = I[i++], cap = I[i++], args = g.o[I[i++]];
     const groups = () => { const r = []; for (let k = 0; k < 4; k++) { const bg = I[i++], nd = I[i++]; r.push([g.o[bg], i, nd]); i += nd; } return r; };
     const cg = groups();
@@ -999,6 +1023,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     g.draws++;
   }); },
 
+  uewg_copy_texture__sig: 'viiiiiiiiiiiiiii',
   uewg_copy_texture: function (src, smip, slayer, sx, sy, sz, dst, dmip, dlayer, dx, dy, dz, w, h, d) {
     const g = Module.uewg;
     g.endPass();
@@ -1026,6 +1051,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     } catch (e) { if (g.errors++ < 40) console.log("[webgpu] copy " + e.message); }
   },
 
+  uewg_clear_buffer__sig: 'viii',
   uewg_clear_buffer: function (id, off, size) {
     const g = Module.uewg, b = g.o[id];
     if (!b) return;
@@ -1035,6 +1061,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // GenerateMips: each level drawn from the one above with a linear filter
+  uewg_gen_mips__sig: 'vi',
   uewg_gen_mips: function (id) { Module.uewg.guard("mips", () => {
     const g = Module.uewg, t = g.o[id];
     if (!(t instanceof GPUTexture) || t.mipLevelCount < 2 || t.dimension !== "2d" || /^(bc|depth|stencil)|int$/.test(t.format)) return;
@@ -1065,8 +1092,8 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   }); },
 
   uewg_readback__async: true,
+  uewg_readback__sig: 'viiiiiiipiiii',
   uewg_readback: async function (kind, id, mip, layer, w, h, d, ptr, pitch, slice, rowbytes, rows) {
-    ptr >>>= 0;
     const g = Module.uewg, src = g.o[id];
     if (!src) return;
     g.flush(0);
@@ -1089,6 +1116,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // the same copy without suspending: start, poll done, finish (green threads keep running meanwhile)
+  uewg_readback_start__sig: 'iiiiiiiipiiii',
   uewg_readback_start: function (kind, id, mip, layer, w, h, d, ptr, pitch, slice, rowbytes, rows) {
     const g = Module.uewg, src = g.o[id];
     if (!src) return 0;
@@ -1102,7 +1130,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
       g.queue.submit([enc.finish()]);
     } catch (e) { if (g.errors++ < 40) console.log("[webgpu] readback " + e.message); tmp.destroy(); return 0; }
     g.hitch.rb++;
-    const t = { kind, w, d, rows, bpr, rowbytes, ptr: ptr >>> 0, pitch, slice, tmp, done: false, ok: false };
+    const t = { kind, w, d, rows, bpr, rowbytes, ptr, pitch, slice, tmp, done: false, ok: false };
     const t0 = performance.now();
     tmp.mapAsync(GPUMapMode.READ).then(() => {
       t.ok = true; t.done = true;
@@ -1119,6 +1147,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
   // small reads the game repeats (probes, picking): hand back the newest finished copy at once and start the next one,
   // so the render thread never waits on the browser's map latency (2-3 frames). 0 = nothing finished yet: wait as usual.
+  uewg_readback_latest__sig: 'iiiiiiiipiiii',
   uewg_readback_latest: function (kind, id, mip, layer, w, h, d, ptr, pitch, slice, rowbytes, rows) {
     const g = Module.uewg, src = g.o[id];
     if (!src || (typeof location !== "undefined" && /[?&]syncreadback=1/.test(location.search))) return 0;
@@ -1128,7 +1157,6 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (!e) { e = { busy: false, data: null }; g.rbl.set(k, e); }
     let got = 0;
     if (e.data) {
-      ptr >>>= 0;
       const bpr = kind ? (rowbytes + 255) & ~255 : 0;
       if (!kind) HEAPU8.set(e.data.subarray(0, w), ptr);
       else for (let z = 0; z < d; z++) for (let y = 0; y < rows; y++)
@@ -1152,7 +1180,9 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     return got;
   },
 
+  uewg_readback_done__sig: 'ii',
   uewg_readback_done: function (n) { const t = Module.uewg.rb && Module.uewg.rb.get(n); return !t || t.done ? 1 : 0; },
+  uewg_readback_finish__sig: 'vi',
   uewg_readback_finish: function (n) {
     const g = Module.uewg, t = g.rb && g.rb.get(n);
     if (!t) return;
@@ -1167,6 +1197,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     t.tmp.destroy();
   },
 
+  uewg_copy_buffer__sig: 'viiiii',
   uewg_copy_buffer: function (src, soff, dst, doff, size) {
     const g = Module.uewg, s = g.o[src], d = g.o[dst];
     if (!s || !d) return;
@@ -1175,6 +1206,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (n > 0) g.encoder().copyBufferToBuffer(s, soff, d, doff, n);
   },
 
+  uewg_present__sig: 'vii',
   uewg_present: function (view, ringUsed) {
     const g = Module.uewg;
     Module.uewPresents = (Module.uewPresents || 0) + 1;
@@ -1241,11 +1273,16 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
   },
 
   // the C side starts the ring over after this one
+  uewg_flush__sig: 'vi',
   uewg_flush: function (ringUsed) { Module.uewg.flush(ringUsed); Module.uewg.ringDone = 0; },
+  uewg_submit__sig: 'vi',
   uewg_submit: function (ringUsed) { Module.uewg.flush(ringUsed); },
-  uewg_ring_used_at: function (p) { Module.uewRingUsedPtr = p >>> 0; },
+  uewg_ring_used_at__sig: 'vp',
+  uewg_ring_used_at: function (p) { Module.uewRingUsedPtr = p; },
+  uewg_ring_reset__sig: 'v',
   uewg_ring_reset: function () { Module.uewg.ringDone = 0; },
   // a ticket that resolves to the time the GPU finishes everything submitted so far
+  uewg_timestamp__sig: 'i',
   uewg_timestamp: function () {
     const g = Module.uewg;
     const t = g.tsNext = (g.tsNext || 0) + 1;
@@ -1254,11 +1291,12 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (g.ts.size > 4096) for (const k of g.ts.keys()) { if (g.ts.size <= 2048) break; g.ts.delete(k); }
     return t;
   },
+  uewg_timestamp_get__sig: 'iip',
   uewg_timestamp_get: function (t, out) {
     const g = Module.uewg, v = g.ts ? g.ts.get(t) : undefined;
-    if (v === undefined) { HEAPF64[out >>> 3] = performance.now(); return 1; }
+    if (v === undefined) { HEAPF64[out / 8] = performance.now(); return 1; }
     if (v < 0) return 0;
-    HEAPF64[out >>> 3] = v;
+    HEAPF64[out / 8] = v;
     return 1;
   },
 };

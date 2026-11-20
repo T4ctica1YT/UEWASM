@@ -51,6 +51,11 @@ def cmd_recomp(a):
         def prog(stage, done, total):
             print(f"@@progress\t{stage}\t{done}\t{total}", flush=True)
     exe = find_exe(a.exe)
+    if a.mem_mb > 3584 and not a.mem64:
+        print(f"{a.mem_mb} MB of game memory doesn't fit a 32-bit module (4 GB in all): building with 64-bit memory (--mem64)")
+        a.mem64 = True
+    if a.mem64 and a.mem_mb > 15 * 1024:
+        sys.exit("--mem-mb: browsers give a 64-bit module at most 16 GB, so game memory can be at most 15360 MB")
     if not a.yes and sys.stdin.isatty():
         for k in ("renderer", "threads", "opt"):
             setattr(a, k, ask(k, getattr(a, k)))
@@ -83,18 +88,18 @@ def cmd_recomp(a):
                         lifter=a.lifter, progress=prog)
     print(f"{r['functions']} functions in {len(r['modules'])} modules, {r['unsupported_total']} unsupported instructions, "
           f"{len(r['missing_imports'])} imports not implemented yet (details in {out / 'coverage.json'})")
-    (out / "options.json").write_text(json.dumps({k: getattr(a, k) for k in ("renderer", "threads", "opt", "mem_mb")}, indent=2))
+    (out / "options.json").write_text(json.dumps({k: getattr(a, k) for k in ("renderer", "threads", "opt", "mem_mb", "mem64")}, indent=2))
     if a.native:
-        native = build.build_native(out, debug=a.debug, progress=prog)
+        native = build.build_native(out, debug=a.debug, progress=prog, mem64=a.mem64)
         if a.run:
             subprocess.run([str(native), "--image", str(out / "image.bin"), "--root", str(root), "--save", str(out / "save"), "--exe", exe_rel])
     if not a.native_only:
-        w, h = (int(x) for x in a.resolution.lower().split("x"))
+        size = "native" if a.resolution.lower() == "native" else tuple(int(x) for x in a.resolution.lower().split("x"))
         web = build.build_wasm(out, opt=a.opt, threads=a.threads, renderer=a.renderer, game_root=root, exe_rel=exe_rel,
-                               size=(w, h), part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
+                               size=size, part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
                                backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb,
-                               single_file=a.single_file, progress=prog, quality=a.quality, names=a.names,
+                               single_file=a.single_file, progress=prog, quality=a.quality, names=a.names, mem64=a.mem64,
                                game_args=[*build.default_args(root / exe_rel), *a.game_arg] if a.game_arg else None)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
         if a.progress:
@@ -148,9 +153,12 @@ def main(argv=None):
     r.add_argument("--opt", choices=list(CHOICES["opt"]), default="-O2")
     r.add_argument("--lifter", choices=["python", "rust"], default="python",
                    help="python: the original lifter; rust: the same output many times faster (needs a Rust toolchain, built on first use)")
-    r.add_argument("--mem-mb", type=int, default=3072, help="guest memory (the browser limit is 4096 total)")
+    r.add_argument("--mem-mb", type=int, default=3072, help="guest memory (up to ~3584 for a normal build; more turns on --mem64)")
+    r.add_argument("--mem64", action="store_true",
+                   help="64-bit WebAssembly memory, for games that need more than ~3.5 GB (up to ~15 GB); a little slower, needs a browser with memory64")
     r.add_argument("--mem-limit-gb", type=float, default=8, help="most memory the running game may use in all (game, file cache, video memory)")
-    r.add_argument("--resolution", default="1280x720", help="render size; the page scales it to the window")
+    r.add_argument("--resolution", default="1280x720",
+                   help="render size (WxH); the page scales it to the window. native: the window's own pixel size, for sharp text (?res= in the page address overrides)")
     r.add_argument("--part-mb", type=int, default=16, help="largest file written for the web host (Cloudflare Pages allows 25)")
     r.add_argument("--compress", action="store_true", help="compress game files (not audio) for a smaller download")
     r.add_argument("--single-file", action="store_true",
@@ -186,6 +194,7 @@ def main(argv=None):
     s = sub.add_parser("serve", help="serve a web build locally")
     s.add_argument("build")
     s.add_argument("--port", type=int, default=8080)
+    s.add_argument("--log", help="write the page's console log to this file as the game runs")
     t = sub.add_parser("test", help="run a web build in a headless browser")
     t.add_argument("build")
     t.add_argument("--seconds", type=int, default=90)
@@ -210,7 +219,7 @@ def main(argv=None):
         cmd_coverage(a)
     elif a.cmd == "serve":
         from .serve import serve
-        serve(a.build, a.port)
+        serve(a.build, a.port, a.log)
     elif a.cmd == "test":
         from . import webtest
         res = webtest.run(a.build, a.seconds, a.report)

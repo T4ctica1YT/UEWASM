@@ -276,6 +276,7 @@ HLE(CreateThread)
     uint64_t start = A3, param = A4, flags = ARG(5), tid_out = ARG(6);
     GThread* t = sched_create(start, param, (flags & 4) != 0);
     if (!t) { RET(0); return; }
+    sched_create_hint(t, c);
     uint64_t h = new_obj(O_THREAD);
     ((Obj*)handle_obj(h))->thread = t;
     t->handle = h;
@@ -298,13 +299,13 @@ HLE(SetThreadPriorityBoost) { RET(1); }
 HLE(SetThreadAffinityMask) { RET(1); }
 HLE(SetThreadIdealProcessor) { RET(0); }
 HLE(SetThreadIdealProcessorEx) { RET(1); }
-/* thread names only feed the debug thread dump */
+/* thread names feed the debug thread dump, and place threads that belong on the page's thread (sched_named) */
 HLE(SetThreadDescription)
 {
     GThread* t = NULL;
     if (A1 == (uint64_t)-2) t = sched_current();
     else { Obj* o = handle_obj(A1); if (o && o->type == O_THREAD) t = o->thread; }
-    if (t) wstr_to_utf8(A2, t->name, sizeof t->name);
+    if (t) { wstr_to_utf8(A2, t->name, sizeof t->name); sched_named(t); }
     RET(0);
 }
 HLE(GetThreadDescription) { RET(0x80004001); }

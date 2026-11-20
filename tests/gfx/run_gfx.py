@@ -17,6 +17,8 @@ FXC = next(Path(r"C:\Program Files (x86)\Windows Kits\10\bin").glob("*/x64/fxc.e
 D3D9 = "d3d9" in sys.argv[1:]
 OUT = ROOT / "tests" / "bin" / ("gfx9" if D3D9 else "gfx")
 NAME = "triangle9" if D3D9 else "triangle"
+# "mem64": a wasm64 build (64-bit memory) with 5 GB of guest memory, so guest addresses pass 4 GB (the native build too)
+MEM64 = "mem64" in sys.argv[1:]
 
 
 def png_pixels(data):
@@ -69,8 +71,8 @@ def main():
     extra = ["srgb"] if srgb else []
     ref = subprocess.run([str(exe), *extra], capture_output=True, text=True, cwd=OUT).stdout
     out = OUT / "recomp"
-    build.recompile(exe, out, mem_mb=256, log=lambda *_: None)
-    native = build.build_native(out, log=lambda *_: None)
+    build.recompile(exe, out, mem_mb=5120 if MEM64 else 256, log=lambda *_: None)
+    native = build.build_native(out, log=lambda *_: None, mem64=MEM64)
     got = subprocess.run([str(native), "--image", str(out / "image.bin"), "--root", str(OUT), "--exe", exe.name, *extra], capture_output=True, text=True)
     print("original:", ref.strip().replace("\n", " | "))
     print("native  :", got.stdout.strip().replace("\n", " | "), "MATCH" if got.stdout.replace("\r", "") == ref.replace("\r", "") else "DIFF")
@@ -79,7 +81,7 @@ def main():
 
     renderer = next((x for x in sys.argv[1:] if x in ("webgpu", "webgl2")), "webgpu")
     print("renderer:", renderer)
-    web = build.build_wasm(out, log=lambda *_: None, renderer=renderer)
+    web = build.build_wasm(out, log=lambda *_: None, renderer=renderer, mem64=MEM64)
     (web / "index.html").write_text('<!doctype html><body style="margin:0;background:#000"><canvas id="canvas" width="640" height="360"></canvas>'
                                     '<script>var Module={canvas:document.getElementById("canvas"),arguments:["--exe","' + NAME + '.exe"' + (',"srgb"' if srgb else '') + '],'
                                     'uewgDebug:location.search.includes("debug"),print:t=>console.log(t),printErr:t=>console.log(t)};</script><script src="game.js"></script></body>')

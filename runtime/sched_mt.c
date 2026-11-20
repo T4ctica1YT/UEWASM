@@ -12,6 +12,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <emscripten/threading.h>
+#include <emscripten/emscripten.h>
 
 #define MAX_CARRIERS 16
 
@@ -60,6 +61,30 @@ static GThread* pick(void);
 static void sched_idle(uint64_t deadline);
 static void wake_carriers(void);
 
+/* the process ends on the page's thread, from its own stack. Emscripten's exit() on another core is a call queued to
+   the page, and run while the page waits in a browser call (its idle, a green thread switch) it counts as kept alive:
+   it only marks the exit, every core keeps running and the page spins for the lock the exiting core never gave back.
+   So that core records the code and stops (sched_exit_process); the page ends the process when it next looks */
+static volatile int exit_req, exit_req_code;
+static void exit_poll(void)
+{
+    if (!__atomic_load_n(&exit_req, __ATOMIC_ACQUIRE)) return;
+    host_flush();
+    /* forced: suspended green threads and the idle wait count as keeping the runtime alive */
+    emscripten_force_exit(exit_req_code);
+}
+/* rt_exit with real threads; doesn't return */
+void sched_exit_process(int code)
+{
+    exit_req_code = code;
+    __atomic_store_n(&exit_req, 1, __ATOMIC_RELEASE);
+    if (emscripten_is_main_runtime_thread()) exit_poll();
+    /* another core keeps the lock, as Windows stops the other threads first: the page polls while it waits for it */
+    sched_notify();
+    static volatile int never;
+    for (;;) emscripten_futex_wait((void*)&never, 0, INFINITY);
+}
+
 /* the page's thread never blocks: while it waits for the lock it runs the calls other cores sent it (browser
    functions, uew_host.js), one of which may be what the holder is waiting for */
 void rt_lock_report(void);
@@ -76,7 +101,7 @@ void rt_lock(void)
     }
     uint64_t t0 = host_ticks_ns();
     if (emscripten_is_main_runtime_thread())
-        while (!bl_try()) emscripten_main_thread_process_queued_calls();
+        while (!bl_try()) { exit_poll(); emscripten_main_thread_process_queued_calls(); }
     else bl_lock();
     if (K) lock_wait_ns[K->id] += host_ticks_ns() - t0;
 }
@@ -115,7 +140,7 @@ static void unlocked_call(void (*f)(uint64_t), uint64_t arg)
     lock_depth = 0;
     bl_unlock();
     f(arg);
-    if (emscripten_is_main_runtime_thread()) while (!bl_try()) emscripten_main_thread_process_queued_calls();
+    if (emscripten_is_main_runtime_thread()) while (!bl_try()) { exit_poll(); emscripten_main_thread_process_queued_calls(); }
     else bl_lock();
     lock_depth = d;
 }
@@ -218,6 +243,7 @@ int sched_run_main(int (*fn)(void*), void* arg)
     base_is_guest = 0;
     wake_carriers();
     while (!main_done) {
+        exit_poll();
         GThread* n = pick();
         if (n) switch_to(n);
         else sched_idle(~0ull);
@@ -272,6 +298,7 @@ static void thread_entry(void* arg)
 {
     GThread* t = arg;
     uint64_t a = t->param;
+    t->started = 1;               /* from here its stack lives on this carrier (sched_named won't move it) */
     rt_unlock();                  /* switched in with the lock held; guest code runs without it */
     t->cpu->r[0] = rt_invoke(t->cpu, t->start, 1, &a);
     rt_lock();
@@ -325,19 +352,79 @@ static void ue_name(GThread* t, uint64_t obj)
 static int has_rhi_thread;
 /* how busy a new thread is likely to be, by name: threads stay on the carrier they start on, so the few that run all
    the time (Unreal's workers and render thread, audio mixers) are spread out first; the many that mostly wait count little */
+/* Unreal Engine 4/5 call it "RenderThread", Unreal Engine 3 "RenderingThread" */
+static int is_render_thread(const char* n) { return strstr(n, "RenderThread") || strstr(n, "RenderingThread"); }
 static int weight(const char* n)
 {
-    static const char* busy[] = { "Worker", "RenderThread", "FMOD mixer", "Mixer", "TaskGraph", "GameThread" };
+    static const char* busy[] = { "Worker", "RenderThread", "RenderingThread", "FMOD mixer", "Mixer", "TaskGraph", "GameThread" };
     for (size_t i = 0; i < sizeof busy / sizeof *busy; i++) if (strstr(n, busy[i])) return 16;
     return 1;
 }
 static int on_page(const char* n)
 {
     if (strstr(n, "RHIThread") || strstr(n, "RHISubmission")) { has_rhi_thread = 1; return 1; }
-    if (strstr(n, "RenderThread")) return !has_rhi_thread || !host_query_flag("rtoffpage");
+    /* off the page, every one of its WebGPU calls waits for the page's thread: Rocket League's (UE3) rendering thread
+       on a worker drew a frame every ~30 s */
+    if (is_render_thread(n)) return !has_rhi_thread || !host_query_flag("rtoffpage");
     return strstr(n, "Audio") != NULL;
 }
-void sched_named(GThread* t) { (void)t; }
+/* a new thread's name, when the code creating it has it at hand: Unreal Engine 3 creates its threads running and names
+   them only after they started (too late to move them), but the creator still holds the name (a wide string) in a
+   saved register or its stack frame. Only rendering-thread names are taken, and only to place the thread on the page's
+   thread; the lock is held, so the new thread hasn't run yet */
+static int wide_name_at(uint64_t p, char* out, int cap)
+{
+    if (p < 0x10000 || p + 2 * (uint64_t)cap > MEM_SIZE || (p & 1)) return 0;
+    int i = 0;
+    for (; i < cap - 1; i++) {
+        uint16_t ch = (uint16_t)LD16(p + 2ull * i);
+        if (!ch) break;
+        if (ch < 0x20 || ch > 0x7E) return 0;
+        out[i] = (char)ch;
+    }
+    out[i] = 0;
+    return i >= 4 && i < cap - 1;
+}
+void sched_create_hint(GThread* t, CPU* creator)
+{
+    if (!t || t->name[0] || !creator) return;
+    static const int regs[] = { 3, 5, 6, 7, 12, 13, 14, 15 };
+    char n[40];
+    int nregs = RT_G32 ? 4 : 8;
+    for (int i = 0; i < nregs; i++)
+        if (wide_name_at(creator->r[regs[i]], n, sizeof n) && (is_render_thread(n) || strstr(n, "RHIThread"))) goto found;
+    for (uint64_t sp = creator->r[4], a = sp; a < sp + 0x200; a += GP)
+        if (wide_name_at(LDP(a), n, sizeof n) && (is_render_thread(n) || strstr(n, "RHIThread"))) goto found;
+    return;
+found:
+    snprintf(t->name, sizeof t->name, "%s", n);
+    sched_named(t);
+}
+
+/* a thread named after it was created (Unreal Engine 3 names its threads with SetThreadName once they exist, so its
+   rendering thread had no name to be placed by): one that belongs on the page's thread and hasn't run yet moves there.
+   A thread that has run can't move: its suspended stack belongs to the worker it ran on */
+void sched_named(GThread* t)
+{
+    if (!t || t == &carriers[0].base) return;
+    rt_lock();
+    if (!t->started && !t->done && t->carrier != 0 && on_page(t->name)) {
+        Carrier* from = &carriers[t->carrier];
+        for (GThread** pp = &from->threads; *pp; pp = &(*pp)->next)
+            if (*pp == t) { *pp = t->next; break; }
+        from->nthreads--;
+        from->load -= weight(t->name);
+        Carrier* to = &carriers[0];
+        t->carrier = 0;
+        t->next = to->threads;
+        to->threads = t;
+        to->nthreads++;
+        to->load += weight(t->name);
+        host_log("[thread] %u (%s) moved to the page's thread", (unsigned)t->tid, t->name);
+        wake_carriers();
+    }
+    rt_unlock();
+}
 
 GThread* sched_create(uint64_t start, uint64_t param, int suspended)
 {

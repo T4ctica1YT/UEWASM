@@ -49,6 +49,9 @@ def h(v):
 SETJMP = {"_setjmp", "_setjmpex", "setjmp", "_setjmp3", "__intrinsic_setjmp", "__intrinsic_setjmpex"}
 
 
+_WRITE_ACCESS = (I.OpAccess.WRITE, I.OpAccess.COND_WRITE, I.OpAccess.READ_WRITE, I.OpAccess.READ_COND_WRITE)
+
+
 class Program:
     def __init__(self, pe, base):
         self.pe = pe
@@ -60,6 +63,7 @@ class Program:
         self.ends = {}
         self.cache = {}
         self.jt = {}
+        self.jt_bases = set()  # bases of the relative jump tables found (lea rB, [table]): data in .text, not functions
         self.comments = False
         self.unsupported = Counter()
         self.unsupported_at = defaultdict(list)
@@ -382,7 +386,10 @@ class Program:
                     break
         return best[-11:] + [ins]
 
-    def jump_table(self, r, end, insns):
+    def jump_table(self, r, end, insns, seed=None):
+        """seed: (rB, table, limit) from a rip-relative lea outside the window (far_table_reg). The table ends by limit
+        (the next thing the function takes the address of) and its entries must all land inside the function: every one
+        up to the bound, or (no compare bounds it) at least two in a row"""
         targets = set()
         bound = None
         # the bound is a compare on the table's index register (or a register copied into it); a compare on anything
@@ -474,7 +481,7 @@ class Program:
                         break
                     targets.add(t)
         # clang style: lea rB, [table]; movsxd rX, [rB + idx*4]; add rX, rB -- entries are relative to the table
-        lea = {}
+        lea = {seed[0]: seed[1]} if seed else {}
         for ins in insns:
             m = MN[ins.mnemonic]
             if m == "LEA" and ins.is_ip_rel_memory_operand:
@@ -482,15 +489,64 @@ class Program:
             elif m == "MOVSXD" and ins.op_kind(1) == OK.MEMORY and ins.memory_base in lea and ins.memory_index_scale == 4 \
                     and ins.memory_displacement == 0:
                 tbl = lea[ins.memory_base]
+                found = set()
+                whole = True
                 for k in range(bound or 4096):
                     p = tbl - self.base + 4 * k
-                    if not (0 <= p and p + 4 <= len(self.img)):
+                    if not (0 <= p and p + 4 <= len(self.img)) or (seed and tbl + 4 * k + 4 > seed[2]):
+                        whole = False
                         break
                     t = tbl + int.from_bytes(self.img[p:p + 4], "little", signed=True)
-                    if not self.in_code(t) or (not bound and not (r <= t < end) and (self.fam(t) is None or self.fam(t) != self.fam(r))):
+                    inside = r <= t < end or (self.fam(t) is not None and self.fam(t) == self.fam(r))
+                    if not self.in_code(t) or ((not bound or seed) and not inside):
+                        whole = False
                         break
-                    targets.add(t)
+                    found.add(t)
+                if seed:
+                    # the caller decides whether the seeded base is the table (and records it then)
+                    if (whole if bound else len(found) >= 2):
+                        targets |= found
+                    continue
+                if found:
+                    self.jt_bases.add(tbl)
+                targets |= found
         return targets
+
+    @staticmethod
+    def far_table_reg(insns):
+        """clang/rustc relative switch whose table base was loaded long before the dispatch (ahead of a loop, say) and so
+        lies outside the window: movsxd rX, [rB + idx*4]; add rX, rB; jmp rX (other code may sit between them). Returns
+        rB when the window ends in that shape and nothing in it writes rB, or rX between the load and the jump"""
+        info = I.InstructionInfoFactory()
+
+        def writes(ins, r):
+            return any(I.RegisterExt.full_register(u.register) == r and u.access in _WRITE_ACCESS
+                       for u in info.info(ins).used_registers())
+
+        j = insns[-1]
+        if j.op_count != 1 or j.op0_kind != OK.REGISTER or j.op0_register not in REG or REG[j.op0_register][0] != "g" \
+                or REG[j.op0_register][2] != 8:
+            return None
+        x = j.op0_register
+        b = None
+        # back from the jump: add rX, rB, then the load
+        for i in range(len(insns) - 2, -1, -1):
+            ins = insns[i]
+            if b is None:
+                if MN[ins.mnemonic] == "ADD" and ins.op_count == 2 and ins.op0_kind == OK.REGISTER and ins.op0_register == x \
+                        and ins.op1_kind == OK.REGISTER and ins.op1_register in REG and REG[ins.op1_register][0] == "g" \
+                        and REG[ins.op1_register][2] == 8 and ins.op1_register != x:
+                    b = ins.op1_register
+                elif writes(ins, x):
+                    return None
+            elif MN[ins.mnemonic] == "MOVSXD" and ins.op0_kind == OK.REGISTER and ins.op0_register == x \
+                    and ins.op1_kind == OK.MEMORY and ins.memory_base == b and ins.memory_index != I.Register.NONE \
+                    and ins.memory_index_scale == 4 and ins.memory_displacement == 0:
+                # the base register is not set anywhere in the window ahead of the load
+                return None if any(writes(p, b) for p in insns[:i]) else b
+            elif writes(ins, x) or writes(ins, b):
+                return None
+        return None
 
     def own(self, r, t, end):
         """t is lifted inside root r (else it is reached by a jump to another root)"""
@@ -504,70 +560,112 @@ class Program:
         done = set()
         extra = set()
         insns = []
-        while work:
-            a = work.pop()
-            while a not in done:
-                if a != r and a in self.roots:
-                    extra.add(a)
-                    break
-                done.add(a)
-                try:
-                    ins = self.decode(a)
-                except Exception:
-                    break
-                if ins.code == I.Code.INVALID:
-                    break
-                insns.append(ins)
-                fc = ins.flow_control
-                nxt = ins.next_ip
-                if fc == FC.CONDITIONAL_BRANCH:
-                    t = ins.near_branch_target
-                    if self.own(r, t, end):
-                        labels.add(t)
-                        work.append(t)
-                    else:
-                        extra.add(t)
-                    if nxt == r or nxt not in self.roots:
-                        labels.add(nxt)
-                elif fc == FC.UNCONDITIONAL_BRANCH:
-                    t = ins.near_branch_target
-                    if self.own(r, t, end):
-                        labels.add(t)
-                        work.append(t)
-                    elif self.in_code(t):
-                        extra.add(t)
-                    break
-                elif fc == FC.INDIRECT_BRANCH:
-                    # the code just before the jump in address order (decode order follows branches, so the bounds
-                    # check guarding the table may have been decoded long before)
-                    tbl = self.jump_table(r, end, self.window(ins))
-                    if tbl:
-                        self.jt[ins.ip] = sorted(tbl)
-                    for t in tbl:
+        lea_ptrs = set()  # rip-relative lea targets in code: function pointers, unless one is a jump table's base
+        leas = set()  # every rip-relative lea in the function: (register, target)
+        far = []  # indirect jumps whose table base register is set outside the window: (jmp, window, base register)
+        while True:
+            while work:
+                a = work.pop()
+                while a not in done:
+                    if a != r and a in self.roots:
+                        extra.add(a)
+                        break
+                    done.add(a)
+                    try:
+                        ins = self.decode(a)
+                    except Exception:
+                        break
+                    if ins.code == I.Code.INVALID:
+                        break
+                    insns.append(ins)
+                    fc = ins.flow_control
+                    nxt = ins.next_ip
+                    if fc == FC.CONDITIONAL_BRANCH:
+                        t = ins.near_branch_target
                         if self.own(r, t, end):
                             labels.add(t)
                             work.append(t)
                         else:
                             extra.add(t)
-                    break
-                elif fc == FC.CALL:
-                    t = ins.near_branch_target
-                    if self.in_code(t):
+                        if nxt == r or nxt not in self.roots:
+                            labels.add(nxt)
+                    elif fc == FC.UNCONDITIONAL_BRANCH:
+                        t = ins.near_branch_target
+                        if self.own(r, t, end):
+                            labels.add(t)
+                            work.append(t)
+                        elif self.in_code(t):
+                            extra.add(t)
+                        break
+                    elif fc == FC.INDIRECT_BRANCH:
+                        # the code just before the jump in address order (decode order follows branches, so the bounds
+                        # check guarding the table may have been decoded long before)
+                        w = self.window(ins)
+                        tbl = self.jump_table(r, end, w)
+                        if not tbl and self.bits == 64:
+                            b = self.far_table_reg(w)
+                            if b is not None:
+                                far.append((ins, w, b))
+                        if tbl:
+                            self.jt[ins.ip] = sorted(tbl)
+                        for t in tbl:
+                            if self.own(r, t, end):
+                                labels.add(t)
+                                work.append(t)
+                            else:
+                                extra.add(t)
+                        break
+                    elif fc == FC.CALL:
+                        t = ins.near_branch_target
+                        if self.in_code(t):
+                            extra.add(t)
+                    elif fc in (FC.RETURN, FC.EXCEPTION) or MN[ins.mnemonic] in ("INT3", "UD2", "HLT"):
+                        break
+                    elif fc == FC.INTERRUPT:
+                        break
+                    if MN[ins.mnemonic] == "LEA" and ins.is_ip_rel_memory_operand:
+                        leas.add((ins.op0_register, ins.ip_rel_memory_address))
+                        if self.in_code(ins.ip_rel_memory_address):
+                            lea_ptrs.add(ins.ip_rel_memory_address)
+                    if self.bits == 32:
+                        # push offset fn / mov [x], offset fn
+                        for i in range(ins.op_count):
+                            if ins.op_kind(i) in (OK.IMMEDIATE32, OK.IMMEDIATE8TO32):
+                                v = ins.immediate(i) & 0xFFFFFFFF
+                                if self.in_code(v):
+                                    extra.add(v)
+                    a = nxt
+            # with everything reachable scanned: the far table's base is the one rip-relative lea of rB in the function
+            # whose target reads as a table for this jump (data, not code the scan decoded, with entries landing inside
+            # the function); none or several and the jump stays unresolved. A wrong guess costs little: the switch
+            # compares the computed target and falls back to rt_jump_fn
+            grew = False
+            left = []
+            for j, w, b in sorted(far, key=lambda f: f[0].ip):
+                fits = []
+                for v in sorted(v for g, v in leas if g == b and v not in done):
+                    limit = min([x for _, x in leas if x > v] + [end if v < end else 1 << 64])
+                    t = self.jump_table(r, end, w, (b, v, limit))
+                    if t:
+                        fits.append((v, t))
+                if len(fits) != 1:
+                    left.append((j, w, b))
+                    continue
+                base, tbl = fits[0]
+                self.jt_bases.add(base)
+                self.jt[j.ip] = sorted(tbl)
+                for t in sorted(tbl):
+                    if self.own(r, t, end):
+                        labels.add(t)
+                        if t not in done:
+                            work.append(t)
+                            grew = True
+                    else:
                         extra.add(t)
-                elif fc in (FC.RETURN, FC.EXCEPTION) or MN[ins.mnemonic] in ("INT3", "UD2", "HLT"):
-                    break
-                elif fc == FC.INTERRUPT:
-                    break
-                if MN[ins.mnemonic] == "LEA" and ins.is_ip_rel_memory_operand and self.in_code(ins.ip_rel_memory_address):
-                    extra.add(ins.ip_rel_memory_address)
-                if self.bits == 32:
-                    # push offset fn / mov [x], offset fn
-                    for i in range(ins.op_count):
-                        if ins.op_kind(i) in (OK.IMMEDIATE32, OK.IMMEDIATE8TO32):
-                            v = ins.immediate(i) & 0xFFFFFFFF
-                            if self.in_code(v):
-                                extra.add(v)
-                a = nxt
+            far = left
+            if not grew:
+                break
+        extra |= {t for t in lea_ptrs if t not in self.jt_bases}
         self.ends.setdefault(r, end)
         return labels, extra
 

@@ -73,9 +73,25 @@ stutters and the second one doesn't: the browser keeps compiled shaders in its c
 
 If the tab crashes or the browser reports it's out of memory:
 
-- `--mem-mb` is the game's own memory (the browser's limit is 4096 in total).
+- `--mem-mb` is the game's own memory. A normal build holds up to 3584 MB, since the whole module gets 4 GB.
 - `--mem-limit-gb` caps the whole game, including the file cache and video memory. Lower it on PCs with 8 GB
   of RAM or less.
+
+### More than 3.5 GB of game memory: `--mem64`
+
+Some games need more than a normal build can hold. Rocket League, for example, loads its whole shader cache
+(about 3.95 GB unpacked) when it starts. `--mem64` builds the module with 64-bit WebAssembly memory, which browsers
+allow up to 16 GB, so `--mem-mb` can go up to 15360. Asking for more than 3584 MB turns it on by itself, and the
+build says so.
+
+- **It costs speed.** Every guest memory access uses 64-bit addresses and a bounds check that a normal build
+  mostly gets for free. Use it only for games that run out of memory without it.
+- **It needs WebAssembly memory64**: current Chrome, Edge or Brave. Other browsers get a message on the page
+  instead of the game.
+- **Raise `--mem-limit-gb` too.** The limit includes the game memory: at the default of 8, video memory shrinks as
+  `--mem-mb` grows, down to its 512 MB minimum from about 6800 MB.
+- It compiles into its own object folders (`wobj_m64…`, and `obj_m64` for `--native`), so a normal build of the
+  same game keeps its compiled files.
 
 ## 7. Building faster
 

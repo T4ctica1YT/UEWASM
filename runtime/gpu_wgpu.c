@@ -90,7 +90,7 @@ static void breset(Buf* b) { b->n = 0; if (b->p) b->p[0] = 0; }
 
 enum { FF_DEPTH = 1, FF_STENCIL = 2, FF_UINT = 4, FF_SINT = 8, FF_SRGB_PAIR = 16, FF_NORENDER = 32, FF_STORAGE = 64, FF_NOBLEND = 128 };
 /* 16-bit norm formats aren't filterable in WebGPU, so they are stored as half floats (CV_UN16/CV_SN16) */
-enum { CV_NONE, CV_RGB32, CV_565, CV_5551, CV_4444, CV_X8, CV_UN16, CV_SN16, CV_SUBST };
+enum { CV_NONE, CV_RGB32, CV_565, CV_5551, CV_4444, CV_X8, CV_UN16, CV_SN16, CV_SUBST, CV_A8 };
 
 typedef struct { const char* name; uint8_t bpb, block, flags, conv; const char* view_pair; } TexFmt;
 
@@ -148,7 +148,10 @@ static TexFmt texfmt(uint32_t f, int ds)
     case 57: return (TexFmt){ "r16uint", 2, 1, FF_UINT | FF_NOBLEND };
     case 58: return (TexFmt){ "r16float", 2, 1, 0, CV_SN16 };
     case 59: return (TexFmt){ "r16sint", 2, 1, FF_SINT | FF_NOBLEND };
-    case 60: case 61: case 65: return (TexFmt){ "r8unorm", 1, 1, 0 };
+    case 60: case 61: return (TexFmt){ "r8unorm", 1, 1, 0 };
+    /* A8 samples as (0,0,0,a) in D3D; WebGPU has no alpha-only format and r8unorm would give (a,0,0,1), so a shader
+       reading .a (Scaleform's glyph cache, UI masks) would see 1 everywhere and its text would vanish or turn to boxes */
+    case 65: return (TexFmt){ "rgba8unorm", 4, 1, 0, CV_A8 };
     case 62: return (TexFmt){ "r8uint", 1, 1, FF_UINT | FF_NOBLEND };
     case 63: return (TexFmt){ "r8snorm", 1, 1, FF_NORENDER };
     case 64: return (TexFmt){ "r8sint", 1, 1, FF_SINT | FF_NOBLEND };
@@ -212,6 +215,8 @@ typedef struct WTex {
     uint32_t cb_serial, cb_version, cb_first, cb_size, cb_off;
     uint8_t* shadow;        /* last uploaded contents of a big CPU-written buffer: only changed bytes go up again */
     int gpu_written;        /* bound as a UAV or cleared since that upload: the shadow no longer matches the GPU copy */
+    int lazy;               /* a vertex/index-only dynamic buffer unmapped without uploading: each draw uploads what it reads */
+    uint32_t discard_serial;    /* g_serial of its last DISCARD map: until that submit, its writes go in order (lazy_range) */
     int8_t f32_color;       /* a 32-bit float colour format (1 yes, 2 no, 0 not worked out yet): asked for every draw */
 } WTex;
 
@@ -232,7 +237,8 @@ typedef struct WView {
 } WView;
 
 /* the resources a draw bound last time with this shader, and the bind group they made */
-typedef struct Memo { int valid, layout, group, bg; uint32_t pass_gen, bg_epoch; int n; void* refs[160]; struct WTex* bufs[16]; int nbufs; } Memo;
+#define MEMO_RES 32
+typedef struct Memo { int valid, layout, group, bg; uint32_t pass_gen, bg_epoch; int n; void* refs[160]; struct WTex* bufs[MEMO_RES]; int nbufs; } Memo;
 
 typedef struct Variant {
     struct Variant* next;
@@ -258,7 +264,9 @@ static void variant_slots(Variant* v)
     v->slots_ready = 1;
 }
 
-typedef struct WShader { Variant* vars; DxWgsl refl; int refl_ok; uint8_t srv_ix[128]; int nsrv; } WShader;
+/* refl is filled on the shader's first draw (wsh below), not when it is created: Rocket League creates ~17,000 shaders
+   at load and draws with a few hundred, and at ~12 KB each the reflections of the rest held ~190 MB for nothing */
+typedef struct WShader { Variant* vars; DxWgsl* refl; int refl_ok, refl_done; uint8_t srv_ix[128]; int nsrv; } WShader;
 
 typedef struct Program {
     struct Program* next;
@@ -293,7 +301,9 @@ static uint32_t g_submits = 1;
 static uint8_t* ring;
 /* the constant ring runs on across frames: a constant buffer the game has not touched keeps its copy until the ring wraps
    over it (ring_gen counts wraps) */
-static uint32_t ring_size = 64u << 20, ring_used, ring_gen;
+/* 32 MB holds ~60 frames of a busy game's constants and uploads; it was 64 MB, all of which ends up in RAM once the ring
+   has wrapped (and as much again in video memory) */
+static uint32_t ring_size = 32u << 20, ring_used, ring_gen;
 static int pass_open;
 static int expand_bufs = -1;
 /* why open passes end (source line), for the per-frame report */
@@ -356,6 +366,7 @@ static void ring_flush(void)
     g_serial++;
 }
 /* debug switches for the draw-path caches: ?nodrawmemo=1 ?norescache=1 ?noringkeep=1 */
+static uint64_t st_shadow_bytes, st_reflected;
 static int dbg_flag(const char* n, int* v) { if (*v < 0) *v = host_query_flag(n); return *v; }
 static int no_dmemo = -1, no_rcache = -1, no_ringkeep = -1, full_dmask = -1, ring_reset = -1;
 /* a copy made in the ring's current lap is still there (nothing is overwritten until the wrap, which submits first).
@@ -420,6 +431,7 @@ static void tex_conv(TexFmt* f, const uint8_t* src, uint8_t* dst, uint32_t texel
         case CV_4444: { uint16_t v = (uint16_t)(src[i * 2] | src[i * 2 + 1] << 8);
             dst[i * 4] = (uint8_t)(((v >> 8) & 15) * 17); dst[i * 4 + 1] = (uint8_t)(((v >> 4) & 15) * 17); dst[i * 4 + 2] = (uint8_t)((v & 15) * 17); dst[i * 4 + 3] = (uint8_t)((v >> 12) * 17); break; }
         case CV_X8: memcpy(dst + i * 4, src + i * 4, 3); dst[i * 4 + 3] = 255; break;
+        case CV_A8: dst[i * 4] = dst[i * 4 + 1] = dst[i * 4 + 2] = 0; dst[i * 4 + 3] = src[i]; break;
         }
     }
 }
@@ -507,6 +519,12 @@ static void res_create(GpuRes* r, uint64_t init)
     int ds = (r->bind & 0x40) != 0;
     t->fmt = texfmt(r->format, ds || (is_ds_typeless(r->format) && !(r->bind & 0x20)));
     if (!t->fmt.name) { host_log("[webgpu] unsupported texture format %u", r->format); return; }
+    /* ?texfmt=1: the first texture of each DXGI format / bind / usage, and what it is stored as */
+    { static int dbg = -1; static uint32_t seen[128]; static int nseen;
+      if (dbg_flag("texfmt", &dbg) && nseen < 128) {
+          uint32_t key = r->format | (r->bind & 0xFF) << 8 | (uint32_t)r->usage << 16, k = 0;
+          while (k < (uint32_t)nseen && seen[k] != key) k++;
+          if (k == (uint32_t)nseen) { seen[nseen++] = key; host_log("[texfmt] format %u bind 0x%x usage %u %ux%u mips %u -> %s conv %d", r->format, r->bind, r->usage, r->width, r->height, r->mips, t->fmt.name, t->fmt.conv); } } }
     if ((r->bind & 0x80) && !(t->fmt.flags & (FF_STORAGE | FF_DEPTH)) && t->fmt.block == 1) {
         /* compute shaders write this texture: switch to a float format WebGPU can store to, same channel count */
         const char* n = t->fmt.name;
@@ -550,6 +568,7 @@ static void res_destroy(GpuRes* r)
     }
     if (t->id) { uewg_retire(t->id); bg_dead(t->id); }
     if (t->view_all) uewg_retire(t->view_all);
+    if (t->shadow) st_shadow_bytes -= r->width;
     free(t->shadow);
     free(t);
     r->backend = NULL;
@@ -581,12 +600,57 @@ static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint3
             memset(top, 0, sizeof top);
         }
     }
-    if (t->used == g_serial) {
+    if (t->used == g_serial && n > ring_size / 4) {
+        /* too big for the ring (it could not even hold it): submit what uses the buffer, then write it directly */
+        ring_submit();
+        uewg_buffer_write(t->id, (int)(off & ~3u), p, (int)n);
+    } else if (t->used == g_serial) {
         uint32_t ro = ring_put(p, n, (n + 3) & ~3u);
         uewg_buffer_copy_ring((int)ro, t->id, (int)(off & ~3u), (int)((n + 3) & ~3u), (int)ring_used);
         PASS_BREAK();
     } else uewg_buffer_write(t->id, (int)(off & ~3u), p, (int)n);
     (void)r;
+}
+
+/* Dynamic vertex/index buffers (Unreal Engine 3's ring of them above all): the game maps a big buffer with
+   NO_OVERWRITE, appends a few hundred bytes and unmaps, thousands of times a frame. Diffing the whole buffer at each
+   Unmap scanned gigabytes a frame (Rocket League: 16 GB compared to send 2 MB). Such a buffer is left "lazy" at Unmap
+   instead, and each draw uploads the bytes it reads. The shadow always matches the GPU copy, so diffing a range
+   against it is exact; bytes no draw reads are never sent.
+   NO_OVERWRITE promises the bytes written aren't read by pending commands, so they go straight to the queue (no ring
+   copy, no render pass break) - unless the buffer was DISCARDed since the last submit: D3D then renames it, and the
+   app may write over bytes earlier commands of this submit still read, so those go through the ring, in order */
+static void diff_put(GpuRes* r, WTex* t, const uint8_t* p, uint32_t a, uint32_t b, int direct)
+{
+    uint32_t lo = a, hi = b;
+    while (lo + 8 <= hi && !memcmp(p + lo, t->shadow + lo, 8)) lo += 8;
+    while (lo < hi && p[lo] == t->shadow[lo]) lo++;
+    if (lo == hi) return;
+    while (hi >= lo + 8 && !memcmp(p + hi - 8, t->shadow + hi - 8, 8)) hi -= 8;
+    while (hi > lo && p[hi - 1] == t->shadow[hi - 1]) hi--;
+    lo &= ~3u;
+    hi = (hi + 3) & ~3u;
+    if (hi > r->width) hi = r->width;
+    memcpy(t->shadow + lo, p + lo, hi - lo);
+    if (direct && t->id) uewg_buffer_write(t->id, (int)lo, p + lo, (int)(hi - lo));
+    else buffer_put(r, t, lo, p + lo, hi - lo);
+}
+/* uploads what changed in bytes [a, b) of a lazy buffer */
+static void lazy_range(GpuRes* r, uint64_t a, uint64_t b)
+{
+    WTex* t = T(r);
+    if (!t || !t->lazy || !t->shadow || !r->backing) return;
+    if (b > r->width) b = r->width;
+    if (a >= b) return;
+    diff_put(r, t, G2H(r->backing + r->sub_offset[0]), (uint32_t)a, (uint32_t)b, t->discard_serial != g_serial);
+}
+/* everything (indirect draws, copies, the geometry shader path: nothing tells which bytes they read) */
+static void lazy_all(GpuRes* r)
+{
+    WTex* t = T(r);
+    if (!t || !t->lazy) return;
+    lazy_range(r, 0, r->width);
+    t->lazy = 0;
 }
 
 /* a texture already used by this frame's unsubmitted commands is written through the ring, in order with them:
@@ -597,7 +661,14 @@ static void tex_write(WTex* t, int mip, int x, int y, int z, int w, int h, int d
 {
     uint32_t blocks = (uint32_t)(w + t->fmt.block - 1) / t->fmt.block, row = blocks * t->fmt.bpb, bpr = (row + 255) & ~255u;
     uint64_t need = (uint64_t)bpr * (uint32_t)rows * (uint32_t)d;
-    if ((t->used != g_serial && t->ring_sub != g_submits) || need > ring_size / 4) { uewg_texture_write(t->id, mip, x, y, z, w, h, d, p, pitch, rows, size); return; }
+    int pending = t->used == g_serial || t->ring_sub == g_submits;   /* commands not yet submitted use this texture */
+    if (!pending || need > ring_size / 4) {
+        /* straight to the queue, which runs it ahead of everything still in the encoder: submit that first when it
+           uses the texture (a big upload mid-frame would otherwise land under draws recorded before it) */
+        if (pending) ring_submit();
+        uewg_texture_write(t->id, mip, x, y, z, w, h, d, p, pitch, rows, size);
+        return;
+    }
     uint32_t off = ring_put(NULL, 0, 0);
     if (off + need > ring_size) { ring_flush(); off = 0; }
     for (int k = 0; k < d; k++)
@@ -623,15 +694,36 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
         return;
     }
     if (r->type == RES_BUFFER && !box && r->width >= 65536 && t->id) {
+        /* NO_OVERWRITE into a buffer only draws read (vertex/index): left for the draws (lazy_range above) */
+        static int nolazy = -1;
+        if (r->map_type == 4) t->discard_serial = g_serial;
+        if (r->map_type == 5 && t->shadow && (r->bind & 3) && !(r->bind & ~3u) && src == r->backing + r->sub_offset[0] &&
+            !dbg_flag("nolazybuffers", &nolazy)) {
+            t->lazy = 1;
+            return;
+        }
+        t->lazy = 0;    /* the diff below sends whatever was still pending too */
         /* games remap whole dynamic buffers every frame but rewrite a little of them */
         const uint8_t* p = G2H(src);
         uint32_t n = r->width;
         if (!t->shadow) {
             t->shadow = malloc(n);
-            if (t->shadow) memcpy(t->shadow, p, n);
+            if (t->shadow) { memcpy(t->shadow, p, n); st_shadow_bytes += n; }
             t->gpu_written = 0;
             buffer_put(r, t, 0, p, n);
             return;
+        }
+        /* ?uploadstats=1: how much the dynamic-buffer diff scans against what actually changes */
+        static int ustats = -1;
+        static uint64_t us_calls, us_scan, us_sent, us_type[8], us_big;
+        if (dbg_flag("uploadstats", &ustats)) {
+            us_calls++; us_scan += n; us_type[r->map_type & 7]++; if (n > us_big) us_big = n;
+            if (us_calls % 4000 == 0) {
+                host_log("[upload] %llu diffs of buffers >= 64 KB: %.0f MB scanned, %.1f MB sent, largest %u KB; map types discard %llu, no-overwrite %llu, write %llu, other %llu",
+                         (unsigned long long)us_calls, us_scan / 1048576.0, us_sent / 1048576.0, (unsigned)(us_big >> 10), (unsigned long long)us_type[4],
+                         (unsigned long long)us_type[5], (unsigned long long)us_type[2], (unsigned long long)(us_type[0] + us_type[1] + us_type[3] + us_type[6] + us_type[7]));
+                us_scan = us_sent = 0;
+            }
         }
         uint32_t lo = 0, hi = n;
         while (lo + 8 <= n && !memcmp(p + lo, t->shadow + lo, 8)) lo += 8;
@@ -643,6 +735,7 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
         hi = (hi + 3) & ~3u;
         if (hi > n) hi = n;
         memcpy(t->shadow + lo, p + lo, hi - lo);
+        if (ustats > 0) us_sent += hi - lo;
         buffer_put(r, t, lo, p + lo, hi - lo);
         return;
     }
@@ -799,10 +892,26 @@ static int view_for(GpuView* v, int sdim)
 
 static void shader_create(GpuShader* s)
 {
-    WShader* w = calloc(1, sizeof *w);
-    s->backend = w;
-    if (s->stage == SH_VS || s->stage == SH_PS || s->stage == SH_CS || s->stage == SH_GS) w->refl_ok = dxbc_reflect(s->code, s->size, &w->refl);
-    if (w->refl_ok) for (int i = 0; i < 128; i++) if (w->refl.srv[i].used) w->srv_ix[w->nsrv++] = (uint8_t)i;
+    s->backend = calloc(1, sizeof(WShader));
+}
+
+/* a shader's backend state, reflected the first time it is asked for */
+static WShader* wsh(GpuShader* s)
+{
+    WShader* w = s ? s->backend : NULL;
+    if (!w || w->refl_done) return w;
+    w->refl_done = 1;
+    if (s->stage != SH_VS && s->stage != SH_PS && s->stage != SH_CS && s->stage != SH_GS) return w;
+    w->refl = calloc(1, sizeof *w->refl);
+    if (w->refl && dxbc_reflect(s->code, s->size, w->refl)) {
+        w->refl_ok = 1;
+        st_reflected++;
+        for (int i = 0; i < 128; i++) if (w->refl->srv[i].used) w->srv_ix[w->nsrv++] = (uint8_t)i;
+    } else {
+        free(w->refl);
+        w->refl = NULL;
+    }
+    return w;
 }
 
 static uint64_t sig_hash(const DxSig* s)
@@ -822,7 +931,7 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* v
 {
     const uint8_t* bf = cur_bfmt;
     cur_bfmt = NULL;
-    WShader* w = s ? s->backend : NULL;
+    WShader* w = wsh(s);
     if (!w || !w->refl_ok) return NULL;
     uint64_t sh = sig_hash(vs_out);
     uint64_t key = 0x9E3779B97F4A7C15ull * (uint64_t)(use_interp + 1);
@@ -863,13 +972,13 @@ static Variant* variant_ex(GpuShader* s, const uint32_t depth[8], const DxSig* v
 static uint32_t buf_fmts(GpuCtx* c, int stage, uint8_t f[128])
 {
     GpuShader* sh = c->sh[stage];
-    WShader* w = sh ? sh->backend : NULL;
+    WShader* w = wsh(sh);
     uint32_t h = 0;
     memset(f, 0, 128);
     if (!w || !w->refl_ok || dbg_flag("expandbuffers", &expand_bufs)) return 0;
     for (int k = 0; k < w->nsrv; k++) {
         int i = w->srv_ix[k];
-        DxSlot* s = &w->refl.srv[i];
+        DxSlot* s = &w->refl->srv[i];
         if (!s->buffer || s->raw || s->structured) continue;
         GpuView* v = c->srv[stage][i];
         if (!v || !v->res || v->res->type != RES_BUFFER || v->format >= 256) continue;
@@ -1327,7 +1436,7 @@ static void ent_json(Buf* b, const Ent* e, int n)
 
 /* resource groups by what is bound (views, samplers, which views clash with the targets), kept across passes and frames
    until a view or resource is freed (bg_epoch) */
-typedef struct RCache { uint64_t h; Variant* v; uint32_t epoch; int bg, nbufs; struct WTex* bufs[16]; } RCache;
+typedef struct RCache { uint64_t h; Variant* v; uint32_t epoch; int bg, nbufs; struct WTex* bufs[MEMO_RES]; } RCache;
 static RCache rcache[8192];
 
 static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group, const char* extra)
@@ -1478,15 +1587,20 @@ static int res_group_ex(GpuCtx* c, Program* p, Variant* v, int stage, int group,
     int found = 0;
     for (BgEnt* e = *slot; e; e = e->next) if (e->h == h) { found = e->id; break; }
     if (memo_ok) {
-        /* remember it, with the buffers whose later CPU writes must stay ordered after this draw */
+        /* remember it, with the buffers and textures whose later CPU writes must stay ordered after this draw: a reused
+           group still marks them used this frame, so an upload after the draw goes into the encoder behind it instead
+           of straight to the queue ahead of it. Textures matter as much as buffers: Scaleform refills its small glyph
+           cache between text batches in one frame, and with only buffers marked every batch sampled the last fill
+           (most letters missing) */
         mo->valid = 1; mo->layout = p->layout; mo->group = group; mo->pass_gen = pass_gen; mo->n = nr;
         memcpy(mo->refs, refs, sizeof *refs * (size_t)nr);
         mo->nbufs = 0;
-        for (int i = 0; i < 128 && mo->nbufs < 16; i++) {
+        for (int i = 0; i < 128; i++) {
             GpuView* vw = w->srv[i].used ? c->srv[stage][i] : NULL;
-            if (vw && vw->res && vw->res->type == RES_BUFFER && T(vw->res)) mo->bufs[mo->nbufs++] = T(vw->res);
+            if (!vw || !vw->res || !T(vw->res)) continue;
+            if (mo->nbufs == MEMO_RES) { mo->valid = 0; break; }
+            mo->bufs[mo->nbufs++] = T(vw->res);
         }
-        if (mo->nbufs == 16) mo->valid = 0;
     }
 #define RC_PUT(id) do { if (rc && mo->valid) { rc->h = rh; rc->v = v; rc->epoch = bg_epoch; rc->bg = (id); rc->nbufs = mo->nbufs; memcpy(rc->bufs, mo->bufs, sizeof *mo->bufs * (size_t)mo->nbufs); } } while (0)
     if (found) { st_bg_hash++; if (memo_ok && mo->valid) { mo->bg = found; mo->bg_epoch = bg_epoch; } RC_PUT(found); return found; }
@@ -1739,6 +1853,31 @@ static int render_pipeline(GpuCtx* c, Program* p, PipeKey* k)
     uint64_t h = fnv(k, sizeof *k, 0xcbf29ce484222325ull);
     Pipe** slot = &pipes[h & 1023];
     for (Pipe* e = *slot; e; e = e->next) if (e->h == h && !memcmp(&e->k, k, sizeof *k)) return e->id;
+    /* ?pipedebug=1: for a new pipeline, which key fields differ from the closest one already made (a field that keeps
+       changing for the same shaders means pipelines are rebuilt every frame) */
+    static int pdbg = -1, pdbg_n;
+    if (dbg_flag("pipedebug", &pdbg) && pdbg_n++ % 50 == 0 && pdbg_n < 20000) {
+        Pipe* best = NULL;
+        int best_d = 99;
+        for (int b = 0; b < 1024; b++)
+            for (Pipe* e = pipes[b]; e; e = e->next) {
+                if (e->k.prog != k->prog) continue;
+                int d = (e->k.layout != k->layout) + (e->k.blend != k->blend) + (e->k.depth != k->depth) + (e->k.raster != k->raster) +
+                        !!memcmp(e->k.stride, k->stride, sizeof k->stride) + !!memcmp(e->k.rt_fmt, k->rt_fmt, sizeof k->rt_fmt) +
+                        (e->k.ds_fmt != k->ds_fmt) + (e->k.sample_mask != k->sample_mask) + (e->k.topology != k->topology) +
+                        (e->k.strip32 != k->strip32) + (e->k.ds_ro != k->ds_ro);
+                if (d < best_d) { best_d = d; best = e; }
+            }
+        if (!best) host_log("[pipe] new pipeline (#%d) for a new program %p", pdbg_n, (void*)k->prog);
+        else host_log("[pipe] new pipeline (#%d), same program; differs in:%s%s%s%s%s%s%s%s%s%s%s (layout %p->%p blend %p->%p depth %p->%p raster %p->%p)",
+                      pdbg_n, best->k.layout != k->layout ? " layout" : "", best->k.blend != k->blend ? " blend" : "", best->k.depth != k->depth ? " depth" : "",
+                      best->k.raster != k->raster ? " raster" : "", memcmp(best->k.stride, k->stride, sizeof k->stride) ? " stride" : "",
+                      memcmp(best->k.rt_fmt, k->rt_fmt, sizeof k->rt_fmt) ? " targets" : "", best->k.ds_fmt != k->ds_fmt ? " depthformat" : "",
+                      best->k.sample_mask != k->sample_mask ? " samplemask" : "", best->k.topology != k->topology ? " topology" : "",
+                      best->k.strip32 != k->strip32 ? " strip32" : "", best->k.ds_ro != k->ds_ro ? " depthreadonly" : "",
+                      (void*)best->k.layout, (void*)k->layout, (void*)best->k.blend, (void*)k->blend, (void*)best->k.depth, (void*)k->depth,
+                      (void*)best->k.raster, (void*)k->raster);
+    }
     Buf b = { 0 };
     bp(&b, "{\"layout\":%d,\"vs\":%d", p->layout, p->vs->module);
     int any_rt = 0;
@@ -1834,7 +1973,7 @@ static int render_pipeline(GpuCtx* c, Program* p, PipeKey* k)
 static void depth_mask(GpuCtx* c, int stage, uint32_t m[8])
 {
     memset(m, 0, 32);
-    WShader* ws = c->sh[stage] ? c->sh[stage]->backend : NULL;
+    WShader* ws = wsh(c->sh[stage]);
     int all = !ws || !ws->refl_ok || dbg_flag("fulldepthmask", &full_dmask), n = all ? 128 : ws->nsrv;
     for (int k = 0; k < n; k++) {
         int i = all ? k : ws->srv_ix[k];
@@ -1844,7 +1983,7 @@ static void depth_mask(GpuCtx* c, int stage, uint32_t m[8])
         /* an integer view of a 32-bit float texture (R32_TYPELESS read as R32_UINT): the shader declares it f32 */
         WTex* t = v && v->res && v->res->type != RES_BUFFER ? T(v->res) : NULL;
         if (t && !t->f32_color) t->f32_color = t->fmt.name && !(t->fmt.flags & FF_DEPTH) && strstr(t->fmt.name, "32float") ? 1 : 2;
-        if (t && t->f32_color == 1 && ws && ws->refl_ok && ws->refl.srv[i].ret && !ws->refl.srv[i].compare)
+        if (t && t->f32_color == 1 && ws && ws->refl_ok && ws->refl->srv[i].ret && !ws->refl->srv[i].compare)
             m[4 + (i >> 5)] |= 1u << (i & 31);
     }
 }
@@ -1932,7 +2071,7 @@ static int put_fixed(GpuCtx* c, uint32_t w, uint32_t h, int n)
 
 static Variant* lib_variant(GpuShader* s, const uint32_t depth[8], const char* prefix, int group)
 {
-    WShader* w = s ? s->backend : NULL;
+    WShader* w = wsh(s);
     if (!w || !w->refl_ok) return NULL;
     char uk[64];
     snprintf(uk, sizeof uk, "lib:%s%d", prefix, group);
@@ -2232,6 +2371,8 @@ static void gs_grow(int* id, int* size, int want, int usage)
 
 static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance, int indexed)
 {
+    for (int i = 0; i < 16; i++) lazy_all(c->vb[i]);
+    if (indexed) lazy_all(c->ib);
     uint32_t dm[8];
     depth_mask(c, SH_VS, dm);
     Variant* vs = lib_variant(c->sh[SH_VS], dm, "a_", 0);
@@ -2345,6 +2486,64 @@ static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vert
     drawn++;
 }
 
+/* the smallest and largest vertex an indexed draw reads, from the CPU copy of its indices (the guest's own memory for
+   a mapped buffer, else the shadow); 0 when there is none to read */
+static int index_span(GpuCtx* c, uint32_t first, uint32_t count, uint32_t* mn, uint32_t* mx)
+{
+    GpuRes* ib = c->ib;
+    WTex* t = T(ib);
+    if (!ib || !t) return 0;
+    uint32_t isz = c->ib_format == 42 ? 4 : 2;
+    uint64_t off = (uint64_t)c->ib_offset + (uint64_t)first * isz;
+    if (off + (uint64_t)count * isz > ib->width) return 0;
+    const uint8_t* p = ib->backing ? G2H(ib->backing + ib->sub_offset[0]) : t->shadow;
+    if (!p) return 0;
+    p += off;
+    uint32_t lo = ~0u, hi = 0, cut = isz == 4 ? ~0u : 0xFFFFu;   /* a strip's restart index reads no vertex */
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v;
+        if (isz == 4) memcpy(&v, p + 4ull * i, 4);
+        else { uint16_t s; memcpy(&s, p + 2ull * i, 2); v = s; }
+        if (v == cut && (c->topology == 3 || c->topology == 5)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (lo > hi) lo = hi = 0;
+    *mn = lo; *mx = hi;
+    return 1;
+}
+/* lazy vertex/index buffers bound to a draw: upload the vertices, instances and indices it reads */
+static void sync_lazy(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance,
+                      int indexed, int indirect, uint32_t want_vb, const uint32_t* inst_step)
+{
+    uint32_t mn = 0, mx = 0;
+    int span = -1;
+    for (int i = 0; i < 16; i++) {
+        GpuRes* vb = c->vb[i];
+        WTex* t = T(vb);
+        if (!vb || !t || !t->lazy || !(want_vb >> i & 1)) continue;
+        uint64_t st = c->vb_stride[i], v0, v1;
+        if (indirect || !st) { lazy_all(vb); continue; }
+        if (inst_step && inst_step[i]) { v0 = first_instance / inst_step[i]; v1 = ((uint64_t)first_instance + instances + inst_step[i] - 1) / inst_step[i]; }
+        else if (!indexed) { v0 = first; v1 = (uint64_t)first + count; }
+        else {
+            if (span < 0) span = index_span(c, first, count, &mn, &mx);
+            if (!span) { lazy_all(vb); continue; }
+            int64_t a = (int64_t)mn + base_vertex, b = (int64_t)mx + base_vertex + 1;
+            if (a < 0) a = 0;
+            if (b < a) b = a;
+            v0 = (uint64_t)a; v1 = (uint64_t)b;
+        }
+        lazy_range(vb, c->vb_offset[i] + v0 * st, c->vb_offset[i] + v1 * st);
+    }
+    WTex* it = T(c->ib);
+    if (indexed && it && it->lazy) {
+        uint64_t isz = c->ib_format == 42 ? 4 : 2;
+        if (indirect) lazy_all(c->ib);
+        else lazy_range(c->ib, c->ib_offset + first * isz, c->ib_offset + ((uint64_t)first + count) * isz);
+    }
+}
+
 static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance, int indexed)
 {
     if (!g_ok || !c->sh[SH_VS] || c->sh[SH_HS] || c->sh[SH_DS] || !count || !instances) DROP(0);
@@ -2433,6 +2632,7 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
         want_vb |= 1u << c->layout->el[e].slot;
         if (c->layout->el[e].per_instance) inst_step[c->layout->el[e].slot] = c->layout->el[e].step ? c->layout->el[e].step : 1;
     }
+    sync_lazy(c, count, first, base_vertex, instances, first_instance, indexed, indirect, want_vb, inst_step);
     /* D3D's SV_InstanceID starts at 0 whatever the start instance; WebGPU's instance_index doesn't. So the start
        instance moves the per-instance vertex buffers instead and the draw itself starts at instance 0. */
     uint32_t shift = indirect ? 0 : first_instance;
@@ -2440,10 +2640,10 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
         if (inst_step[i] && c->vb[i] && (uint64_t)c->vb_offset[i] + (uint64_t)(shift / inst_step[i]) * c->vb_stride[i] >= c->vb[i]->width) shift = 0;
     /* likewise SV_VertexID of an indexed draw is the index alone, without the base vertex (Unreal's manual vertex fetch
        adds that itself), while WebGPU's vertex_index includes it: move the per-vertex buffers instead */
-    WShader* vsw = c->sh[SH_VS] ? (WShader*)c->sh[SH_VS]->backend : NULL;
-    if (indirect) { st_ind++; if (vsw && vsw->refl.uses_instance_id) st_iid_ind++; }
-    else if (first_instance && shift != first_instance && vsw && vsw->refl.uses_instance_id) st_iid_lost++;
-    uint32_t vshift = !indirect && indexed && base_vertex > 0 && vsw && vsw->refl_ok && vsw->refl.uses_vertex_id ? (uint32_t)base_vertex : 0;
+    WShader* vsw = wsh(c->sh[SH_VS]);
+    if (indirect) { st_ind++; if (vsw && vsw->refl_ok && vsw->refl->uses_instance_id) st_iid_ind++; }
+    else if (first_instance && shift != first_instance && vsw && vsw->refl_ok && vsw->refl->uses_instance_id) st_iid_lost++;
+    uint32_t vshift = !indirect && indexed && base_vertex > 0 && vsw && vsw->refl_ok && vsw->refl->uses_vertex_id ? (uint32_t)base_vertex : 0;
     for (int i = 0; i < 16 && vshift; i++)
         if (!inst_step[i] && c->vb[i] && dk.stride[i] && ((uint64_t)c->vb_offset[i] + (uint64_t)vshift * c->vb_stride[i] >= c->vb[i]->width || (vshift * c->vb_stride[i]) & 3)) vshift = 0;
     for (int i = 0; i < 16; i++) {
@@ -2479,12 +2679,12 @@ static void dispatch(GpuCtx* c, uint32_t x, uint32_t y, uint32_t z)
     uint32_t dm[8];
     depth_mask(c, SH_CS, dm);
     const char* uf[8] = { 0 };
-    WShader* ws = c->sh[SH_CS]->backend;
+    WShader* ws = wsh(c->sh[SH_CS]);
     if (!ws || !ws->refl_ok) return;
     static char buf_tags[128][8];
     for (int i = 0; i < 8; i++) {
-        if (!ws->refl.uav[i].used || ws->refl.uav[i].raw || ws->refl.uav[i].structured) continue;
-        if (ws->refl.uav[i].buffer || ws->refl.uav[i].dim == 1) {
+        if (!ws->refl->uav[i].used || ws->refl->uav[i].raw || ws->refl->uav[i].structured) continue;
+        if (ws->refl->uav[i].buffer || ws->refl->uav[i].dim == 1) {
             /* typed buffer UAVs wider or narrower than one 32-bit channel: stores pack to the view's format */
             GpuView* v = c->uav[i];
             uint32_t f = v && v->res && v->res->type == RES_BUFFER ? v->format : 0;
@@ -2544,11 +2744,13 @@ static void copy(GpuRes* dst, uint32_t dsub, uint32_t dx, uint32_t dy, uint32_t 
 {
     WTex *d = T(dst), *s = T(src);
     if (!g_ok || !d || !s) return;
+    lazy_all(src);
     if (dst->type == RES_BUFFER && src->type == RES_BUFFER) {
         uint32_t so = box ? (uint32_t)box[0] : 0, n = box ? (uint32_t)(box[3] - box[0]) : src->width;
         if (dx + n > dst->width) n = dst->width - dx;
         if (dst->backing && src->backing) memmove(G2H(dst->backing + dx), G2H(src->backing + so), n);
         d->version++;
+        if (d->shadow) st_shadow_bytes -= dst->width;
         free(d->shadow);
         d->shadow = NULL;
         if (d->id && s->id && !(so & 3) && !(dx & 3)) { uewg_copy_buffer(s->id, (int)so, d->id, (int)dx, (int)n); PASS_BREAK(); d->used = s->used = g_serial; }
@@ -2603,6 +2805,21 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
 {
     (void)w; (void)h;
     if (!g_ok) return;
+    /* every 600 frames: how much of the guest memory the game uses now and at most, and the wasm memory's size */
+    { static uint64_t frames;
+      if (++frames % 600 == 0) {
+          extern uint64_t MEM_SIZE, g_shader_count, g_shader_bytes, g_res_live, g_shader_distinct, g_shader_distinct_bytes;
+          host_log("[mem] game memory %llu MB in use, %llu MB at most, of %llu MB; wasm memory %llu MB", (unsigned long long)(g_mem_used() >> 20),
+                   (unsigned long long)(g_mem_peak() >> 20), (unsigned long long)(MEM_SIZE >> 20), (unsigned long long)(__builtin_wasm_memory_size(0) >> 4));
+          /* the runtime's share: the wasm memory beyond the game's (mallinfo would walk the whole heap to say it) */
+          host_log("[mem] runtime heap %llu MB (game memory excluded); %llu shaders, %llu distinct (%llu MB bytecode, %llu MB distinct; %llu drawn so far, %llu MB reflection), buffer shadows %llu MB, %llu buffers and textures (%llu MB of records)",
+                   (unsigned long long)((((uint64_t)__builtin_wasm_memory_size(0) << 16) - MEM_SIZE) >> 20), (unsigned long long)g_shader_count, (unsigned long long)g_shader_distinct,
+                   (unsigned long long)(g_shader_bytes >> 20), (unsigned long long)(g_shader_distinct_bytes >> 20), (unsigned long long)st_reflected, (unsigned long long)(st_reflected * sizeof(DxWgsl) >> 20), (unsigned long long)(st_shadow_bytes >> 20),
+                   (unsigned long long)g_res_live, (unsigned long long)(g_res_live * sizeof(GpuRes) >> 20));
+          { uint64_t rq, hd, bn, bg; void g_heap_stats(uint64_t*, uint64_t*, uint64_t*, uint64_t*); g_heap_stats(&rq, &hd, &bn, &bg);
+            host_log("[mem] game heap (malloc/HeapAlloc): %llu MB asked for, %llu MB held (%llu MB in blocks of 64 KB and up), %llu MB free in size-class lists",
+                     (unsigned long long)(rq >> 20), (unsigned long long)(hd >> 20), (unsigned long long)(bg >> 20), (unsigned long long)(bn >> 20)); }
+      } }
     WTex* t = T(bb);
     int view = 0;
     if (t && t->id) {
@@ -2619,6 +2836,14 @@ static void present(GpuRes* bb, uint32_t w, uint32_t h)
         view = t->view_all;
     }
     static uint32_t frames;
+    /* ?dropstats=1: the drop counts every 30 frames instead of 600 (a slow scene may never reach 600) */
+    static int dropstats = -1;
+    if (dbg_flag("dropstats", &dropstats) && (frames + 1) % 30 == 0) {
+        char m[256];
+        int o = snprintf(m, sizeof m, "%u drawn", drawn);
+        for (int i = 0; i < 7; i++) if (drops[i]) o += snprintf(m + o, sizeof m - o, ", %u dropped (%s)", drops[i], drop_why[i]);
+        host_log("[webgpu] frames %u-%u: %s", frames - 28, frames + 1, m);
+    }
     if (++frames % 600 == 0) {
         char m[256];
         int o = snprintf(m, sizeof m, "%u drawn", drawn), dropped = 0;

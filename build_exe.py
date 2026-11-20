@@ -27,6 +27,9 @@ def main():
             "--add-data", f"{lift}{sep}rustlift/target/release"]
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--name", NAME, *rust,
            "--icon", str(ico), "--add-data", f"{rt}{sep}runtime", "--add-data", f"{HERE / 'uewasm' / 'assets'}{sep}uewasm/assets",
+           # what 32-bit games' system calls pop on return (Unreal Engine 3 games are often 32-bit): read from SysWOW64
+           # and cached in this file, which isn't a module, so PyInstaller would leave it out
+           "--add-data", f"{HERE / 'uewasm' / 'recomp' / 'stdcall32.json'}{sep}uewasm/recomp",
            "--exclude-module", "playwright", "--exclude-module", "numpy", "--exclude-module", "greenlet",
            "--collect-all", "iced_x86", "--hidden-import", "psutil",
            # video re-encoding and Unreal pak handling

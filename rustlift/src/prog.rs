@@ -1,5 +1,5 @@
 // Function discovery for one module: the Rust form of lift.py's Program (roots, regions, jump tables).
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::func::{mn, reg_info};
@@ -39,6 +39,8 @@ pub struct Program {
     pub call_args: Vec<(u64, u32)>,
     /// relocated slots (rvas): in 32-bit modules with relocations they mark jump-table entries exactly
     pub relocset: HashSet<u64>,
+    /// bases of the relative jump tables found (lea rB, [table]): data inside .text, never a function start
+    pub jt_bases: HashSet<u64>,
     pub ptr: u64,
     funcs_sorted: Vec<(u64, u64)>,
 }
@@ -107,7 +109,7 @@ impl Program {
         let ptr = (m.bits / 8) as u64;
         let mut p = Program {
             m, text, roots: HashSet::new(), starts: vec![], ends: HashMap::new(), jt: HashMap::new(), order: vec![],
-            blocks: HashMap::new(), sj_funcs: HashSet::new(), flag_ret: HashSet::new(), call_args: vec![], ptr, funcs_sorted, relocset: HashSet::new(),
+            blocks: HashMap::new(), sj_funcs: HashSet::new(), flag_ret: HashSet::new(), call_args: vec![], ptr, funcs_sorted, relocset: HashSet::new(), jt_bases: HashSet::new(),
         };
         p.relocset = p.m.relocs.iter().copied().collect();
         if p.m.bits == 32 {
@@ -561,7 +563,10 @@ impl Program {
         out
     }
 
-    fn jump_table(&self, r: u64, end: u64, insns: &[Instruction]) -> BTreeSet<u64> {
+    /// seed: (rB, table, limit) from a rip-relative lea outside the window (far_table_reg). The table ends by limit (the
+    /// next thing the function takes the address of) and its entries must all land inside the function: every one up
+    /// to the bound, or (no compare bounds it) at least two in a row
+    fn jump_table(&mut self, r: u64, end: u64, insns: &[Instruction], seed: Option<(Register, u64, u64)>) -> BTreeSet<u64> {
         let mut targets = BTreeSet::new();
         let mut bound: Option<u64> = None;
         let mut load: Option<Instruction> = None;
@@ -680,6 +685,9 @@ impl Program {
             }
         }
         let mut lea: HashMap<Register, u64> = HashMap::new();
+        if let Some((b, v, _)) = seed {
+            lea.insert(b, v);
+        }
         for ins in insns {
             let m = mn(ins);
             if m == "LEA" && ins.is_ip_rel_memory_operand() {
@@ -687,21 +695,77 @@ impl Program {
             } else if m == "MOVSXD" && ins.op_kind(1) == OpKind::Memory && lea.contains_key(&ins.memory_base())
                 && ins.memory_index_scale() == 4 && ins.memory_displacement64() == 0 {
                 let tbl = lea[&ins.memory_base()];
+                let mut found = BTreeSet::new();
+                let mut whole = true;
                 for k in 0..bound.unwrap_or(4096) {
                     let p = tbl as i64 - self.m.base as i64 + 4 * k as i64;
-                    if !(0 <= p && (p + 4) as usize <= img.len()) {
+                    if !(0 <= p && (p + 4) as usize <= img.len()) || seed.map_or(false, |s| tbl + 4 * k + 4 > s.2) {
+                        whole = false;
                         break;
                     }
                     let d = self.u32_at(p as usize) as i32 as i64;
                     let t = (tbl as i64 + d) as u64;
-                    if !self.in_code(t) || (bound.is_none() && !(r <= t && t < end) && (self.fam(t).is_none() || self.fam(t) != self.fam(r))) {
+                    let inside = (r <= t && t < end) || (self.fam(t).is_some() && self.fam(t) == self.fam(r));
+                    if !self.in_code(t) || ((bound.is_none() || seed.is_some()) && !inside) {
+                        whole = false;
                         break;
                     }
-                    targets.insert(t);
+                    found.insert(t);
                 }
+                if seed.is_some() {
+                    // the caller decides whether the seeded base is the table (and records it then)
+                    if if bound.is_some() { whole } else { found.len() >= 2 } {
+                        targets.extend(found);
+                    }
+                    continue;
+                }
+                if !found.is_empty() {
+                    self.jt_bases.insert(tbl);
+                }
+                targets.extend(found);
             }
         }
         targets
+    }
+
+    /// clang/rustc relative switch whose table base was loaded long before the dispatch (ahead of a loop, say) and so
+    /// lies outside the window: movsxd rX, [rB + idx*4]; add rX, rB; jmp rX (other code may sit between them). Returns
+    /// rB when the window ends in that shape and nothing in it writes rB, or rX between the load and the jump
+    fn far_table_reg(insns: &[Instruction]) -> Option<Register> {
+        let mut info = InstructionInfoFactory::new();
+        let mut writes = |ins: &Instruction, r: Register| info.info(ins).used_registers().iter().any(|u| {
+            u.register().full_register() == r
+                && matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
+        });
+        let (j, rest) = insns.split_last()?;
+        if j.op_count() != 1 || j.op0_kind() != OpKind::Register || reg_info(j.op0_register()).map_or(true, |i| i.0 != 'g' || i.2 != 8) {
+            return None;
+        }
+        let x = j.op0_register();
+        // back from the jump: add rX, rB, then the load
+        let mut i = rest.len();
+        let mut b = Register::None;
+        while i > 0 {
+            i -= 1;
+            let ins = &rest[i];
+            if b == Register::None {
+                if mn(ins) == "ADD" && ins.op_count() == 2 && ins.op0_kind() == OpKind::Register && ins.op0_register() == x
+                    && ins.op1_kind() == OpKind::Register && reg_info(ins.op1_register()).map_or(false, |r| r.0 == 'g' && r.2 == 8)
+                    && ins.op1_register() != x {
+                    b = ins.op1_register();
+                } else if writes(ins, x) {
+                    return None;
+                }
+            } else if mn(ins) == "MOVSXD" && ins.op0_kind() == OpKind::Register && ins.op0_register() == x
+                && ins.op1_kind() == OpKind::Memory && ins.memory_base() == b && ins.memory_index() != Register::None
+                && ins.memory_index_scale() == 4 && ins.memory_displacement64() == 0 {
+                // the base register is not set anywhere in the window ahead of the load
+                return if rest[..i].iter().any(|p| writes(p, b)) { None } else { Some(b) };
+            } else if writes(ins, x) || writes(ins, b) {
+                return None;
+            }
+        }
+        None
     }
 
     fn own(&self, r: u64, t: u64, end: u64) -> bool {
@@ -716,80 +780,144 @@ impl Program {
         let mut work = vec![r];
         let mut done = HashSet::new();
         let mut extra = BTreeSet::new();
-        while let Some(mut a) = work.pop() {
-            while !done.contains(&a) {
-                if a != r && self.roots.contains(&a) {
-                    extra.insert(a);
-                    break;
-                }
-                done.insert(a);
-                let ins = self.decode(cache, a);
-                if ins.code() == Code::INVALID {
-                    break;
-                }
-                let fc = ins.flow_control();
-                let nxt = ins.next_ip();
-                let m = mn(&ins);
-                if fc == FlowControl::ConditionalBranch {
-                    let t = ins.near_branch_target();
-                    if self.own(r, t, end) {
-                        labels.insert(t);
-                        work.push(t);
-                    } else {
-                        extra.insert(t);
+        // rip-relative lea targets in code: function pointers, unless one turns out to be a jump table's base
+        let mut lea_ptrs = BTreeSet::new();
+        // every rip-relative lea in the function: (register, target)
+        let mut leas: BTreeSet<(Register, u64)> = BTreeSet::new();
+        // indirect jumps whose table base register is set outside the window: (jmp, window, base register)
+        let mut far: Vec<(Instruction, Vec<Instruction>, Register)> = vec![];
+        loop {
+            while let Some(mut a) = work.pop() {
+                while !done.contains(&a) {
+                    if a != r && self.roots.contains(&a) {
+                        extra.insert(a);
+                        break;
                     }
-                    if nxt == r || !self.roots.contains(&nxt) {
-                        labels.insert(nxt);
+                    done.insert(a);
+                    let ins = self.decode(cache, a);
+                    if ins.code() == Code::INVALID {
+                        break;
                     }
-                } else if fc == FlowControl::UnconditionalBranch {
-                    let t = ins.near_branch_target();
-                    if self.own(r, t, end) {
-                        labels.insert(t);
-                        work.push(t);
-                    } else if self.in_code(t) {
-                        extra.insert(t);
-                    }
-                    break;
-                } else if fc == FlowControl::IndirectBranch {
-                    let w = self.window(&ins);
-                    let tbl = self.jump_table(r, end, &w);
-                    if !tbl.is_empty() {
-                        self.jt.insert(ins.ip(), tbl.iter().copied().collect());
-                    }
-                    for t in tbl {
+                    let fc = ins.flow_control();
+                    let nxt = ins.next_ip();
+                    let m = mn(&ins);
+                    if fc == FlowControl::ConditionalBranch {
+                        let t = ins.near_branch_target();
                         if self.own(r, t, end) {
                             labels.insert(t);
                             work.push(t);
                         } else {
                             extra.insert(t);
                         }
+                        if nxt == r || !self.roots.contains(&nxt) {
+                            labels.insert(nxt);
+                        }
+                    } else if fc == FlowControl::UnconditionalBranch {
+                        let t = ins.near_branch_target();
+                        if self.own(r, t, end) {
+                            labels.insert(t);
+                            work.push(t);
+                        } else if self.in_code(t) {
+                            extra.insert(t);
+                        }
+                        break;
+                    } else if fc == FlowControl::IndirectBranch {
+                        let w = self.window(&ins);
+                        let tbl = self.jump_table(r, end, &w, None);
+                        if tbl.is_empty() && self.m.bits == 64 {
+                            if let Some(b) = Self::far_table_reg(&w) {
+                                far.push((ins, w, b));
+                            }
+                        }
+                        if !tbl.is_empty() {
+                            self.jt.insert(ins.ip(), tbl.iter().copied().collect());
+                        }
+                        for t in tbl {
+                            if self.own(r, t, end) {
+                                labels.insert(t);
+                                work.push(t);
+                            } else {
+                                extra.insert(t);
+                            }
+                        }
+                        break;
+                    } else if fc == FlowControl::Call {
+                        let t = ins.near_branch_target();
+                        if self.in_code(t) {
+                            extra.insert(t);
+                        }
+                    } else if fc == FlowControl::Return || fc == FlowControl::Exception || m == "INT3" || m == "UD2" || m == "HLT" {
+                        break;
+                    } else if fc == FlowControl::Interrupt {
+                        break;
                     }
-                    break;
-                } else if fc == FlowControl::Call {
-                    let t = ins.near_branch_target();
-                    if self.in_code(t) {
-                        extra.insert(t);
+                    if m == "LEA" && ins.is_ip_rel_memory_operand() {
+                        leas.insert((ins.op0_register(), ins.ip_rel_memory_address()));
+                        if self.in_code(ins.ip_rel_memory_address()) {
+                            lea_ptrs.insert(ins.ip_rel_memory_address());
+                        }
                     }
-                } else if fc == FlowControl::Return || fc == FlowControl::Exception || m == "INT3" || m == "UD2" || m == "HLT" {
-                    break;
-                } else if fc == FlowControl::Interrupt {
-                    break;
-                }
-                if m == "LEA" && ins.is_ip_rel_memory_operand() && self.in_code(ins.ip_rel_memory_address()) {
-                    extra.insert(ins.ip_rel_memory_address());
-                }
-                if self.m.bits == 32 {
-                    for i in 0..ins.op_count() {
-                        let k = ins.op_kind(i);
-                        if k == OpKind::Immediate32 || k == OpKind::Immediate8to32 {
-                            let v = ins.immediate(i) & 0xFFFFFFFF;
-                            if self.in_code(v) {
-                                extra.insert(v);
+                    if self.m.bits == 32 {
+                        for i in 0..ins.op_count() {
+                            let k = ins.op_kind(i);
+                            if k == OpKind::Immediate32 || k == OpKind::Immediate8to32 {
+                                let v = ins.immediate(i) & 0xFFFFFFFF;
+                                if self.in_code(v) {
+                                    extra.insert(v);
+                                }
                             }
                         }
                     }
+                    a = nxt;
                 }
-                a = nxt;
+            }
+            // with everything reachable scanned: the far table's base is the one rip-relative lea of rB in the function
+            // whose target reads as a table for this jump (data, not code the scan decoded, with entries landing inside
+            // the function); none or several and the jump stays unresolved. A wrong guess costs little: the switch
+            // compares the computed target and falls back to rt_jump_fn
+            far.sort_by_key(|f| f.0.ip());
+            let mut grew = false;
+            let mut left = vec![];
+            for (j, w, b) in std::mem::take(&mut far) {
+                let vals: Vec<u64> = leas.iter().filter(|l| l.0 == b && !done.contains(&l.1)).map(|l| l.1).collect();
+                let mut fits = vec![];
+                for v in vals {
+                    let mut limit = leas.iter().map(|l| l.1).filter(|&x| x > v).min().unwrap_or(u64::MAX);
+                    if v < end {
+                        limit = limit.min(end);
+                    }
+                    let t = self.jump_table(r, end, &w, Some((b, v, limit)));
+                    if !t.is_empty() {
+                        fits.push((v, t));
+                    }
+                }
+                if fits.len() != 1 {
+                    left.push((j, w, b));
+                    continue;
+                }
+                let (base, tbl) = fits.pop().unwrap();
+                self.jt_bases.insert(base);
+                self.jt.insert(j.ip(), tbl.iter().copied().collect());
+                for t in tbl {
+                    if self.own(r, t, end) {
+                        labels.insert(t);
+                        if !done.contains(&t) {
+                            work.push(t);
+                            grew = true;
+                        }
+                    } else {
+                        extra.insert(t);
+                    }
+                }
+            }
+            far = left;
+            if !grew {
+                break;
+            }
+        }
+        for t in lea_ptrs {
+            if !self.jt_bases.contains(&t) {
+                extra.insert(t);
             }
         }
         self.ends.entry(r).or_insert(end);

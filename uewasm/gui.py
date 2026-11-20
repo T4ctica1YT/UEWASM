@@ -20,7 +20,7 @@ THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (several co
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
 QUALITY = {"Game's own setting": "game", "Low (fastest here)": "low", "Medium": "medium", "High": "high", "Epic": "epic"}
 LIFTERS = {"Python (original)": "python", "Rust (same result, much faster)": "rust"}
-RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540"]
+RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540", "native"]
 BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
 PRIORITIES = {"High (fastest, tuned to this PC)": "high", "Low (keeps the PC usable while it builds)": "low"}
 VIDEOS = {"Keep original videos": (0, "fast"), "Shrink to render height, fast encode": (-1, "fast"),
@@ -324,8 +324,10 @@ class App:
         self.renderer = combo(p, "Renderer", RENDERERS, "renderer", "WebGPU (recommended)")
         self.threads = combo(p, "Threading", THREADS, "threads", "Cooperative (no special hosting)", "Real threads use several CPU cores; the host must allow it (uewasm serve does)")
         self.quality = combo(p, "Graphics (Unreal)", QUALITY, "quality", "Game's own setting", "Applied at every start; lower runs faster in the browser")
-        self.res = combo(p, "Resolution", RESOLUTIONS, "res", "1280x720", "Type any size, like 1366x768", editable=True)
-        self.mem = spin(p, "Guest memory (MB)", "mem", 3072, 1024, 3584, 256, "Memory the game itself can use")
+        self.res = combo(p, "Resolution", RESOLUTIONS, "res", "1280x720", "Type any size, like 1366x768; native renders at the window's own pixel size (sharpest text)", editable=True)
+        self.mem = spin(p, "Guest memory (MB)", "mem", 3072, 1024, 15360, 256,
+                        "Memory the game itself can use. Above 3584 MB the build uses 64-bit memory (current Chrome, Edge or Brave); "
+                        "Unreal Engine 3 games such as Rocket League need about 7168")
         self.mem_limit = spin(p, "Memory limit when run (GB)", "mem_limit", 8, 4, 32, 1, "All the browser tab may use, including downloads and video memory", tk.DoubleVar)
         self.show_fps = check(p, "Show an FPS counter", "show_fps", False, "Ctrl+Shift+F toggles it in game")
         self.async_shaders = check(p, "Compile shaders in the background", "async_shaders", True, "Shorter freezes when new effects first appear")
@@ -700,11 +702,16 @@ class App:
         if not exe:
             messagebox.showerror(TITLE, "Choose the game's install folder or .exe first.")
             return
-        try:
-            w, h = (int(x) for x in self.res.get().lower().split("x"))
-        except ValueError:
-            messagebox.showerror(TITLE, "Resolution should look like 1280x720.")
-            return
+        res = self.res.get().strip().lower()
+        if res == "native":
+            size = "native"
+        else:
+            try:
+                w, h = (int(x) for x in res.split("x"))
+            except ValueError:
+                messagebox.showerror(TITLE, "Resolution should look like 1280x720, or native.")
+                return
+            size = (w, h)
         if THREADS[self.threads.get()] == "real" and self.single.get():
             messagebox.showerror(TITLE, "A single .html file can't use real threads (pages opened from disk can't be cross-origin isolated). "
                                         "Pick cooperative threading, or untick the single-file option.")
@@ -717,7 +724,7 @@ class App:
         if not self.resolve_needs():
             return
         self.save_prefs()
-        opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=(w, h), mem=int(self.mem.get()),
+        opts = dict(exe=exe, out=out, renderer=RENDERERS[self.renderer.get()], opt=OPTS[self.opt.get()], size=size, mem=int(self.mem.get()),
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
                     compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
                     backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()),
@@ -759,18 +766,26 @@ class App:
             stages = [s for s in STAGES if o["native"] or not s.startswith("native")]
             self.est = Estimator(stages, input_mb)
             log(f"{o['exe'].name}: {len(extra)} game DLLs, {input_mb:.0f} MB of machine code to translate")
+            # more game memory than a 32-bit module can hold (4 GB in all, the runtime included): a 64-bit memory build
+            mem64 = o["mem"] > 3584
+            if mem64:
+                log(f"{o['mem']} MB of game memory doesn't fit a 32-bit module: building with 64-bit memory")
             r = build.recompile(o["exe"], o["out"], mem_mb=o["mem"], extra=extra, search=sorted({str(d.parent) for d in extra}),
                                 system_dlls=o["sys_dlls"], log=log, progress=self.progress, lifter=o.get("lifter", "python"))
             log(f"{r['functions']} functions, {r['unsupported_total']} unsupported instructions, {len(r['missing_imports'])} Windows functions not implemented yet")
-            (Path(o["out"]) / "options.json").write_text(json.dumps({"renderer": o["renderer"], "opt": o["opt"], "mem_mb": o["mem"]}, indent=2))
+            (Path(o["out"]) / "options.json").write_text(json.dumps({"renderer": o["renderer"], "threads": o.get("threads", "coop"), "opt": o["opt"],
+                                                                      "mem_mb": o["mem"], "mem64": mem64}, indent=2))
             if o["native"]:
-                build.build_native(o["out"], log=log, progress=self.progress)
+                build.build_native(o["out"], log=log, progress=self.progress, mem64=mem64)
+            # videos shrunk "to the render height": with a native size that height is only known in the browser
+            render_h = o["size"][1] if isinstance(o["size"], tuple) else 1080
             web = build.build_wasm(o["out"], opt=o["opt"], renderer=o["renderer"], game_root=root, exe_rel=o["exe"].relative_to(root).as_posix(),
                                    size=o["size"], part_mb=o["part"], compress=o["compress"], log=log, progress=self.progress,
-                                   video_height=o["size"][1] if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
+                                   video_height=render_h if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
                                    wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
                                    backend=o.get("backend"), placeholders=o.get("placeholders", False), aes_key=o.get("aes"),
-                                   mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False), quality=o.get("quality"))
+                                   mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False), quality=o.get("quality"),
+                                   mem64=mem64)
             self.est.remember()
             self.q.put(("done", str(web)))
         except Cancelled:

@@ -250,6 +250,8 @@ Add these to the game's address, for example `index.html?syncshaders=1&nocull=1`
 | `?capture=1` | Enable frame capture (see below). |
 | `?gpuprof=1` | Time every GPU pass and log the slowest ones (`[gpuprof]` lines) along with their shader source. |
 | `?texdebug=1`, `?bufdebug=1`, `?bgdebug=1` | Log texture, buffer and bind group details. Very verbose. |
+| `?texfmt=1` | Log the first texture of each format, bind and usage, and the WebGPU format it is stored as (`[texfmt]` lines). |
+| `?glyphdebug=1` | Log the creates, maps, updates and copies that touch 8-bit single-channel textures, which is how UI text glyph caches are filled (`[glyph]` lines, first 600). |
 | `?arg=-foo` | Pass an extra launch argument to the game (repeat for more). |
 
 From the DevTools console, while the game runs:

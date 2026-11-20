@@ -5,6 +5,29 @@ page switches (add them to the address, e.g. `index.html?tracering=1`); two need
 
 For rendering problems (black screen, wrong colours) see [RENDERING.md](RENDERING.md) first.
 
+## Keeping the log: `uewasm serve --log`
+
+The tools below print to the game's log. To get it in a file while the game runs, without the debug panel's
+*Save log*, serve the build with `--log`:
+
+```
+python uewasm.py serve builds\MyGame\web --log builds\MyGame\run.log
+```
+
+The server adds a small script to `index.html` that sends every console line, page error and unhandled promise
+rejection back to it every half second, and appends them to the file. The file is never cleared: each server start
+adds a `=== uewasm serve …` line, each page load a `[uewlog] page …` line with the address and the browser. Lines
+start with the seconds since the page loaded, and warnings and errors are marked:
+
+```
+=== uewasm serve C:\…\builds\MyGame\web on port 8080, 2026-11-18 14:02:11
+0.0 [uewlog] page http://localhost:8080/?memdebug=1 Mozilla/5.0 …
+12.4 [warn] …
+```
+
+It holds the same lines *Save log* would, and it can be read (or followed with `Get-Content -Wait`) while the game
+runs. If the tab crashes, the last half second can be missing.
+
 ## Readable crash stacks
 
 Build with function names, so WebAssembly stack traces name the guest functions:
@@ -147,8 +170,61 @@ site wasn't recorded (its arguments were pushed in an earlier block), so the sta
 ## Running out of memory
 
 The first failed guest allocation logs the guest stack, the WebAssembly call chain and (with `?tracering=1`) the last
-system calls; `?memdebug=1` also logs every reservation of 64 MB or more with its caller. An absurd request (gigabytes)
-usually comes from a bad count further up, or from a loop that never ends allocating small blocks.
+system calls. An absurd request (gigabytes) usually comes from a bad count further up, or from a loop that never ends
+allocating small blocks.
+
+Every 600 frames, WebGPU builds log how much guest memory is in use, the most that was ever in use, and the size of
+the WebAssembly memory:
+
+```
+[mem] game memory 4030 MB in use, 6568 MB at most, of 7168 MB; wasm memory 7504 MB
+[mem] runtime heap 336 MB (game memory excluded); 16766 shaders, 13998 distinct (45 MB bytecode, 40 MB distinct; 256 drawn so far, 2 MB reflection), buffer shadows 28 MB, 3815 buffers and textures (11 MB of records)
+[mem] game heap (malloc/HeapAlloc): 149 MB asked for, 161 MB held (147 MB in blocks of 64 KB and up), 0 MB free in size-class lists
+```
+
+The second line is the runtime's own share of the WebAssembly memory. Shaders with identical bytecode share one copy
+(and one set of translations and pipelines), and a shader is reflected (about 12 KB) only when it is first drawn, so
+games that create thousands of shaders at load don't pay for duplicates or for the ones they never use. The heap figure
+also counts each game thread's 4 MB native stack, most of which is never touched and so takes no RAM. The third line is
+what the game allocates through the C runtime and `HeapAlloc`; memory it takes with `VirtualAlloc` (most engines'
+own allocators) is only in the first line.
+
+Freed blocks are zeroed when they are freed rather than when they are handed out again, so memory a game frees and
+never reuses (a loader's buffers) holds zeros, which Windows compresses to almost nothing if it trims the tab under
+memory pressure. `?nozerofree=1` goes back to zeroing at reuse.
+
+`[memline]` lines trace guest memory while it climbs (a line per 256 MB step) and when it falls by two steps or more,
+which shows the shape of a loading peak: what is allocated at once, what builds up, and what is freed afterwards.
+
+The page's download cache can be resized for a test with `?cachemb=N`; `Module.uewFiles.refetched` in the console
+counts bytes downloaded again after the cache evicted them (what a smaller cache costs). With `?cachetrace=1`,
+`Module.uewFiles.trace` records every block the game reads (its key) and every block that arrives (`-key-1`), in order,
+so cache sizes and policies can be replayed offline against a real session instead of tried one run at a time.
+
+WebAssembly memory can't hand pages back, so the "at most" figure (plus about 700 MB of runtime) is what the page
+keeps in RAM for the rest of the session, even after the game frees it. `--mem-mb` has to stay above it with some
+headroom; setting it higher only reserves address space, it doesn't use RAM.
+
+`?memdebug=1` shows where the memory goes. It logs the first 200 `VirtualAlloc` calls of 64 MB or more (and failed
+ones) with the four arguments, the result, the caller and the thread; for 64-bit games each one also gets a deeper
+guest stack, up to 48 code addresses, nearest first. Every `VirtualFree` of a block of 64 MB or more is logged too,
+with the whole block and whether it was released or only decommitted:
+
+```
+[mem] VirtualAlloc(0, f8000000, 3000, 4) = 3c0000000 from 1418a2c3e thread 4100
+[mem] stack: 1418a2c3e 14187f512 14187f6a0 1410e5a92 140f3b2c8 140f3a011 …
+[mem] VirtualFree(3c0000000, 0, 8000): block 3c0000000+f8000000 released from 1418a2d10
+```
+
+The first addresses on a `[mem] stack:` line are the engine's own allocator, the same for every large block; the
+game code that asked for the block is further down, usually from the first address that differs between two such
+lines. Some entries are stale values left on the stack, so one address that doesn't fit with its neighbours can be
+skipped. The others are return addresses inside a function: the nearest `F_<address>` below one in the recompiled C
+is that function (see [Reading the game's code](#reading-the-games-code)). A block allocated again and again and
+never released points at a leak.
+
+In a `--mem64` build, small blocks (under 4 MB) are placed above 4 GB on purpose, so code that keeps a guest address
+in 32 bits breaks on the first allocation instead of deep into a game.
 
 ## Reading the game's code
 

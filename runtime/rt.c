@@ -30,7 +30,7 @@ CPU main_cpu;
 /* guest address space above the images, handed out in 64K units */
 #define UNIT 65536ull
 #define BIG 0xFF
-static uint64_t unit_lo, unit_n, unit_rover, units_used;
+static uint64_t unit_lo, unit_n, unit_rover, units_used, units_peak;
 static uint64_t *unit_free, *unit_dirty;
 static uint32_t* unit_run;
 static uint64_t arena_cur, arena_end;
@@ -70,6 +70,17 @@ static uint64_t units_scan(uint64_t from, uint64_t to, uint64_t n)
     return ~0ull;
 }
 
+/* a line each time guest memory in use climbs to the next 256 MB step, or falls two steps: the shape of loading peaks
+   (without repeating while it hovers around one step) */
+static void mem_timeline(void)
+{
+    static uint64_t last_step = 0;
+    uint64_t step = units_used * UNIT >> 28;
+    if (step <= last_step && step + 2 > last_step) return;
+    last_step = step;
+    host_log("[memline] %llu MB in use (most %llu MB)", (unsigned long long)(units_used * UNIT >> 20), (unsigned long long)(units_peak * UNIT >> 20));
+}
+
 static void units_take(uint64_t i, uint64_t n)
 {
     for (uint64_t j = i; j < i + n; j++) {
@@ -78,6 +89,8 @@ static void units_take(uint64_t i, uint64_t n)
     }
     unit_run[i] = (uint32_t)n;
     units_used += n;
+    if (units_used > units_peak) units_peak = units_used;
+    mem_timeline();
 }
 
 /* the highest run of n free units */
@@ -105,7 +118,17 @@ uint64_t g_pages(uint64_t size)
 {
     uint64_t n = (size + UNIT - 1) / UNIT;
     if (!n) n = 1;
-    uint64_t i = n >= 64 ? units_scan_down(n) : units_scan(0, unit_n, n);
+    uint64_t i;
+#ifdef UEW_MEM64
+    /* 64-bit memory: small blocks start above 4 GB as well (big ones come from the top already), so code that still
+       keeps a guest address in 32 bits breaks on the first allocation, not deep into a game */
+    uint64_t at4 = unit_lo < (4ull << 30) ? ((4ull << 30) - unit_lo) / UNIT : 0;
+    if (n < 64 && at4 < unit_n) {
+        i = units_scan(at4, unit_n, n);
+        if (i == ~0ull) i = units_scan(0, at4, n);
+    } else
+#endif
+    i = n >= 64 ? units_scan_down(n) : units_scan(0, unit_n, n);
     if (i == ~0ull) i = n >= 64 ? units_scan(0, unit_n, n) : units_scan_down(n);
     if (i == ~0ull) {
         host_log("[mem] out of guest memory (%llu bytes requested, %llu MB in use)", (unsigned long long)size,
@@ -154,18 +177,31 @@ uint64_t g_pages_query(uint64_t a, uint64_t* len)
     return 0;
 }
 
+/* a block is zeroed when it is freed, not when its memory is next handed out: the same work, done earlier, except for
+   memory that is never handed out again. WebAssembly can't give memory back, so that memory stays in the page; holding
+   zeros, Windows compresses it to almost nothing when it trims the page under memory pressure, where stale data only
+   halves. Rocket League frees 2.6 GB of shader-cache buffers after loading: zeroing them took ~0.2 s, and a trimmed
+   page then held 1.25 GB less in Windows' compression store. ?nozerofree=1 zeroes at reuse instead */
+static int zero_free;
 void g_pages_free(uint64_t a)
 {
     uint64_t len, base = g_pages_query(a, &len);
     if (!base || base != a) return;
     uint64_t i = (a - unit_lo) / UNIT, n = len / UNIT;
-    for (uint64_t j = i; j < i + n; j++) { SETB(unit_free, j); SETB(unit_dirty, j); }
+    if (zero_free) {
+        memset(MEM + unit_lo + i * UNIT, 0, (size_t)(n * UNIT));
+        for (uint64_t j = i; j < i + n; j++) { SETB(unit_free, j); CLRB(unit_dirty, j); }
+    } else
+        for (uint64_t j = i; j < i + n; j++) { SETB(unit_free, j); SETB(unit_dirty, j); }
     unit_run[i] = 0;
     units_used -= n;
+    mem_timeline();
     if (i < unit_rover) unit_rover = i;
 }
 
 uint64_t g_mem_used(void) { return unit_lo + units_used * UNIT; }
+/* the most guest memory ever in use: wasm memory can't give pages back, so this is what the game keeps resident */
+uint64_t g_mem_peak(void) { return unit_lo + units_peak * UNIT; }
 
 static int size_class(uint64_t n)
 {
@@ -174,23 +210,33 @@ static int size_class(uint64_t n)
     return k;
 }
 
+/* heap bookkeeping for the [mem] log line: bytes asked for and held by live blocks, bytes sitting in the free lists */
+static uint64_t heap_req, heap_held, heap_binned, heap_big;
+void g_heap_stats(uint64_t* req, uint64_t* held, uint64_t* binned, uint64_t* big) { *req = heap_req; *held = heap_held; *binned = heap_binned; *big = heap_big; }
+
 uint64_t g_alloc(uint64_t n)
 {
     if (n == 0) n = 1;
     int k = size_class(n + 16);
     uint64_t blk;
+    heap_req += n;
     if (k > 15) {
         blk = g_pages(n + 16);
-        if (!blk) return 0;
+        if (!blk) { heap_req -= n; return 0; }
         k = BIG;
+        uint64_t len; g_pages_query(blk, &len);
+        heap_held += len; heap_big += len;
     } else if (bins[k]) {
         blk = bins[k];
         bins[k] = LD64(blk + 16);
+        heap_binned -= 1ull << k;
+        heap_held += 1ull << k;
     } else {
+        heap_held += 1ull << k;
         uint64_t sz = 1ull << k;
         if (arena_cur + sz > arena_end) {
             arena_cur = g_pages(1 << 20);
-            if (!arena_cur) return 0;
+            if (!arena_cur) { heap_req -= n; heap_held -= sz; return 0; }
             arena_end = arena_cur + (1 << 20);
         }
         blk = arena_cur;
@@ -216,8 +262,11 @@ void g_free(uint64_t p)
 {
     if (!p) return;
     int k = (int)LD64(p - 8);
-    if (k == BIG) { g_pages_free(p - 16); return; }
+    heap_req -= LD64(p - 16);
+    if (k == BIG) { uint64_t len; if (g_pages_query(p - 16, &len)) { heap_held -= len; heap_big -= len; } g_pages_free(p - 16); return; }
     if (k < 4 || k > 15) return;
+    heap_held -= 1ull << k;
+    heap_binned += 1ull << k;
     ST64(p, bins[k]);
     bins[k] = p - 16;
 }
@@ -234,7 +283,7 @@ uint64_t g_realloc(uint64_t p, uint64_t n)
     if (!p) return g_alloc(n);
     if (!n) { g_free(p); return 0; }
     uint64_t old = g_size(p);
-    if (n <= block_cap(p)) { ST64(p - 16, n); return p; }
+    if (n <= block_cap(p)) { heap_req += n - old; ST64(p - 16, n); return p; }
     uint64_t q = g_alloc(n);
     if (q) memcpy(G2H(q), G2H(p), (size_t)(old < n ? old : n));
     g_free(p);
@@ -442,8 +491,11 @@ void rt_ring_dump(void)
     void rt_ebp_dump_all(void);
     rt_ebp_dump_all();
     if (ring_on <= 0) return;
-    host_log("[trap] last %u system calls:", ring_n < 64 ? ring_n : 64);
-    for (unsigned i = ring_n > 64 ? ring_n - 64 : 0; i < ring_n; i++) {
+    /* one snapshot: with real threads the other threads keep adding calls faster than they can be printed, and a bound
+       read on every pass never ends (Rocket League's audio thread printed for minutes after a trap) */
+    unsigned end = *(volatile unsigned*)&ring_n;
+    host_log("[trap] last %u system calls:", end < 64 ? end : 64);
+    for (unsigned i = end > 64 ? end - 64 : 0; i < end; i++) {
         unsigned k = i & 63;
         host_log("  %s(%llx, %llx, %llx, %llx) ret=%llx rbp=%llx t=%u", ring[k].name, (unsigned long long)ring[k].a[0], (unsigned long long)ring[k].a[1],
                  (unsigned long long)ring[k].a[2], (unsigned long long)ring[k].a[3], (unsigned long long)ring[k].ret, (unsigned long long)ring[k].bp, ring[k].tid);
@@ -759,9 +811,11 @@ void rt_detach_all(CPU* c)
 void rt_exit(int code)
 {
 #ifdef UEW_THREADS
-    /* any thread may end the process; the other cores' stacks can't be unwound to rt_main */
+    /* any thread may end the process; the other cores' stacks can't be unwound to rt_main. The page's thread ends it
+       (sched_mt.c: Emscripten's exit() from another core can leave the process running) */
+    void sched_exit_process(int code);
     host_flush();
-    exit(code);
+    sched_exit_process(code);
 #else
     exit_code = code;
     longjmp(exit_jmp, 1);
@@ -1240,6 +1294,9 @@ static int guest_main(void* arg);
 int rt_main(int argc, char** argv, const char* image_path)
 {
     MEM_SIZE = (uint64_t)GUEST_MEM_MB << 20;
+    /* a 32-bit game can't point past 4 GB: more guest memory (a 64-bit memory build) would only hand it addresses
+       it truncates */
+    if (RT_G32 && MEM_SIZE > (4ull << 30)) MEM_SIZE = 4ull << 30;
 #ifdef __EMSCRIPTEN__
     /* fresh wasm memory is already zero; calloc would memset (and commit) all of it */
     MEM = (uint8_t*)malloc((size_t)MEM_SIZE);
@@ -1250,6 +1307,7 @@ int rt_main(int argc, char** argv, const char* image_path)
         host_log("couldn't reserve %llu MB of guest memory", (unsigned long long)GUEST_MEM_MB);
         return 1;
     }
+    zero_free = !host_query_flag("nozerofree");
     build_fn_hash();
     units_init(IMAGE_HI);
     const ModuleInfo* exe = NULL;
@@ -1316,18 +1374,21 @@ static int guest_main(void* arg)
     return exit_code;
 }
 
-void rt_backtrace(CPU* c, const char* tag)
+/* code addresses found on the guest stack (return addresses, and some stale ones), nearest first; up to max of them */
+void rt_backtrace_n(CPU* c, const char* tag, int max)
 {
     uint64_t sp = c->r[4];
     int n = 0;
-    char line[512];
+    char line[2048];
     int k = snprintf(line, sizeof line, "[%s] stack:", tag);
-    for (int i = 0; i < 4096 && n < 16; i++) {
+    for (int i = 0; i < 8192 && n < max && k < (int)sizeof line - 24; i++) {
         uint64_t v = LD64(sp + 8ull * i);
         if (v >= IMAGE_LO && v < IMAGE_HI && rt_module_at(v)) { k += snprintf(line + k, sizeof line - (size_t)k, " %llx", (unsigned long long)v); n++; }
     }
     host_log("%s", line);
 }
+
+void rt_backtrace(CPU* c, const char* tag) { rt_backtrace_n(c, tag, 16); }
 
 /* flags handed across a jump into another lifted fragment */
 #ifdef _MSC_VER

@@ -133,6 +133,7 @@ uint64_t g_pages_at(uint64_t a, uint64_t size);
 uint64_t g_pages_query(uint64_t a, uint64_t* len);
 void g_pages_free(uint64_t a);
 uint64_t g_mem_used(void);
+uint64_t g_mem_peak(void);
 #define A1 R(1)
 #define A2 R(2)
 #define A3 R(8)
