@@ -142,7 +142,7 @@ def cmd_install_emsdk(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="uewasm", description="Windows x64 game recompiler for the web")
+    ap = argparse.ArgumentParser(prog="uewasm", description="Windows x64 and x86 game recompiler for the web (Unreal Engine 3, 4 and 5)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("recomp", help="recompile a game for the web")
     r.add_argument("exe", help="the game's .exe, or its install folder")

@@ -102,6 +102,14 @@ These don't change the result, only how long the build takes:
 - **`--priority low`** keeps the PC usable during a build. It's slower but produces the same output.
 - Rebuilding into the same output folder only recompiles lifted files that changed.
 
+## Unreal Engine 3 games
+
+- `--quality` doesn't apply: UE3 keeps its own settings, so lower graphics in the game's options menu.
+- 32-bit UE3 games: start with `--threads real`, which Dishonored needs to get past its start-up.
+- 64-bit UE3 games with large shader caches (Rocket League) need about 7 GB of game memory (`--mem-mb 7168`, which
+  turns on `--mem64`). Each running copy then uses about 10 GB of RAM: close other copies, and close the tab rather
+  than reloading it, because a reload doesn't free the old copy right away.
+
 ## A good starting point
 
 For a mid-range PC and a UE4 game:
