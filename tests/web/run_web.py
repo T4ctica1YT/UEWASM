@@ -28,7 +28,8 @@ def make_game(game):
     (game / "Binaries" / "helper.dll").write_bytes(b"MZ" + bytes(1000))
 
 
-def run_browser(web, ranges):
+def run_browser(web, ranges, queries=("", "")):
+    """one page load per query (each after the last, same browser storage); the console lines of all of them"""
     from playwright.sync_api import sync_playwright
     srv = serve.background(web, ranges=ranges)
     out = []
@@ -38,9 +39,9 @@ def run_browser(web, ranges):
             page = b.new_page()
             page.on("console", lambda m: out.append(m.text))
             page.on("pageerror", lambda e: out.append("PAGEERROR " + str(e)))
-            for _ in range(2):
+            for q in queries:
                 n = len(out)
-                page.goto(f"http://localhost:{srv.server_port}/index.html")
+                page.goto(f"http://localhost:{srv.server_port}/index.html{q}")
                 t0 = time.time()
                 while time.time() - t0 < 60 and not any(l.strip() == "done" or l.startswith("PAGEERROR") for l in out[n:]):
                     page.wait_for_timeout(250)
@@ -85,7 +86,12 @@ def main():
         web = build.build_wasm(out, log=sizes.append, game_root=game, exe_rel="assets.exe", part_mb=1, compress=compress)
         print(sizes[0])
         for ranges in (True, False):
-            lines = [l for l in run_browser(web, ranges) if l.strip() and not l.startswith("[")]
+            # a third load with ?clearsave=Saved starts without the save again, as the first run did
+            lines = [l for l in run_browser(web, ranges, ("", "", "?clearsave=Saved")) if l.strip() and not l.startswith("[")]
+            first = ref[:len(ref) // 2]
+            if lines[len(ref):len(ref) + len(first)] != first:
+                print("  ?clearsave=Saved: the save was still there:", lines[len(ref):len(ref) + len(first)])
+                ok = False
             same = lines[:len(ref)] == ref
             print(f"web ({'deflated' if compress else 'raw'}, {'range requests' if ranges else 'whole parts'}):", "MATCH" if same else "DIFF")
             if not same:

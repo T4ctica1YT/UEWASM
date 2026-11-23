@@ -301,7 +301,8 @@ python tests/shaders/extract_d3d9.py "C:/Games/SomeUE3Game" tests/bin/shaders9  
 python tests/isa/run_isa.py --wasm # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
 cargo test --release --manifest-path rustlift/Cargo.toml --bin uewrecomp   # the SteamStub AES against FIPS-197
 python tests/web/run_web.py        # game files over HTTP (raw and deflated, with and without Range) and saved progress
-python tests/net/run_net.py        # real TCP, UDP and HTTPS (Schannel, libcurl-style checks) and hashing through WISP vs native
+python tests/net/run_net.py        # real TCP, UDP, HTTPS (Schannel, libcurl-style checks, a full download) and hashing through WISP vs native
+python tests/aes/run_aes.py        # OpenSSL's assembly AES (Python's libcrypto-3.dll) recompiled vs native: code that bends the x64 ABI
 python tests/sse/gen_test.py       # SIMD versions of the SSE helpers against their scalar references
 python tests/steam/run_pair.py <web build of tests/steam/steamtest.cpp>   # two players: lobby, chat, P2P (WebWorks server, or the relay with --relay)
 ```
@@ -347,6 +348,13 @@ so there is no separate mode to pick. What differs:
   than UE4 titles and the first visit to each area stutters while shaders compile.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.
 - Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call.
+
+## Working on UEWASM
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the project's rules, recipes for common changes and which tests to run.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how a game becomes a web page and where each part lives;
+[docs/LIFTER.md](docs/LIFTER.md) is about finding recompiler bugs (wrong results with no crash);
+[docs/ONLINE.md](docs/ONLINE.md) covers the Steam, EOS, WISP and TLS internals.
 
 ## Third-party code
 

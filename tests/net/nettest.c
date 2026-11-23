@@ -164,6 +164,109 @@ static int https_status(const char* host, int curl_style, char* line, int cap)
 
 static void hex(const unsigned char* d, int n, char* out) { for (int i = 0; i < n; i++) sprintf(out + 2 * i, "%02x", d[i]); }
 
+// a whole HTTPS download in libcurl's pattern (16 KB reads, records split across reads): body size and SHA-256
+static int https_download(const char* host, const char* path, char* line, int cap)
+{
+    PSecurityFunctionTableA sspi = InitSecurityInterfaceA();
+    SCHANNEL_CRED sc = { 0 };
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_AUTO_CRED_VALIDATION;
+    CredHandle cred;
+    TimeStamp ts;
+    if (sspi->AcquireCredentialsHandleA(NULL, (char*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND, NULL, &sc, NULL, NULL, &cred, &ts) != SEC_E_OK) { snprintf(line, cap, "credentials"); return 0; }
+    SOCKET s = connect_to(host, "443");
+    if (s == INVALID_SOCKET) { snprintf(line, cap, "connect failed"); return 0; }
+    DWORD req = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM, attrs;
+    CtxtHandle ctx;
+    SecBuffer ob = { 0, SECBUFFER_EMPTY, NULL };
+    SecBufferDesc od = { SECBUFFER_VERSION, 1, &ob };
+    SECURITY_STATUS st = sspi->InitializeSecurityContextA(&cred, NULL, (char*)host, req, 0, 0, NULL, 0, &ctx, &od, &attrs, &ts);
+    static char in[65536];
+    int have = 0;
+    for (;;) {
+        if (ob.cbBuffer) { send(s, (char*)ob.pvBuffer, ob.cbBuffer, 0); sspi->FreeContextBuffer(ob.pvBuffer); ob.cbBuffer = 0; ob.pvBuffer = NULL; }
+        if (st == SEC_E_OK) break;
+        if (st != SEC_I_CONTINUE_NEEDED && st != SEC_E_INCOMPLETE_MESSAGE) { snprintf(line, cap, "handshake failed %08lx", (unsigned long)st); return 0; }
+        if (st == SEC_E_INCOMPLETE_MESSAGE || have == 0) {
+            int r = recv(s, in + have, (int)sizeof in - have, 0);
+            if (r <= 0) { snprintf(line, cap, "closed in the handshake"); return 0; }
+            have += r;
+        }
+        SecBuffer ib[2] = { { (unsigned long)have, SECBUFFER_TOKEN, in }, { 0, SECBUFFER_EMPTY, NULL } };
+        SecBufferDesc id = { SECBUFFER_VERSION, 2, ib };
+        ob.BufferType = SECBUFFER_EMPTY; ob.cbBuffer = 0; ob.pvBuffer = NULL;
+        st = sspi->InitializeSecurityContextA(&cred, &ctx, (char*)host, req, 0, 0, &id, 0, NULL, &od, &attrs, &ts);
+        if (st == SEC_E_INCOMPLETE_MESSAGE) continue;
+        if (ib[1].BufferType == SECBUFFER_EXTRA && ib[1].cbBuffer) { memmove(in, in + have - ib[1].cbBuffer, ib[1].cbBuffer); have = ib[1].cbBuffer; }
+        else have = 0;
+    }
+    SecPkgContext_StreamSizes sz;
+    sspi->QueryContextAttributesA(&ctx, SECPKG_ATTR_STREAM_SIZES, &sz);
+    static char msg[4096];
+    int n = snprintf(msg + sz.cbHeader, sizeof msg - sz.cbHeader - sz.cbTrailer, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: nettest\r\nConnection: close\r\n\r\n", path, host);
+    SecBuffer eb[4] = { { sz.cbHeader, SECBUFFER_STREAM_HEADER, msg }, { (unsigned long)n, SECBUFFER_DATA, msg + sz.cbHeader },
+                        { sz.cbTrailer, SECBUFFER_STREAM_TRAILER, msg + sz.cbHeader + n }, { 0, SECBUFFER_EMPTY, NULL } };
+    SecBufferDesc ed = { SECBUFFER_VERSION, 4, eb };
+    if (sspi->EncryptMessage(&ctx, 0, &ed, 0) != SEC_E_OK) { snprintf(line, cap, "EncryptMessage failed"); return 0; }
+    send(s, msg, eb[0].cbBuffer + eb[1].cbBuffer + eb[2].cbBuffer, 0);
+    BCRYPT_ALG_HANDLE alg;
+    BCRYPT_HASH_HANDLE hh;
+    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    BCryptCreateHash(alg, &hh, NULL, 0, NULL, 0, 0);
+    static char head[8192];
+    int hl = 0, in_body = 0;
+    long long body = 0;
+    for (;;) {
+        SecBuffer db[4] = { { (unsigned long)have, SECBUFFER_DATA, in }, { 0, SECBUFFER_EMPTY, NULL }, { 0, SECBUFFER_EMPTY, NULL }, { 0, SECBUFFER_EMPTY, NULL } };
+        SecBufferDesc dd = { SECBUFFER_VERSION, 4, db };
+        SECURITY_STATUS r = have ? sspi->DecryptMessage(&ctx, &dd, 0, NULL) : SEC_E_INCOMPLETE_MESSAGE;
+        if (r == SEC_E_INCOMPLETE_MESSAGE) {
+            int want = (int)sizeof in - have < 16384 ? (int)sizeof in - have : 16384;
+            int k = recv(s, in + have, want, 0);
+            if (k <= 0) break;
+            have += k;
+            continue;
+        }
+        if (r != SEC_E_OK) break;
+        int extra = 0;
+        for (int i = 0; i < 4; i++) {
+            if (db[i].BufferType == SECBUFFER_DATA && db[i].cbBuffer) {
+                const char* p = (const char*)db[i].pvBuffer;
+                int m = (int)db[i].cbBuffer;
+                if (!in_body) {
+                    int take = m < (int)sizeof head - hl ? m : (int)sizeof head - hl;
+                    memcpy(head + hl, p, take);
+                    hl += take;
+                    char* e = NULL;
+                    for (int j = 3; j < hl; j++) if (!memcmp(head + j - 3, "\r\n\r\n", 4)) { e = head + j + 1; break; }
+                    if (!e) continue;
+                    in_body = 1;
+                    int before = hl - take, hdr = (int)(e - head);
+                    p += hdr - before; m -= hdr - before;
+                }
+                BCryptHashData(hh, (PUCHAR)p, m, 0);
+                body += m;
+            }
+            if (db[i].BufferType == SECBUFFER_EXTRA) extra = (int)db[i].cbBuffer;
+        }
+        memmove(in, in + have - extra, extra);
+        have = extra;
+    }
+    unsigned char d[32];
+    char h[65];
+    BCryptFinishHash(hh, d, 32, 0);
+    BCryptDestroyHash(hh);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    hex(d, 32, h);
+    char* e = strpbrk(head, "\r\n");
+    if (e) *e = 0;
+    snprintf(line, cap, "%s, %lld bytes, sha256 %s", head, body, h);
+    sspi->DeleteSecurityContext(&ctx);
+    sspi->FreeCredentialsHandle(&cred);
+    closesocket(s);
+    return strncmp(head, "HTTP/1.1 200", 12) == 0;
+}
+
 // hashes through CNG (BCrypt, with HMAC) and CryptoAPI, and random numbers from both
 static void hashes(void)
 {
@@ -250,6 +353,8 @@ int main(void)
     else printf("FAIL https (schannel): %s\n", line);
     if (https_status("api.epicgames.dev", 1, line, sizeof line)) printf("OK https epic (schannel): %s\n", line);
     else printf("FAIL https epic (schannel): %s\n", line);
+    if (https_download("raw.githubusercontent.com", "/torvalds/linux/v6.0/MAINTAINERS", line, sizeof line)) printf("OK https download: %s\n", line);
+    else printf("FAIL https download: %s\n", line);
     printf("DONE\n");
     WSACleanup();
     return 0;

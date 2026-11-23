@@ -4,6 +4,7 @@ These tools find *where* a recompiled game goes wrong when the log only says it 
 page switches (add them to the address, e.g. `index.html?tracering=1`); two need a debug build.
 
 For rendering problems (black screen, wrong colours) see [RENDERING.md](RENDERING.md) first.
+When the game runs but computes something wrong (a save that won't load, a failed checksum), see [LIFTER.md](LIFTER.md).
 
 ## Keeping the log: `uewasm serve --log`
 
@@ -157,6 +158,20 @@ Unreal Engine 3 relies on this: a failed package or class load is thrown and cau
 
 - A catch that lands on an address the lifter didn't make an entry point stops with `catch continuation is not a
   lifted entry point`: the funclet's `mov eax, continuation; ret` wasn't recognised by `eh32.py`.
+
+## Online sign-in errors
+
+`?httpdebug=1` logs the HTTPS a game makes through Windows' Schannel (the EOS SDK, for one): each request's method,
+host and path (form fields by name), and each answer's status, with the body of failed answers. When a game reports a
+sign-in error, that body says what the service actually objected to, for example
+`[http] api.epicgames.dev: HTTP/1.1 401 Unauthorized: {"errorCode":"errors.com.epicgames.eos.auth.external.invalid_token","errorMessage":"Steam Session Ticket unexpected length: 32."}`.
+Tokens, credentials and successful answers' bodies are left out, so the log can be shared. It offers servers only
+HTTP/1.1, so the traffic stays readable.
+
+`?clearsave=<path>` deletes a file or folder inside the save folder (the browser's copy of the game's writable files)
+before the game starts, for example a download cache an online SDK keeps trusting:
+`?clearsave=Users/Player/AppData/Local/<Game>/Saved/PersistentDownloadDir/EOSCache`. `?filetrace=1` shows the paths
+the game uses.
 
 ## Steam
 

@@ -307,6 +307,38 @@ uint64_t hle_file_pread(uint64_t h, uint64_t off, uint64_t buf, uint64_t len)
     return r;
 }
 
+/* writes len bytes at off without touching the file position (mapped views written back); returns the bytes written */
+uint64_t hle_file_pwrite(uint64_t h, uint64_t off, uint64_t buf, uint64_t len)
+{
+    Handle* x = hget(h);
+    if (!x || x->kind != H_FILE || !x->f) return 0;
+    uint64_t keep, pos;
+    if (!seek(x, 0, 1, &keep) || !seek(x, (int64_t)off, 0, &pos)) return 0;
+    size_t w = fwrite(G2H(buf), 1, (size_t)len, x->f);
+    fflush(x->f);
+    seek(x, (int64_t)keep, 0, &pos);
+    return w;
+}
+static uint64_t fsize(Handle* x);
+uint64_t hle_file_size(uint64_t h) { Handle* x = hget(h); return x && x->kind == H_FILE && x->f ? fsize(x) : 0; }
+/* grows a file to size (zero-filled), as a read-write mapping larger than the file does */
+int hle_file_extend(uint64_t h, uint64_t size)
+{
+    Handle* x = hget(h);
+    if (!x || x->kind != H_FILE || !x->f) return 0;
+    if (fsize(x) >= size) return 1;
+    return host_truncate(x->f, size);
+}
+/* another handle to the same open file (ReOpenFile, and file mappings, which outlive the handle they were made from) */
+uint64_t hle_file_reopen(uint64_t h, uint32_t access, uint32_t flags)
+{
+    Handle* x = hget(h);
+    if (!x || x->kind != H_FILE || !x->path[0]) return (uint64_t)-1;
+    if (x->f) fflush(x->f);
+    return open_file(x->path, access, 3, flags);   /* OPEN_EXISTING */
+}
+HLE(ReOpenFile) { uint64_t r = hle_file_reopen(A1, (uint32_t)A2, (uint32_t)ARG(4)); if (r == (uint64_t)-1) set_error(6); RET(r); }
+
 HLE(ReadFile)
 {
     uint64_t h = A1, buf = A2, n = A3 & 0xFFFFFFFF, got = A4, ov = ARG(5);

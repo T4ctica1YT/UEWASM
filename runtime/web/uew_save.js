@@ -16,6 +16,22 @@
     addRunDependency("uew-save");
     FS.syncfs(true, e => {
       if (e) err(`[save] ${e}`);
+      // ?clearsave=path/in/the/save/folder deletes that file or folder first (a stale download cache, a broken save)
+      const clear = typeof location != "undefined" && new URLSearchParams(location.search).get("clearsave");
+      if (clear && !clear.split(/[\\/]/).includes("..")) {
+        const rm = p => {
+          let st;
+          try { st = FS.stat(p); } catch (_) { return 0; }
+          if (!FS.isDir(st.mode)) { FS.unlink(p); return 1; }
+          let n = 0;
+          for (const k of FS.readdir(p)) if (k != "." && k != "..") n += rm(p + "/" + k);
+          FS.rmdir(p);
+          return n;
+        };
+        const p = dir + "/" + clear.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+        out(`[save] cleared ${p}: ${rm(p)} files`);
+        flush();
+      }
       // tests: window.uewSeedFiles = { "path/under/the/save/folder": base64 } puts files in place before the game starts
       const seed = typeof window !== "undefined" && window.uewSeedFiles;
       if (seed) for (const [rel, b64] of Object.entries(seed)) {

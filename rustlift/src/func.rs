@@ -945,7 +945,11 @@ impl<'a> Func<'a> {
                         let post = self.c.p.flags_live_after_call(self.cache, ins.next_ip());
                         (if pre { "rt_xfl = rt_flags(&F); " } else { "" }, if post { " F.fop = F_RAW; F.rawfl = rt_xfl;" } else { "" })
                     } else { ("", "") };
-                    self.emit(format!("{push} {pre}SPILL(); {call} FILLV();{post}"));
+                    // x64 code that changes a callee-saved register must have unwind data; a target without any is a
+                    // leaf, or hand-written code outside the ABI that hands results back in them (OpenSSL's AES cores
+                    // return the state in ebx, vpaes leaves its constants in xmm9-15): reload everything after it
+                    let fill = if self.bits() == 64 && !self.c.p.func_start(t) { "FILL();" } else { "FILLV();" };
+                    self.emit(format!("{push} {pre}SPILL(); {call} {fill}{post}"));
                 } else {
                     let v = self.rd(0, Some(p))?;
                     self.emit(format!("{{ static IC ic_ = IC_INIT; uint64_t t_ = {v}; {push} SPILL(); if (t_ == ic_.a) ic_.f(c); else rt_call_ic(c, t_, &ic_); FILLV(); }}"));

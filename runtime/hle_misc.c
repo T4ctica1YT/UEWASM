@@ -458,7 +458,6 @@ HLE(GetFinalPathNameByHandleW) { RET(utf8_to_wstr("C:\\file", A2, (size_t)A3)); 
 HLE(GetCurrencyFormatW) { uint64_t n = 0; while (LD16(A3 + 2 * n)) n++; if ((int32_t)ARG(6) > (int64_t)n) memcpy(G2H(ARG(5)), G2H(A3), 2 * (n + 1)); RET(n + 1); }
 HLE(GetNumberFormatW) { uint64_t n = 0; while (LD16(A3 + 2 * n)) n++; if ((int32_t)ARG(6) > (int64_t)n) memcpy(G2H(ARG(5)), G2H(A3), 2 * (n + 1)); RET(n + 1); }
 STUB(GetGeoInfoA, 0)
-STUB(FlushViewOfFile, 1)
 /* MEMORYSTATUS: SIZE_T fields, 4 bytes for 32-bit games (capped at 2 GB as Windows does without /LARGEADDRESSAWARE) */
 HLE(GlobalMemoryStatus)
 {
@@ -489,41 +488,72 @@ STUB(LockResource, 0)
 STUB(SizeofResource, 0)
 HLE(CopyFile2) { extern void hle_CopyFileW(CPU*); R(8) = 0; hle_CopyFileW(c); RET((uint32_t)R(0) ? 0 : 0x80070002); }
 
-typedef struct { uint64_t file; uint64_t size; } Mapping;
+/* File mappings. A view is a copy of its part of the file, in pages of its own; a writable view of a read-write
+   mapping goes back to the file when flushed or unmapped (FILE_MAP_COPY views and PAGE_WRITECOPY mappings stay
+   private). The mapping holds its own handle to the file, since callers often close theirs right after mapping. */
+typedef struct { uint64_t file; uint64_t size; uint32_t protect; } Mapping;
+typedef struct { uint64_t mem, len, file, off; } View;
+static View views[256];
 void hle_set_error(uint32_t e);
+uint64_t hle_file_pread(uint64_t h, uint64_t off, uint64_t buf, uint64_t len);
+uint64_t hle_file_pwrite(uint64_t h, uint64_t off, uint64_t buf, uint64_t len);
+uint64_t hle_file_size(uint64_t h);
+int hle_file_extend(uint64_t h, uint64_t size);
+uint64_t hle_file_reopen(uint64_t h, uint32_t access, uint32_t flags);
 HLE(CreateFileMappingW)
 {
     hle_set_error(0);
     Mapping* m = calloc(1, sizeof *m);
-    m->file = A1;
+    uint32_t prot = (uint32_t)A3 & 0xFF;
+    int rw = prot == 0x04 || prot == 0x40;   /* PAGE_READWRITE, PAGE_EXECUTE_READWRITE */
+    m->protect = prot;
     m->size = ((uint64_t)(uint32_t)A4 << 32) | (uint32_t)ARG(5);
+    if (A1 && A1 != (uint64_t)-1) {
+        m->file = hle_file_reopen(A1, rw ? 0xC0000000u : 0x80000000u, 0);
+        if (m->file == (uint64_t)-1) m->file = 0;
+        uint64_t fs = m->file ? hle_file_size(m->file) : 0;
+        if (!m->size) m->size = fs;
+        else if (m->size > fs && rw && m->file) hle_file_extend(m->file, m->size);
+        if (!m->size) { free(m); hle_set_error(1006); RET(0); return; }   /* ERROR_FILE_INVALID: an empty file */
+    }
     RET(handle_new(5, m));
 }
 HLE(CreateFileMappingA) { hle_CreateFileMappingW(c); }
+static void view_flush(View* v, uint64_t from, uint64_t n)
+{
+    if (!v->file || from >= v->len) return;
+    if (from + n > v->len || !n) n = v->len - from;
+    hle_file_pwrite(v->file, v->off + from, v->mem + from, n);
+}
 HLE(MapViewOfFile)
 {
     Mapping* m = handle_obj(A1);
-    if (!m) { RET(0); return; }
+    if (!m) { hle_set_error(6); RET(0); return; }
+    uint32_t access = (uint32_t)A2;
     uint64_t off = ((uint64_t)(uint32_t)A3 << 32) | (uint32_t)A4, len = ARG(5);
-    extern void hle_GetFileSizeEx(CPU*);
-    if (!len && (m->file == (uint64_t)-1 || !m->file)) len = m->size > off ? m->size - off : 0;
-    if (!len) {
-        uint64_t tmp = g_calloc(8);
-        uint64_t s1 = R(1), s2 = R(2);
-        R(1) = m->file; R(2) = tmp;
-        hle_GetFileSizeEx(c);
-        len = LD64(tmp) - off;
-        R(1) = s1; R(2) = s2;
-    }
-    /* a view is a copy of that part of the file, in pages of its own so unmapping gives them back */
+    if (off > m->size || (len && off + len > m->size)) { hle_set_error(8); RET(0); return; }   /* past the mapping's end */
+    if (!len) len = m->size - off;
     uint64_t mem = g_pages(len + 16);
     if (!mem) { hle_set_error(8); RET(0); return; }
-    extern uint64_t hle_file_pread(uint64_t h, uint64_t off, uint64_t buf, uint64_t len);
     uint64_t got = m->file ? hle_file_pread(m->file, off, mem, len) : 0;
     memset(G2H(mem + got), 0, (size_t)(len + 16 - got));
+    int writeback = m->file && (access & 2) && !(access & 1) && (m->protect == 0x04 || m->protect == 0x40);
+    for (int i = 0; i < 256; i++) if (!views[i].mem) { views[i] = (View){ mem, len, writeback ? m->file : 0, off }; break; }
     RET(mem);
 }
-HLE(UnmapViewOfFile) { if (A1 && g_pages_query(A1, NULL) == A1) g_pages_free(A1); RET(1); }
+HLE(FlushViewOfFile)
+{
+    for (int i = 0; i < 256; i++)
+        if (views[i].mem && A1 >= views[i].mem && A1 < views[i].mem + views[i].len) { view_flush(&views[i], A1 - views[i].mem, A2); break; }
+    RET(1);
+}
+HLE(UnmapViewOfFile)
+{
+    for (int i = 0; i < 256; i++)
+        if (views[i].mem == A1 && A1) { view_flush(&views[i], 0, 0); views[i].mem = 0; break; }
+    if (A1 && g_pages_query(A1, NULL) == A1) g_pages_free(A1);
+    RET(1);
+}
 
 typedef struct { uint64_t fn, ctx; } Work;
 HLE(CreateThreadpoolWork) { Work* w = calloc(1, sizeof *w); w->fn = A1; w->ctx = A2; RET(handle_new(5, w)); }

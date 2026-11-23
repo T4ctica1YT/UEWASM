@@ -26,6 +26,10 @@ typedef struct Sock {
     struct { uint8_t ip[4]; uint16_t port; int id; } ub[8]; int nub;   /* bridged UDP: one stream per destination */
 } Sock;
 
+/* how often a blocked socket call looks again: every millisecond kept some thread always due, so the page never went
+   quiet long enough to paint (seconds a frame while an online SDK's network threads waited) */
+#define NET_POLL_MS 4
+
 /* The page may serve some host names itself (an offline stand-in for a game's online services): Module.uewNet.claim(name)
    takes a name, getaddrinfo gives it an address 127.1.x.y, and connections there exchange bytes with
    Module.uewNet.open(name, port) -> { send(Uint8Array), close() } which answers through Module.uewNetPush */
@@ -279,7 +283,7 @@ HLE(accept)
     if (!k || !k->listening) { err(k ? E_INVAL : E_NOTSOCK); RET((uint64_t)-1); return; }
     while (!k->nq) {
         if (k->nonblock) { err(E_WOULDBLOCK); RET((uint64_t)-1); return; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
         k = get(A1);
         if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
     }
@@ -301,7 +305,7 @@ static int64_t do_send(CPU* c, Sock* k, const uint8_t* p, uint32_t n)
         uint32_t room = BUFSZ - d->len;
         if (!room) {
             if (done || k->nonblock) break;
-            sched_sleep(c, 1);
+            sched_sleep(c, NET_POLL_MS);
             continue;
         }
         uint32_t m = n - done < room ? n - done : room;
@@ -321,7 +325,7 @@ static int64_t do_recv(CPU* c, uint64_t s, uint8_t* p, uint32_t n, int peek)
         if (k->bridge) {
             if (net_avail(k->bridge) < 0) return 0;
             if (k->nonblock) { err(E_WOULDBLOCK); return -1; }
-            sched_sleep(c, 1);
+            sched_sleep(c, NET_POLL_MS);
             k = get(s);
             if (!k) { err(E_NOTSOCK); return -1; }
             pull(k);
@@ -330,7 +334,7 @@ static int64_t do_recv(CPU* c, uint64_t s, uint8_t* p, uint32_t n, int peek)
         if (k->peer_closed || k->shut_rd) return 0;
         if (k->peer < 0) { err(E_NOTCONN); return -1; }
         if (k->nonblock) { err(E_WOULDBLOCK); return -1; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
         k = get(s);
         if (!k) { err(E_NOTSOCK); return -1; }
     }
@@ -368,7 +372,7 @@ HLE(recv)
     if (k && k->type == 2 && k->bridge) {
         while (net_avail(k->bridge) <= 0) {
             if (k->nonblock) { err(E_WOULDBLOCK); RET((uint64_t)-1); return; }
-            sched_sleep(c, 1);
+            sched_sleep(c, NET_POLL_MS);
             if (!(k = get(A1))) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
         }
         RET((uint64_t)net_recv1(k->bridge, G2H(A2), (int)A3));
@@ -429,7 +433,7 @@ HLE(recvfrom)
         }
         if (k->nd) break;
         if (k->nonblock) { err(E_WOULDBLOCK); RET((uint64_t)-1); return; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
         k = get(A1);
         if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
     }
@@ -511,7 +515,7 @@ HLE(select)
     uint64_t limit = tv ? (uint64_t)LD32(tv) * 1000000000ull + (uint64_t)LD32(tv + 4) * 1000ull : ~0ull, t0 = host_ticks_ns();
     while (!ready(rd, 0) && !ready(wr, 1)) {
         if (host_ticks_ns() - t0 >= limit) { if (rd) ST32(rd, 0); if (wr) ST32(wr, 0); if (ex) ST32(ex, 0); RET(0); return; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
     }
     int n = filter(rd, 0) + filter(wr, 1);
     if (ex) ST32(ex, 0);
@@ -542,7 +546,7 @@ HLE(WSAPoll)
             hits += got != 0;
         }
         if (hits || timeout == 0 || (timeout > 0 && host_ticks_ns() - t0 >= (uint64_t)timeout * 1000000ull)) { RET((uint64_t)hits); return; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
     }
 }
 
@@ -733,7 +737,7 @@ HLE(WSAWaitForMultipleEvents)
         }
         if (all ? count == n : count > 0) { RET(hit); return; }
         if (ms != 0xFFFFFFFF && host_ticks_ns() - t0 >= (uint64_t)ms * 1000000ull) { RET(0x102); return; }
-        sched_sleep(c, 1);
+        sched_sleep(c, NET_POLL_MS);
     }
 }
 

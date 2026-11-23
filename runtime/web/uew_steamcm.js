@@ -75,7 +75,7 @@ addToLibrary({
 
     get() {
       if (this.s) return this.s;
-      this.s = { state: 0, ws: null, steamid: 0n, session: 0, jobs: new Map(), nextJob: 1n, tokens: [], tickets: [], acks: new Map(),
+      this.s = { state: 0, ws: null, steamid: 0n, session: 0, jobs: new Map(), nextJob: 1n, tokens: [], tickets: [], acks: new Map(), acked: new Set(),
                  owner: new Map(), name: '', appid: 0, reqs: new Map(), nextReq: 1, seq: 0, heartbeat: 0 };
       return this.s;
     },
@@ -279,7 +279,7 @@ addToLibrary({
           if (tcp.length) try { localStorage.setItem('uew_steam_cms_tcp', JSON.stringify(tcp.slice(0, 12))); } catch (e) { }
           break;
         }
-        case E.ClientAuthListAck: for (const c of pb.all(m, 1)) { const w = s.acks.get(Number(c)); if (w) w(); } break;
+        case E.ClientAuthListAck: for (const c of pb.all(m, 1)) { const w = s.acks.get(Number(c)); if (w) w(); s.acked.add(Number(c)); } break;
       }
     },
 
@@ -517,7 +517,7 @@ addToLibrary({
         </form>
         <div style="width:200px;text-align:center">
           <div style="font-size:12px;font-weight:600;color:#1999ff;letter-spacing:.5px;margin:6px 0 10px">OR SIGN IN WITH QR</div>
-          <canvas data-qr width="200" height="200" style="width:200px;height:200px;background:#fff;border-radius:6px"></canvas>
+          <canvas data-qr width="200" height="200" style="position:static;inset:auto;display:block;margin:0 auto;aspect-ratio:auto;max-width:none;max-height:none;width:200px;height:200px;background:#fff;border-radius:6px"></canvas>
           <div data-qrmsg style="font-size:12px;color:#8f98a0;margin-top:8px;min-height:32px">Getting a code from Steam…</div>
         </div>
       </div>`;
@@ -627,15 +627,17 @@ addToLibrary({
       a.set(crypto.getRandomValues(new Uint8Array(8)), o + 12);
       dv.setUint32(o + 20, performance.now() >>> 0, true); dv.setUint32(o + 24, ++s.seq, true);
       const crc = this.crc32(a);
+      // Steam checks a ticket against this list: a service handed it before Steam acknowledges it rejects it as invalid
+      const acked = new Promise(r => s.acks.set(crc, () => { s.acks.delete(crc); r(true); }));
       s.tickets.push({ appid, crc, ticket: a, secret: identity ? new TextEncoder().encode('str:' + identity + '\0') : null });
       this.sendAuthList();
-      const raw = a.length + 4 + owner.length, size = type === 5 ? Math.max(raw, 2560) : raw;
-      const out = new Uint8Array(size);
+      // the ticket's own length, web API ones too: the EOS SDK refuses a ticket padded to the 2560-byte buffer size
+      // before sending it to Epic
+      const out = new Uint8Array(a.length + 4 + owner.length);
       out.set(a);
       new DataView(out.buffer).setUint32(a.length, owner.length, true);
       out.set(owner, a.length + 4);
-      if (size > raw) out.set(crypto.getRandomValues(new Uint8Array(size - raw)), raw);
-      return { crc, bytes: out };
+      return { crc, bytes: out, acked };
     },
     sendAuthList() {
       const s = this.get(), pb = this.pb;
@@ -700,6 +702,8 @@ addToLibrary({
       for (let i = 0; i < 50 && !uewSCM.get().tokens.length; i++) await new Promise(r => setTimeout(r, 100));
       const t = uewSCM.ticket(appid, type, id);
       if (!t) throw new Error('no game connect token from Steam');
+      const ok = await Promise.race([t.acked, new Promise(r => setTimeout(() => r(false), 5000))]);
+      uewSCM.log(`web API ticket for ${id || '(no identity)'}: ${t.bytes.length} bytes, ${ok ? 'registered with Steam' : 'not acknowledged by Steam in 5 s'}`);
       return t;
     });
   },
@@ -708,6 +712,9 @@ addToLibrary({
     const u = HEAPU8.slice(data, data + len);
     return uewSCM.request(() => uewSCM.encryptedTicket(appid, u));
   },
+  // 1 once Steam has acknowledged the ticket with this CRC
+  scm_ticket_acked__proxy: 'sync', scm_ticket_acked__deps: ['$uewSCM'], scm_ticket_acked__sig: 'ii',
+  scm_ticket_acked: function (crc) { return uewSCM.get().acked.has(crc >>> 0) ? 1 : 0; },
   scm_req_status__proxy: 'sync', scm_req_status__deps: ['$uewSCM'], scm_req_status__sig: 'ii',
   scm_req_status: function (id) { const r = uewSCM.get().reqs.get(id); return r ? r.status : 2; },
   // the finished request's bytes (and ticket CRC): its length; the request is kept until scm_req_free

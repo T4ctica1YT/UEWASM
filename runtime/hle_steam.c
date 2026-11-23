@@ -60,6 +60,7 @@ int scm_req_status(int id);
 int scm_req_take(int id, void* buf, int cap, uint32_t* crc);
 void scm_req_free(int id);
 void scm_cancel(uint32_t crc);
+int scm_ticket_acked(uint32_t crc);
 #else
 static int scm_start(int appid) { (void)appid; return 0; }
 static int scm_state(void) { return -1; }
@@ -70,6 +71,7 @@ static int scm_req_status(int i) { (void)i; return 2; }
 static int scm_req_take(int i, void* b, int n, uint32_t* c) { (void)i; (void)b; (void)n; (void)c; return 0; }
 static void scm_req_free(int i) { (void)i; }
 static void scm_cancel(uint32_t c) { (void)c; }
+static int scm_ticket_acked(uint32_t c) { (void)c; return 1; }
 static int ww_init(int appid) { (void)appid; return 0; }
 static int ww_state(void) { return -1; }
 static int ww_self(char* b, int n) { if (n) b[0] = 0; return 0; }
@@ -544,9 +546,20 @@ static int nwtix;
 static struct { uint32_t handle, crc; } stix[32];
 static int nstix;
 static uint32_t next_ticket = 0x100;
+/* session tickets whose GetAuthSessionTicketResponse_t waits for Steam to acknowledge them (or 5 s) */
+static struct { uint32_t handle, crc; uint64_t until; } ptix[16];
+static int nptix;
 
 static void poll_tickets(CPU* c)
 {
+    for (int i = 0; i < nptix; i++) {
+        if (!scm_ticket_acked(ptix[i].crc) && host_ticks_ns() < ptix[i].until) continue;
+        uint8_t d[8] = { 0 };
+        w32(d, ptix[i].handle); w32(d + 4, 1);   /* GetAuthSessionTicketResponse_t */
+        post(c, 163, d, 8);
+        if (dbg_steam()) host_log("[steam] session ticket %u %s", ptix[i].handle, scm_ticket_acked(ptix[i].crc) ? "registered" : "not acknowledged in 5 s");
+        ptix[i--] = ptix[--nptix];
+    }
     for (int i = 0; i < nwtix; i++) {
         int st = scm_req_status(wtix[i].req);
         if (!st) continue;
@@ -831,8 +844,8 @@ static void ww_method(CPU* c, int unused, int n)
             if (pcb) ST32(pcb, (uint32_t)(n > 0 ? n : 0));
             uint8_t d[8] = { 0 };
             uint32_t h = n > 0 ? next_ticket++ : 0;
-            w32(d, h); w32(d + 4, n > 0 ? 1 : 2);   /* GetAuthSessionTicketResponse_t */
-            queue_post(163, d, 8);
+            if (n > 0 && nptix < 16) { ptix[nptix].handle = h; ptix[nptix].crc = crc; ptix[nptix++].until = host_ticks_ns() + 5000000000ull; }
+            else { w32(d, h); w32(d + 4, n > 0 ? 1 : 2); queue_post(163, d, 8); }   /* GetAuthSessionTicketResponse_t */
             if (n > 0 && nstix < 32) { stix[nstix].handle = h; stix[nstix++].crc = crc; }
             r = h;
         } else if (is(m, "CancelAuthTicket") && scm_on) {

@@ -49,6 +49,54 @@ static int dbg = -1;
 
 /* ---- the root store as BearSSL trust anchors ---- */
 
+/* ?httpdebug=1: HTTPS requests (method, host, path; form fields by name, values only for ones that say what kind of
+   request it is) and the status of each answer, with the body of failed ones: what a service answered when a game
+   reports a sign-in error. Credentials, tokens and successful answers' bodies are never logged. */
+static int httpdbg = -1;
+static int http_debug(void) { if (httpdbg < 0) httpdbg = host_query_flag("httpdebug"); return httpdbg; }
+static void http_log_request(const char* host, const unsigned char* p, size_t n)
+{
+    static const char* methods[] = { "GET ", "POST ", "PUT ", "PATCH ", "DELETE ", 0 };
+    int m = 0;
+    while (methods[m] && (n < strlen(methods[m]) || memcmp(p, methods[m], strlen(methods[m])))) m++;
+    if (!methods[m]) return;
+    size_t q = strlen(methods[m]);
+    while (q < n && q < 300 && p[q] != '\r' && p[q] != '?' && p[q] != ' ') q++;
+    char line[1024];
+    int o = snprintf(line, sizeof line, "%.*s%s%.*s", (int)strlen(methods[m]), (const char*)p, host, (int)(q - strlen(methods[m])), (const char*)p + strlen(methods[m]));
+    const unsigned char* body = NULL;
+    for (size_t i = 0; i + 3 < n; i++) if (!memcmp(p + i, "\r\n\r\n", 4)) { body = p + i + 4; break; }
+    if (body && body < p + n && *body != '{') {
+        static const char* shown[] = { "grant_type", "external_auth_type", "token_type", "scope", 0 };
+        const unsigned char* b = body, *end = p + n;
+        while (b < end && o < (int)sizeof line - 80) {
+            const unsigned char* eq = b, *amp;
+            while (eq < end && *eq != '=' && *eq != '&') eq++;
+            amp = eq;
+            while (amp < end && *amp != '&') amp++;
+            int show = 0;
+            for (int k = 0; shown[k]; k++) if ((size_t)(eq - b) == strlen(shown[k]) && !memcmp(b, shown[k], eq - b)) show = 1;
+            size_t vl = eq < amp ? (size_t)(amp - eq - 1) : 0;
+            if (show && vl < 64) o += snprintf(line + o, sizeof line - o, " %.*s", (int)(amp - b), (const char*)b);
+            else o += snprintf(line + o, sizeof line - o, " %.*s=(%u chars)", (int)(eq - b) < 40 ? (int)(eq - b) : 40, (const char*)b, (unsigned)vl);
+            b = amp < end ? amp + 1 : end;
+        }
+    }
+    host_log("[http] %s", line);
+}
+static void http_log_response(const char* host, const unsigned char* p, size_t n)
+{
+    if (n < 12 || memcmp(p, "HTTP/1.", 7)) return;
+    int status = atoi((const char*)p + 9);
+    size_t e = 0;
+    while (e < n && e < 120 && p[e] != '\r') e++;
+    const unsigned char* body = NULL;
+    for (size_t i = 0; i + 3 < n; i++) if (!memcmp(p + i, "\r\n\r\n", 4)) { body = p + i + 4; break; }
+    if ((status >= 200 && status < 300) || !body) { host_log("[http] %s: %.*s", host, (int)e, (const char*)p); return; }
+    size_t bl = (size_t)(p + n - body);
+    host_log("[http] %s: %.*s: %.*s", host, (int)e, (const char*)p, (int)(bl < 800 ? bl : 800), (const char*)body);
+}
+
 static br_x509_trust_anchor* anchors;
 static size_t nanchors;
 
@@ -304,6 +352,7 @@ static uint32_t isc(uint64_t cred, uint64_t ctxh, const char* target, uint32_t r
                 if (n >= sizeof k->alpn_store[0] || o2 + 1 + n > size) break;
                 memcpy(k->alpn_store[k->nalpn], G2H(p + 11 + o2), n);
                 k->alpn_store[k->nalpn][n] = 0;
+                if (http_debug() && !strcmp(k->alpn_store[k->nalpn], "h2")) { o2 += 1 + n; continue; }   /* readable HTTP/1.1 */
                 k->alpn[k->nalpn] = k->alpn_store[k->nalpn];
                 k->nalpn++;
                 o2 += 1 + n;
@@ -424,6 +473,7 @@ HLE(EncryptMessage)
     const unsigned char* p = G2H(LDP(db + 8));
     size_t n = LD32(db), sent = 0;
     Bytes o = { 0 };
+    if (http_debug()) http_log_request(k->host, p, n);
     while (sent < n) {
         unsigned st = br_ssl_engine_current_state(&k->sc.eng);
         if (st & BR_SSL_CLOSED) { free(o.p); RET(bearssl_status(k)); return; }
@@ -490,6 +540,7 @@ HLE(DecryptMessage)
     if (rl < n) set_buf(desc_buf(d, 3), SECBUFFER_EXTRA, base + rl, (uint32_t)(n - rl));
     else set_buf(desc_buf(d, 3), SECBUFFER_EMPTY, 0, 0);
     if (A4) ST32(A4, 0);
+    if (http_debug()) http_log_response(k->host, p + 5, got);
     RET(SEC_E_OK);
 }
 

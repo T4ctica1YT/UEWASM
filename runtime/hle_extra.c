@@ -158,7 +158,6 @@ HLE(GetLargePageMinimum) { RET(0); }
 HLE(VirtualUnlock) { RET(1); }
 HLE(DebugBreak) { host_log("[debug] DebugBreak at %llx", (unsigned long long)LD64(R(4))); }
 HLE(DeviceIoControl) { hle_set_error(1); RET(0); }
-HLE(ReOpenFile) { hle_set_error(6); RET((uint64_t)-1); }
 HLE(ReadConsoleA) { RET(0); }
 HLE(EventWriteTransfer) { RET(0); }
 
