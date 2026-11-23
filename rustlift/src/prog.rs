@@ -1,4 +1,4 @@
-// Function discovery for one module: the Rust form of lift.py's Program (roots, regions, jump tables).
+// Function discovery for one module (roots, regions, jump tables).
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -50,7 +50,7 @@ fn fs_load(ins: &Instruction) -> bool {
         && ins.op1_kind() == OpKind::Memory && ins.memory_segment() == Register::FS
 }
 
-/// part of a 32-bit MSVC prologue: frame, saved registers, locals, EH registration, /GS cookie (lift.py: _prologue_ins)
+/// part of a 32-bit MSVC prologue: frame, saved registers, locals, EH registration, /GS cookie
 fn prologue_ins(ins: &Instruction, prev: Option<&Instruction>) -> bool {
     let imm = |k: OpKind| k == OpKind::Immediate8to32 || k == OpKind::Immediate32;
     let k0 = ins.op0_kind();
@@ -267,7 +267,7 @@ impl Program {
     }
 
     /// bytes pushed for each call through a register or vtable in the block at lab: counted from the end of the
-    /// function's prologue, the block's start or the last call (lift.py: site_args)
+    /// function's prologue, the block's start or the last call
     fn site_args(&self, cache: &mut HashMap<u64, Instruction>, root: u64, lab: u64, labels: &BTreeSet<u64>, out: &mut Vec<(u64, u32)>) {
         let (mut a, mut n, mut prologue) = (lab, 0u64, lab == root);
         let mut prev: Option<Instruction> = None;
@@ -375,7 +375,7 @@ impl Program {
 
     /// 32-bit images without a function table sometimes keep pointer tables inside .text (the CRT's initializer lists
     /// in msvcr90, for one): a relocated pointer there counts when it is aligned and its target follows a ret or padding,
-    /// as a function start does (jump-table case labels usually don't). Same rule as lift.py.
+    /// as a function start does (jump-table case labels usually don't).
     fn code_table_target(&self, site: u64, v: u64) -> bool {
         if self.m.bits != 32 || site & 3 != 0 {
             return false;

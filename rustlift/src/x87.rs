@@ -1,4 +1,4 @@
-// x87 floating point: the Rust form of x87.py (the register stack lives in the CPU struct as doubles).
+// x87 floating point (the register stack lives in the CPU struct as doubles).
 use iced_x86::{OpKind, Register};
 
 use crate::func::{Func, Unsup, R};

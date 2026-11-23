@@ -1,5 +1,5 @@
-// uewlift: the fast lifter. build.py (recompile with lifter="rust") writes a job file describing each module, runs this,
-// and reads back the roots and the unsupported-instruction counts; the C it writes matches the Python lifter's.
+// uewlift: the lifter. uewrecomp writes a job file describing each module, runs this, and reads back the roots and
+// the unsupported-instruction counts.
 mod func;
 mod prog;
 mod sse;
@@ -32,7 +32,7 @@ struct Rx {
     f_ref: Regex,
 }
 
-/// SPILL/FILL/FILLV expansion and XMM locals (build.py regs_local)
+/// SPILL/FILL/FILLV expansion and XMM locals
 fn regs_local(rx: &Rx, body: Vec<String>, bits: u32) -> (Vec<String>, Vec<u32>) {
     const VOLATILE: [u32; 8] = [0, 1, 2, 4, 8, 9, 10, 11];
     let text = body.join("\n");
@@ -57,7 +57,7 @@ fn regs_local(rx: &Rx, body: Vec<String>, bits: u32) -> (Vec<String>, Vec<u32>) 
     (out, xused)
 }
 
-/// written the way Python's write_text does (CRLF on Windows), so switching lifters doesn't touch unchanged files
+/// written with CRLF line ends on Windows (as the generated files always were), so a relift leaves unchanged files alone
 fn write_if_changed(path: &Path, text: &str) {
     let text = if cfg!(windows) { text.replace('\n', "\r\n") } else { text.to_string() };
     if let Ok(old) = std::fs::read_to_string(path) {

@@ -1,7 +1,7 @@
 /* x87 floating point as 32-bit MSVC code uses it (Unreal Engine 3, Scaleform and the CRT's maths helpers): loads and
    stores in every width, integer conversion under each rounding mode, compares read through fnstsw/sahf and fcomi,
    the transcendental and scaling instructions, and the control word. Built only as a 32-bit program
-   (python tests/run_tests.py --x86 x87); the 64-bit build prints a single line. Results are printed rounded to 12
+   (uewtest run --x86 x87); the 64-bit build prints a single line. Results are printed rounded to 12
    significant digits, as the recompiled code computes in double precision. */
 #include <stdio.h>
 #include <math.h>

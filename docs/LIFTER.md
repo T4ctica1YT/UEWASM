@@ -19,13 +19,14 @@ you can debug it with ordinary tools.
 
 ### 1. Reproduce outside the game
 
-Find a small program that runs the same code. Library code is often available elsewhere: Python's install ships
+Find a small program that runs the same code. Library code is often available elsewhere: a Python install ships
 OpenSSL (`libcrypto-3.dll`), zlib and SQLite DLLs, and a test exe can `LoadLibrary` one and call its exports.
-`tests/aes/run_aes.py` is the pattern:
+`uewtest aes` (`aes()` in `rustlift/src/bin/uewtest/suites.rs`, with `tests/aes/aes.c`) is the pattern:
 
 1. compile a test exe that prints hashes of its results,
 2. run it natively,
-3. `build.recompile(exe, out, extra=[dll])`, then `build.build_native(out)`,
+3. recompile it with the DLL as an extra module (`build::recompile(exe, out, .., &[dll], ..)`), then
+   `build::build_native(out)`,
 4. run the recompiled program and compare line by line.
 
 Libraries pick code paths from CPUID, so force the path the runtime takes. The runtime reports SSE up to SSE4.2 and
@@ -52,15 +53,15 @@ it's open (OpenSSL's perlasm, for example).
 ### 4. Instrument it
 
 Add a `printf` at a label inside the lifted function (a loop head, say), rebuild with `build_native` (it recompiles
-only changed files), and compare against a reference implementation written in Python. The first value that differs
-points at the instructions in between. Don't re-run `recompile` afterwards, or it regenerates the file and removes your
-prints.
+only changed files), and compare against a reference implementation (a few lines of C built natively, or any
+language you like for a throwaway check). The first value that differs points at the instructions in between. Don't
+re-run `recompile` afterwards, or it regenerates the file and removes your prints.
 
 ### 5. Fix it and add a test
 
 Fix the lifter (`rustlift/src/func.rs` for instructions and calls, `sse.rs`, `x87.rs`) or the runtime. Then add the
-case to a test that compares against native: a form to `tests/isa/run_isa.py` for one instruction, or a program like
-`tests/aes/` for a pattern.
+case to a test that compares against native: a form in `rustlift/src/bin/uewtest/isa.rs` for one instruction, or a
+program like `tests/aes/` with its suite in `uewtest` for a pattern.
 
 ## Assumptions the lifter makes
 

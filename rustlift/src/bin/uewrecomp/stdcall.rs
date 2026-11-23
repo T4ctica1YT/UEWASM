@@ -1,5 +1,5 @@
 //! Bytes a 32-bit system function pops on return (stdcall), read from the `ret N` in Windows' own SysWOW64 copy.
-//! Results are cached in uewasm/recomp/stdcall32.json, so builds on machines without SysWOW64 still get them.
+//! Results are cached in assets/stdcall32.json, so builds on machines without SysWOW64 still get them.
 use crate::pe::{self, Export, Pe};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -220,7 +220,7 @@ impl Stdcall {
 
     pub fn save(&self) {
         if self.dirty && self.wow.is_dir() {
-            // the same layout Python's json.dumps(indent=0, sort_keys=True) wrote, so the file diffs cleanly
+            // one sorted key per line, the file's layout since it was first written, so it diffs cleanly
             let body: Vec<String> = self.cache.iter().map(|(k, v)| format!("{}: {v}", serde_json::to_string(k).unwrap())).collect();
             let _ = std::fs::write(&self.cache_path, format!("{{\n{}\n}}", body.join(",\n")));
         }

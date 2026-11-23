@@ -1,6 +1,6 @@
 // UEWASM desktop app (egui): pick a game, choose build settings, and recompile with live progress and a time estimate.
-// The build itself runs in the UEWASM command line (uewasm-cli.exe beside this app, or uewasm.py with Python), which
-// reports its stages on stdout (--progress).
+// The build itself runs in the UEWASM command line (uewasm-cli.exe beside this app, or a checkout's rustlift build),
+// which reports its stages on stdout (--progress). Tools a setting needs are checked first and can be installed here.
 #![windows_subsystem = "windows"]
 
 mod build;
@@ -29,8 +29,8 @@ const VIDEOS: &[(&str, i32, &str)] = &[("Keep original videos", 0, "fast"), ("Sh
 const RESOLUTIONS: &[&str] = &["1280x720", "1600x900", "1920x1080", "960x540", "native"];
 
 fn main() -> eframe::Result {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../uewasm/assets/logo_44.png")).ok();
-    let mut vp = egui::ViewportBuilder::default().with_title("UEWASM").with_inner_size([900.0, 760.0]).with_min_inner_size([780.0, 640.0]);
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo_44.png")).ok();
+    let mut vp = egui::ViewportBuilder::default().with_title("UEWASM").with_inner_size([920.0, 860.0]).with_min_inner_size([780.0, 640.0]);
     if let Some(i) = icon {
         vp = vp.with_icon(i);
     }
@@ -50,8 +50,14 @@ struct App {
     finished: Option<String>,
     last_web: Option<PathBuf>,
     server: Option<serve::Server>,
-    tools: String,
+    tools: serde_json::Value,
+    tools_err: Option<String>,
     error: Option<String>,
+    /// tools the chosen settings need that are missing, asked about one at a time before the build starts
+    needs: Vec<serde_json::Value>,
+    /// the running job is an install (its key); the build starts after it when resume is set
+    installing: Option<String>,
+    resume: bool,
 }
 
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) {
@@ -74,11 +80,79 @@ fn fmt_time(s: f64) -> String {
 impl App {
     fn new() -> App {
         let s = Settings::load();
-        let tools = build::check_tools();
         let mut a = App { s, info: String::new(), described: "\u{0}".into(), job: None, est: None, stage: "Ready".into(), stage_frac: Some(0.0),
-            log: String::new(), started: None, finished: None, last_web: None, server: None, tools, error: None };
+            log: String::new(), started: None, finished: None, last_web: None, server: None, tools: serde_json::Value::Null, tools_err: None,
+            error: None, needs: vec![], installing: None, resume: false };
+        a.check_tools();
         a.describe();
         a
+    }
+
+    fn check_tools(&mut self) {
+        match build::doctor(&self.s.emsdk, false, false, false) {
+            Ok(v) => {
+                self.tools = v["status"].clone();
+                self.tools_err = None;
+            }
+            Err(e) => self.tools_err = Some(e),
+        }
+    }
+
+    fn videos_on(&self) -> bool {
+        VIDEOS.iter().find(|v| v.0 == self.s.videos).map_or(false, |v| v.1 != 0)
+    }
+
+    /// starts an install through the command line; with resume the build starts once it succeeds
+    fn install(&mut self, key: &str, resume: bool) {
+        let mut args = vec!["install".to_string(), key.to_string()];
+        if key == "emsdk" {
+            let dir = if self.s.emsdk.trim().is_empty() {
+                Path::new(&std::env::var("USERPROFILE").unwrap_or_default()).join("emsdk").to_string_lossy().into_owned()
+            } else {
+                self.s.emsdk.trim().to_string()
+            };
+            args.push(dir);
+        }
+        self.log.push_str(&format!("Installing {key}…\n"));
+        self.stage = format!("Installing {key}…");
+        self.stage_frac = None;
+        self.started = Some(Instant::now());
+        self.est = None;
+        match Job::start(&args, "") {
+            Ok(j) => {
+                self.job = Some(j);
+                self.installing = Some(key.to_string());
+                self.resume = resume;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// what the settings need, then the build; a missing tool opens its question first
+    fn request_start(&mut self) {
+        self.error = None;
+        match build::doctor(&self.s.emsdk, self.s.native, self.s.wasm_opt, self.videos_on()) {
+            Ok(v) => {
+                self.tools = v["status"].clone();
+                self.needs = v["missing"].as_array().cloned().unwrap_or_default();
+            }
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        }
+        if self.needs.is_empty() {
+            self.start();
+        }
+    }
+
+    fn turn_off(&mut self, key: &str) {
+        match key {
+            "binaryen" => self.s.wasm_opt = false,
+            "msvc" => self.s.native = false,
+            "ffmpeg" => self.s.videos = VIDEOS[0].0.into(),
+            _ => {}
+        }
     }
 
     fn describe(&mut self) {
@@ -181,7 +255,7 @@ impl App {
         self.started = Some(Instant::now());
         let stages: Vec<&str> = build::STAGES.iter().copied().filter(|s| self.s.native || !s.starts_with("native")).collect();
         self.est = Some(Estimator::new(&stages, 1.0));
-        match Job::start(&args) {
+        match Job::start(&args, &self.s.emsdk) {
             Ok(j) => self.job = Some(j),
             Err(e) => {
                 self.finish("Failed");
@@ -227,6 +301,25 @@ impl App {
                 }
             }
         }
+        if let (Some(code), Some(key)) = (exited, self.installing.clone()) {
+            self.installing = None;
+            self.job = None;
+            self.stage_frac = Some(if code == 0 { 1.0 } else { 0.0 });
+            self.check_tools();
+            if code == 0 {
+                self.stage = format!("Installed {key}");
+                if key == "emsdk" && self.s.emsdk.trim().is_empty() {
+                    if let Some(p) = self.tools["emsdk"].as_str() { self.s.emsdk = p.to_string(); }
+                }
+                if std::mem::take(&mut self.resume) { self.request_start(); }
+            } else {
+                self.stage = format!("Installing {key} failed");
+                self.resume = false;
+                let tail: Vec<&str> = self.log.lines().rev().take(6).collect();
+                self.error = Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
+            }
+            return;
+        }
         if let Some(code) = exited {
             if self.last_web.is_some() && code == 0 {
                 if let Some(e) = &self.est { e.remember(); }
@@ -265,6 +358,9 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new("Windows x64 and x86 games to WebAssembly").weak());
             });
             ui.add_space(6.0);
+            // the form scrolls, so the buttons, progress and log below it stay in view
+            let form_h = (ui.available_height() - 200.0).max(160.0);
+            egui::ScrollArea::vertical().id_salt("form").max_height(form_h).auto_shrink([false, true]).show(ui, |ui| {
             ui.group(|ui| {
                 ui.label(egui::RichText::new("Game").strong());
                 egui::Grid::new("game").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -359,11 +455,54 @@ impl eframe::App for App {
                 let (note, _) = self.aes_note();
                 if !note.is_empty() { ui.label(egui::RichText::new(note).weak()); }
             });
+            ui.add_space(6.0);
+            // open by itself when Emscripten, which every build needs, wasn't found
+            let open = self.tools["emsdk"].is_null() || self.tools_err.is_some();
+            egui::CollapsingHeader::new(egui::RichText::new("Tools").strong()).id_salt("tools").default_open(open).show(ui, |ui| {
+                ui.label(egui::RichText::new("Every build needs Emscripten. Choose the folder it's installed in (the one with emsdk.bat), or let UEWASM install it.").weak());
+                ui.horizontal(|ui| {
+                    ui.label("Emscripten SDK");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.s.emsdk).desired_width(420.0).hint_text("found automatically when blank"));
+                    if r.lost_focus() { self.s.save(); self.check_tools(); }
+                    if ui.button("Browse…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_title("Emscripten SDK folder").pick_folder() {
+                            self.s.emsdk = d.to_string_lossy().into();
+                            self.s.save();
+                            self.check_tools();
+                        }
+                    }
+                    if ui.add_enabled(!running, egui::Button::new("Install…")).clicked() { self.install("emsdk", false); }
+                });
+                let st = self.tools.clone();
+                let row = |ui: &mut egui::Ui, name: &str, v: &serde_json::Value, missing: &str| {
+                    let t = match v { serde_json::Value::String(s) => s.clone(), serde_json::Value::Bool(true) => "ok".into(), _ => missing.into() };
+                    ui.label(name);
+                    ui.label(egui::RichText::new(t).weak());
+                };
+                egui::Grid::new("toolgrid").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                    row(ui, "Emscripten", &st["emsdk"], "not found");
+                    ui.label(""); ui.end_row();
+                    row(ui, "Binaryen (shrink code)", &st["binaryen"], "not in this Emscripten install");
+                    ui.label(""); ui.end_row();
+                    row(ui, "Visual Studio C++ (native test .exe)", &st["msvc"], "not found");
+                    if st["msvc"].is_null() && st["winget"].as_bool() == Some(true) && ui.add_enabled(!running, egui::Button::new("Install…")).clicked() { self.install("msvc", false); }
+                    ui.end_row();
+                    row(ui, "Rust (the recompiler's tools)", &st["rust"], "not found");
+                    if st["rust"].is_null() && st["winget"].as_bool() == Some(true) && ui.add_enabled(!running, egui::Button::new("Install…")).clicked() { self.install("rust", false); }
+                    ui.end_row();
+                    row(ui, "ffmpeg (shrinking videos)", &st["ffmpeg"], "not found");
+                    if st["ffmpeg"].is_null() && ui.add_enabled(!running, egui::Button::new("Install…")).clicked() { self.install("ffmpeg", false); }
+                    ui.end_row();
+                });
+                if let Some(e) = &self.tools_err { ui.label(egui::RichText::new(e).color(egui::Color32::LIGHT_RED)); }
+                if ui.button("Check again").clicked() { self.check_tools(); }
+            });
+            });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let can = !running && self.aes_note().1;
                 if ui.add_enabled(can, egui::Button::new(egui::RichText::new("Recompile").strong()).min_size(egui::vec2(120.0, 30.0))).clicked() {
-                    self.start();
+                    self.request_start();
                 }
                 if ui.add_enabled(running, egui::Button::new("Cancel")).clicked() {
                     if let Some(j) = &mut self.job { j.cancel(); }
@@ -412,8 +551,44 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::multiline(&mut self.log.as_str()).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
                 });
             });
-            ui.label(egui::RichText::new(&self.tools).weak().small());
         });
+        if let Some(n) = self.needs.first().cloned() {
+            let s = |k: &str| n[k].as_str().unwrap_or("").to_string();
+            let mut choice = None;
+            egui::Window::new(s("title")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.set_max_width(520.0);
+                ui.label(s("text"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if let Some(l) = n["install"].as_str() { if ui.button(l).clicked() { choice = Some("install"); } }
+                    if n["browse"].as_bool() == Some(true) && ui.button("Choose its folder…").clicked() { choice = Some("browse"); }
+                    if let Some(l) = n["off"].as_str() { if ui.button(l).clicked() { choice = Some("off"); } }
+                    if n["url"].is_string() && ui.button("More info").clicked() { build::open(&s("url")); }
+                    if ui.button("Cancel").clicked() { choice = Some("cancel"); }
+                });
+            });
+            match choice {
+                Some("install") => {
+                    self.needs.clear();
+                    self.install(&s("key"), true);
+                }
+                Some("browse") => {
+                    if let Some(d) = rfd::FileDialog::new().set_title("Emscripten SDK folder").pick_folder() {
+                        self.s.emsdk = d.to_string_lossy().into();
+                        self.s.save();
+                        self.needs.clear();
+                        self.request_start();
+                    }
+                }
+                Some("off") => {
+                    self.turn_off(&s("key"));
+                    self.needs.remove(0);
+                    if self.needs.is_empty() { self.start(); }
+                }
+                Some(_) => self.needs.clear(),
+                None => {}
+            }
+        }
         if let Some(e) = self.error.clone() {
             let mut open = true;
             egui::Window::new("UEWASM").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).open(&mut open).show(ui.ctx(), |ui| {

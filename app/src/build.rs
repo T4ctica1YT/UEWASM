@@ -1,5 +1,5 @@
-// Running a build: the UEWASM command line in a child process, its --progress lines turned into messages, and the
-// time estimate (the same model and stored rates as the Python app).
+// Running a build: the UEWASM command line (uewasm-cli) in a child process, its --progress lines turned into
+// messages, and the time estimate (stored rates from past builds).
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -43,37 +43,53 @@ fn command(exe: &Path) -> Command {
     c
 }
 
-/// how to run the command line: uewasm-cli.exe beside this app (the packaged build), else uewasm.py with a Python found
-/// near it (a checkout)
-fn cli() -> Result<(PathBuf, Vec<String>), String> {
+fn cargo() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("cargo.exe")).find(|p| p.exists()))
+        .or_else(|| Some(Path::new(&home).join(".cargo/bin/cargo.exe")).filter(|p| p.exists()))
+}
+
+/// the command line: uewasm-cli.exe beside this app (the release), else a checkout's rustlift build (built with cargo
+/// when it's missing)
+fn cli() -> Result<PathBuf, String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = me.parent().unwrap_or(Path::new("."));
-    let packaged = dir.join("uewasm-cli.exe");
+    let packaged = me.parent().unwrap_or(Path::new(".")).join("uewasm-cli.exe");
     if packaged.exists() {
-        return Ok((packaged, vec![]));
+        return Ok(packaged);
     }
     for d in me.ancestors() {
-        let script = d.join("uewasm.py");
-        if !script.exists() {
+        let toml = d.join("rustlift/Cargo.toml");
+        if !toml.exists() {
             continue;
         }
-        let pythons = [d.join(".venv/Scripts/python.exe"), d.join("../.venv/Scripts/python.exe"), d.join("venv/Scripts/python.exe")];
-        for p in pythons {
-            if p.exists() {
-                return Ok((p, vec!["-u".into(), script.to_string_lossy().into()]));
+        let exe = d.join("rustlift/target/release/uewasm-cli.exe");
+        if !exe.exists() {
+            let cargo = cargo().ok_or("UEWASM's command line isn't built and Rust isn't installed (https://rustup.rs)")?;
+            let o = command(&cargo).args(["build", "--release", "--bin", "uewasm-cli", "--manifest-path"]).arg(&toml).output().map_err(|e| e.to_string())?;
+            if !o.status.success() {
+                let e = String::from_utf8_lossy(&o.stderr);
+                return Err(format!("couldn't build uewasm-cli:\n{}", &e[e.len().saturating_sub(1500)..]));
             }
         }
-        for p in ["py", "python", "python3"] {
-            if command(Path::new(p)).arg("--version").output().map_or(false, |o| o.status.success()) {
-                let mut a = vec![];
-                if p == "py" { a.push("-3".into()); }
-                a.extend(["-u".into(), script.to_string_lossy().into()]);
-                return Ok((PathBuf::from(p), a));
-            }
-        }
-        return Err("UEWASM needs Python 3 to build (no Python found)".into());
+        return Ok(exe);
     }
-    Err("can't find the UEWASM command line (uewasm-cli.exe or uewasm.py)".into())
+    Err("can't find the UEWASM command line (uewasm-cli.exe)".into())
+}
+
+/// the toolchain's state and what the given settings still need (uewasm-cli doctor --json)
+pub fn doctor(emsdk: &str, native: bool, wasm_opt: bool, videos: bool) -> Result<serde_json::Value, String> {
+    let mut c = command(&cli()?);
+    c.args(["doctor", "--json"]);
+    if !emsdk.trim().is_empty() {
+        c.args(["--emsdk", emsdk.trim()]);
+    }
+    for (on, f) in [(native, "--native"), (wasm_opt, "--wasm-opt"), (videos, "--videos")] {
+        if on {
+            c.arg(f);
+        }
+    }
+    let o = c.output().map_err(|e| e.to_string())?;
+    serde_json::from_slice(&o.stdout).map_err(|_| String::from_utf8_lossy(&o.stderr).trim().to_string())
 }
 
 pub enum Msg {
@@ -91,10 +107,14 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn start(args: &[String]) -> Result<Job, String> {
-        let (exe, pre) = cli()?;
-        let mut child = command(&exe).args(&pre).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null())
-            .env("PYTHONIOENCODING", "utf-8").spawn().map_err(|e| format!("couldn't start {}: {e}", exe.display()))?;
+    pub fn start(args: &[String], emsdk: &str) -> Result<Job, String> {
+        let exe = cli()?;
+        let mut c = command(&exe);
+        c.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        if !emsdk.trim().is_empty() {
+            c.env("UEWASM_EMSDK", emsdk.trim());
+        }
+        let mut child = c.spawn().map_err(|e| format!("couldn't start {}: {e}", exe.display()))?;
         let (tx, rx) = channel();
         let out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
@@ -303,21 +323,8 @@ fn base64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// one-line toolchain status for the bottom of the window
-pub fn check_tools() -> String {
-    let mut parts = vec![];
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    // %USERPROFILE%\emsdk, or the drive root where emsdk's own instructions often put it
-    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
-    let em = std::env::var("EMSDK").ok().map(PathBuf::from).into_iter()
-        .chain([Path::new(&home).join("emsdk"), Path::new(&format!("{drive}\\")).join("emsdk")])
-        .any(|d| d.join("upstream/emscripten").is_dir());
-    parts.push(if em { "Emscripten: found".to_string() } else { "Emscripten: NOT FOUND (install emsdk to %USERPROFILE%\\emsdk or set EMSDK)".into() });
-    parts.push(match cli() { Ok((p, _)) => format!("builder: {}", p.file_name().unwrap_or_default().to_string_lossy()), Err(e) => e });
-    parts.join(" · ")
-}
-
 /// a URL or folder in the default app
 pub fn open(what: &str) {
-    let _ = command(Path::new("cmd")).args(["/c", "start", "", what]).spawn();
+    let comspec = std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+    let _ = command(Path::new(&comspec)).args(["/c", "start", "", what]).spawn();
 }

@@ -129,7 +129,7 @@ These don't change the result, only how long the build takes:
 For a mid-range PC and a UE4 game:
 
 ```
-python uewasm.py recomp "C:\Games\MyGame" --threads real --quality medium --resolution 1280x720 --fps
+uewasm-cli recomp "C:\Games\MyGame" --threads real --quality medium --resolution 1280x720 --fps
 ```
 
 If it's still slow, drop to `--quality low` and `--resolution 960x540`. If it stutters only in new areas, that's

@@ -24,9 +24,9 @@ game .exe + DLLs ──uewrecomp──▶ image.bin + gen/*.c ──uewbuild (em
 4. **Pack** (`rustlift/src/bin/uewpack.rs`). The game's own files are split into download parts the page fetches on
    demand.
 
-`uewasm/recomp/build.py` drives these steps. `uewasm/cli.py`, `uewasm/gui.py` and the desktop app (`app/`) are
-front ends that call it with options. The same lifted C also builds natively (`build_native`), which is how the tests
-compare the recompiled program with the original exe without a browser.
+`uewasm-cli` (`rustlift/src/bin/uewasm-cli/`, `build.rs`) drives these steps; the desktop app (`app/`) is a front end
+that runs it with options. The same lifted C also builds natively (`build_native`), which is how the tests compare
+the recompiled program with the original exe without a browser.
 
 ## The lifted code
 
@@ -89,16 +89,21 @@ writes goes to the save folder (`/save/<exe name>/`), which persists in the brow
 
 ## The tools
 
-All tools that ship with the release are Rust (`rustlift/`, one crate):
+Every tool is Rust (`rustlift/`, one crate):
 
 | Binary | Job |
 |---|---|
+| `uewasm-cli` | the command line: `recomp` runs the steps below in order, plus `serve`, `relay`, `test`, `doctor`, `install`, `coverage`, `disasm` |
 | `uewrecomp` | link, lift, `refresh` (bind runtime functions added since the lift), `game-dlls` |
 | `uewlift` | the lifter, run by `uewrecomp` |
 | `uewbuild` | compile and link the web build, write the page |
 | `uewpack` | split and compress game files |
 | `uewserve` | local server: headers for threads, byte ranges, the online relay and the WISP server |
 | `gen_steam_ifaces`, `gen_eos_api`, `gen_ca_roots` | generate `runtime/steam_ifaces.h`, `runtime/eos_api.h`, `runtime/ca_roots.h` from the SDK headers and Mozilla's roots |
+| `uewtest` | the test suites (`run`, `isa`, `aes`, `net`, `web`, `gfx`, `steam-pair`, `sse`) and shader tools |
+| `uewdist` | the release: builds everything and lays it out in `dist/` |
 
-The Python package (`uewasm/`) is the CLI and GUI layer and runs these binaries. The desktop app (`app/`) is Rust/egui
-and runs the CLI.
+`uewasm-cli`'s modules are shared: `uewtest` includes them with `#[path]` (the build steps, the DevTools client
+`cdp.rs` that drives headless Edge/Chrome, the `.pak` reader). The CLI finds the other tools beside itself, and in a
+checkout rebuilds them with cargo when their sources are newer. It finds `runtime/` and `assets/` from its own
+location (`UEWASM_HOME` overrides). The desktop app (`app/`) is Rust/egui and runs the CLI.

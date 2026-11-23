@@ -41,6 +41,8 @@ pub struct Settings {
     pub wisp_url: String,
     pub steam_wisp: bool,
     pub eos: String,
+    /// the Emscripten SDK folder (blank: found automatically), kept in settings.json where the command line reads it
+    pub emsdk: String,
 }
 
 impl Settings {
@@ -59,6 +61,8 @@ impl Settings {
             wasm_opt: b("wasm_opt", false), single: b("single", false), show_fps: b("show_fps", false), async_shaders: b("async_shaders", true),
             debug_panel: b("debug_panel", true), placeholders: b("placeholders", false), aes_on: b("aes_on", false), aes_key: String::new(), relay: b("relay", false), wisp: b("wisp", false), wisp_url: s("wisp_url", ""), steam_wisp: b("steam_wisp", false),
             eos: s("eos", "Stand-in in the page (offline sign-in, local lobbies)"),
+            emsdk: std::fs::read_to_string(settings_dir().join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| v["emsdk"].as_str().map(String::from)).unwrap_or_default(),
         }
     }
 
@@ -72,5 +76,11 @@ impl Settings {
             "async_shaders": self.async_shaders, "debug_panel": self.debug_panel, "placeholders": self.placeholders, "aes_on": self.aes_on,
         });
         let _ = std::fs::write(settings_dir().join("app_settings.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
+        let f = settings_dir().join("settings.json");
+        let mut shared: Value = std::fs::read_to_string(&f).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+        if shared.get("emsdk").and_then(|x| x.as_str()).unwrap_or("") != self.emsdk.trim() {
+            shared["emsdk"] = json!(self.emsdk.trim());
+            let _ = std::fs::write(f, serde_json::to_string_pretty(&shared).unwrap_or_default());
+        }
     }
 }

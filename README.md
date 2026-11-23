@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="uewasm/assets/logo.png" alt="UEWASM" width="200">
+  <img src="assets/logo.png" alt="UEWASM" width="200">
 </a>
 
   <br>
@@ -35,7 +35,7 @@ Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 ga
    relocates them into one guest address space and resolves imports the way Windows does. Microsoft's CRT DLLs and the
    game's own DLLs are recompiled too, so only the operating-system layer has to be reimplemented. SteamStub-wrapped
    executables are unwrapped, 32-bit C++/SEH exception frames are found, and 32-bit system calls get their stdcall
-   argument sizes from Windows' own DLLs (cached in `uewasm/recomp/stdcall32.json`).
+   argument sizes from Windows' own DLLs (cached in `assets/stdcall32.json`).
 2. **Discovery**: functions come from `.pdata` (including chained chunks), entry points, exports, relocated code
    pointers and call targets; switch tables are recovered per function family.
 3. **Lifter** (`uewlift`, `rustlift/src/`): each x86-64 (or 32-bit x86) function becomes a C function. Registers
@@ -45,8 +45,9 @@ Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 ga
 4. **Web build** (`uewbuild`, `uewpack`): compiles the C and the runtime with Emscripten and links them, cuts the game's
    files into parts for static hosts, and writes the page. `uewserve` serves a build (and the online relay).
 
-The tools in `rustlift/` are Rust and are built with cargo the first time they're needed (the release `UEWASM.exe`
-ships them). The Python package (`uewasm/`) is the command line and the Tkinter app that drive them.
+Every tool is Rust, in `rustlift/`: `uewasm-cli` is the command line that drives the others, `uewtest` runs the
+tests, and `uewdist` makes the release. From source they're built with cargo the first time they're needed; the
+release ships them.
 5. **Runtime** (`runtime/`):
    - guest heap, files (game data fetched on demand; a separate save folder), Win32/USER32 windowing and input;
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
@@ -61,34 +62,43 @@ ships them). The Python package (`uewasm/`) is the command line and the Tkinter 
    - XAudio2 2.7 (mixer, submixes, reverb, X3DAudio) and WASAPI on an AudioWorklet; Ogg Vorbis and VP8/VP9 video
      are decoded natively or by the browser's hardware decoder where the game ships libvorbis/libvpx.
 
-Desktop apps:
+The desktop app (`UEWASM.exe`, Rust and egui, in `app/`) runs the build through the command line beside it and serves
+finished builds itself. Its *Tools* section finds or installs Emscripten, Rust, the Visual Studio C++ tools and
+ffmpeg, and before a build it asks about anything the chosen settings need. It builds Unreal Engine 3 games the same
+way the command line does: *Guest memory* goes up to 15360 MB, and more than 3584 MB builds with 64-bit memory
+(`--mem64`; Rocket League needs about 7168 MB). *Resolution* offers `native` for the window's own pixel size.
 
-- `app/` (Rust, egui): `cargo build --release --target x86_64-pc-windows-msvc` in `app/`. It runs the build through the
-  command line (`uewasm-cli.exe` beside it, or `uewasm.py` with Python) and serves finished builds itself.
-- The original Tkinter app (the release `UEWASM.exe`): settings on tabs (*Build*, *Graphics & performance*, *Game
-  files*, *Online*, *Tools*), each with a note on what it does. `pip install pyinstaller`, then `python build_exe.py`
-  (writes `dist/UEWASM.exe`, with the Rust recompiler built in).
+From the command line:
 
-Both apps build Unreal Engine 3 games the same way the command line does: *Guest memory* goes up to 15360 MB, and
-more than 3584 MB builds with 64-bit memory (`--mem64`; Rocket League needs about 7168 MB). *Resolution* offers
-`native` for the window's own pixel size.
+```
+uewasm-cli recomp "C:\Games\MyGame" -o builds\MyGame -y      # recompile for the web (options below)
+uewasm-cli serve builds\MyGame\web                           # play it at http://localhost:8080
+uewasm-cli test builds\MyGame\web                            # run it in a headless browser and check it renders
+uewasm-cli doctor                                            # what's installed, what's missing
+```
+
+From source, build the tools once with `cargo build --release --manifest-path rustlift/Cargo.toml` (they land in
+`rustlift/target/release/`) and the app with `cargo build --release --target x86_64-pc-windows-msvc --manifest-path
+app/Cargo.toml`. `cargo run --release --manifest-path rustlift/Cargo.toml --bin uewdist` builds both and writes the
+release to `dist/UEWASM/` and `dist/UEWASM-<version>.zip`.
 
 ## Requirements
 
 - Windows 10/11, x64
-- Python 3.11+ (only for running from source; the release `UEWASM.exe` bundles it)
+- Rust (only for running from source; the release ships the tools built)
 - [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html). The desktop app finds it in
   `%USERPROFILE%\emsdk` or wherever the `EMSDK` environment variable points; another folder can be chosen on its
   *Tools* tab (or with `--emsdk PATH`). Without it, the app stops before building and offers to install it
-  (about 2.5 GB); `uewasm install-emsdk [folder]` does the same from the command line. The first build downloads
+  (about 2.5 GB); `uewasm-cli install-emsdk [folder]` does the same from the command line. The first build downloads
   Emscripten's libogg/libvorbis ports, so it needs an internet connection once.
 - A browser with WebGPU and JavaScript Promise Integration: current Chrome or Edge.
 - Only for some settings (the app checks before building, and offers to install what it can or to turn the setting
-  off; `uewasm doctor` lists them all):
+  off; `uewasm-cli doctor` lists them all, `uewasm-cli install <tool>` installs one):
   - Visual Studio Build Tools with C++ (MSVC): native verification builds (`--native`);
-  - Rust: building the recompiler's tools when running from source (`UEWASM.exe` bundles them; without them nothing
-    can be recompiled);
-  - Binaryen (part of Emscripten): `--wasm-opt`.
+  - Binaryen (part of Emscripten): `--wasm-opt`;
+  - ffmpeg: shrinking videos (`--video-height`); `uewasm-cli install ffmpeg` downloads a build of it;
+  - for videos inside Oodle-compressed `.pak` files, the game's own Oodle DLL (`oo2core_*_win64.dll`, found in the
+    install folder; `UEWASM_OODLE` points at another). Without one those videos keep their original size.
 
 ## UEWASM Status and Support
 
@@ -110,15 +120,15 @@ Here are the games used for Testing and some screenshots of the tool working
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
-      <img src="uewasm/assets/ss/hn.png" width="500" alt="Hello Neighbor Running in a Web browser">
+      <img src="assets/ss/hn.png" width="500" alt="Hello Neighbor Running in a Web browser">
     </td>
     <td align="center">
       <strong>Dispatch</strong><br>
-      <img src="uewasm/assets/ss/dispatch.png" width="500" alt="Dispatch Running in a Web browser">
+      <img src="assets/ss/dispatch.png" width="500" alt="Dispatch Running in a Web browser">
     </td>
     <td align="center">
       <strong>Dead As Disco</strong><br>
-      <img src="uewasm/assets/ss/DaD.png" width="500" alt="Dead as Disco Running in a Web browser">
+      <img src="assets/ss/DaD.png" width="500" alt="Dead as Disco Running in a Web browser">
     </td>
     
 ## Building Options
@@ -156,9 +166,9 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--placeholders` |N/A| With `--backend`, answer requests for downloadable content the build lacks with empty stand-in files. |
 | `--steam` | `webworks` (default), `account`, `offline` | `webworks`: Steam games sign in to a [WebWorks](https://github.com/Stratus-Games/Webworks) server for their Steam features (see below), and play with the offline Steam when no server answers. `account`: the player signs in to their own Steam account in the page, so the game gets the real SteamID, name and tickets its online services check with Valve (see [Official servers](#official-servers)). `offline`: no Steam server, as before. |
 | `--webworks-url` | URL (default `http://localhost:3000`) | The WebWorks server the page signs in to. `?webworks=URL` in the page address overrides it, `?steam=offline` turns it off. |
-| `--relay` |N/A| Online games: `uewasm serve` (and the apps' *Play in browser*) also runs the built-in relay at the game's own address, so everyone who opens the page can use lobbies and P2P together with no other server. |
-| `--relay-url` | URL | Online games: use a relay run elsewhere (`uewasm relay --port 3000`) at this address. |
-| `--wisp` |N/A| Real network connections: the game reaches its own servers through the WISP server `uewasm serve` runs at the game's address (see [Official servers](#official-servers)). |
+| `--relay` |N/A| Online games: `uewasm-cli serve` (and the app' *Play in browser*) also runs the built-in relay at the game's own address, so everyone who opens the page can use lobbies and P2P together with no other server. |
+| `--relay-url` | URL | Online games: use a relay run elsewhere (`uewasm-cli relay --port 3000`) at this address. |
+| `--wisp` |N/A| Real network connections: the game reaches its own servers through the WISP server `uewasm-cli serve` runs at the game's address (see [Official servers](#official-servers)). |
 | `--wisp-url` | URL | The same through a WISP server elsewhere (`wss://host/path/`; any WISP v1 server works). `?wisp=URL` in the page address overrides it, `?wisp=0` turns it off. |
 | `--steam-wisp` / `--no-steam-wisp` |N/A| With `--steam account` and WISP: sign in to Steam through the WISP server too, so the page never contacts Steam itself. Asked at build time when neither is given. |
 | `--eos` | `standin` (default), `real` | Games with Epic Online Services: `standin` answers the EOS SDK in the page (below); `real` recompiles the game's own EOS SDK, which signs in to Epic and joins real lobbies through WISP (it turns `--wisp` on). |
@@ -187,7 +197,7 @@ Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1
   It explains every `[webgpu]` log line, the page switches that isolate a problem, Unreal settings that work around
   broken effects, frame capture, and how to fix the shader translator itself.
 - **Low FPS or stutter:** see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-- **Crashes and hangs:** see [docs/DEBUGGING.md](docs/DEBUGGING.md) (writing the log to a file with `uewasm serve --log`,
+- **Crashes and hangs:** see [docs/DEBUGGING.md](docs/DEBUGGING.md) (writing the log to a file with `uewasm-cli serve --log`,
   readable crash stacks, `?tracering=1`, `?watch=`, `?memdebug=1`, debug builds).
 
 ## Hosting
@@ -229,10 +239,10 @@ npm start` from the WebWorks repository; players on other machines need its LAN 
 
 ### Built-in relay
 
-For a game with no WebWorks server to hand, build with `--relay`: `uewasm serve` then answers the same calls itself
+For a game with no WebWorks server to hand, build with `--relay`: `uewasm-cli serve` then answers the same calls itself
 (guest sign-in, lobbies with data, members and chat, P2P packets over a WebSocket) at the game's own address, so
-players who open the page play together. `uewasm serve --host 0.0.0.0` lets other machines on the network join.
-`uewasm relay` runs the relay on its own, for builds hosted elsewhere and made with `--relay-url`.
+players who open the page play together. `uewasm-cli serve --host 0.0.0.0` lets other machines on the network join.
+`uewasm-cli relay` runs the relay on its own, for builds hosted elsewhere and made with `--relay-url`.
 
 ## Epic Online Services
 
@@ -260,7 +270,7 @@ A build can talk to a game's real servers, with nothing to install for the playe
 
 - **Real connections (WISP)**: with `--wisp` (or `--wisp-url`), the runtime's Winsock carries every connection the game
   makes, TCP and UDP, by host name or address, over one WebSocket to a [WISP](https://github.com/MercuryWorkshop/wisp-protocol)
-  server (`uewasm serve` has one at `/wisp/`; `uewasm serve --host 0.0.0.0` lets other machines use it). The server
+  server (`uewasm-cli serve` has one at `/wisp/`; `uewasm-cli serve --host 0.0.0.0` lets other machines use it). The server
   refuses private and loopback addresses, so a public one isn't a way into its own network; `--wisp-allow
   "*.epicgames.dev,*.example.com"` narrows it to a list.
 - **TLS stays the game's**: games encrypt with their own OpenSSL, or with Windows' Schannel, which the runtime provides
@@ -290,25 +300,28 @@ anti-cheat (Easy Anti-Cheat, BattlEye) won't accept it; builds have to match the
 
 ## Testing
 
+The tests are one Rust tool, `uewtest` (`rustlift/src/bin/uewtest/`, built with the others). Each builds a small
+program with MSVC, recompiles it, and compares the original exe with the native recompile and the web build:
+
 ```
-python tests/run_tests.py          # C, C++ STL, threads, files: original exe vs native recompile vs wasm
-python tests/run_tests.py --threads real   # the same with guest threads on several cores
-python tests/run_tests.py --mem64  # the same with 64-bit memory and 5 GB of guest memory (addresses past 4 GB)
-python tests/gfx/run_gfx.py webgpu # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
-python tests/gfx/run_gfx.py webgpu srgb  # the same on an sRGB swap chain (must not come out darker)
-python tests/gfx/run_gfx.py webgpu d3d9  # the Direct3D 9 version (32-bit, Shader Model 3)
-python tests/shaders/extract_d3d9.py "C:/Games/SomeUE3Game" tests/bin/shaders9   # a UE3 game's D3D9 shaders, for wgsl_dump/wgsl_check
-python tests/isa/run_isa.py --wasm # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
+uewtest run                  # C, C++ STL, threads, files: original exe vs native recompile vs wasm
+uewtest run --threads real   # the same with guest threads on several cores
+uewtest run --mem64          # the same with 64-bit memory and 5 GB of guest memory (addresses past 4 GB)
+uewtest gfx webgpu           # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
+uewtest gfx webgpu srgb      # the same on an sRGB swap chain (must not come out darker)
+uewtest gfx webgpu d3d9      # the Direct3D 9 version (32-bit, Shader Model 3)
+uewtest isa --wasm           # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
+uewtest web                  # game files over HTTP (raw and deflated, with and without Range) and saved progress
+uewtest net                  # real TCP, UDP, HTTPS (Schannel, libcurl-style checks, a full download) and hashing through WISP vs native
+uewtest aes                  # OpenSSL's assembly AES (a Python install's libcrypto-3.dll, or UEWASM_LIBCRYPTO) recompiled vs native: code that bends the x64 ABI
+uewtest sse                  # SIMD versions of the SSE helpers against their scalar references
+uewtest steam-pair <web build of tests/steam/steamtest.cpp>   # two players: lobby, chat, P2P (WebWorks server, or the relay with --relay)
+uewtest extract-d3d9 "C:/Games/SomeUE3Game" tests/bin/shaders9   # a UE3 game's D3D9 shaders, for wgsl_dump/wgsl-check
 cargo test --release --manifest-path rustlift/Cargo.toml --bin uewrecomp   # the SteamStub AES against FIPS-197
-python tests/web/run_web.py        # game files over HTTP (raw and deflated, with and without Range) and saved progress
-python tests/net/run_net.py        # real TCP, UDP, HTTPS (Schannel, libcurl-style checks, a full download) and hashing through WISP vs native
-python tests/aes/run_aes.py        # OpenSSL's assembly AES (Python's libcrypto-3.dll) recompiled vs native: code that bends the x64 ABI
-python tests/sse/gen_test.py       # SIMD versions of the SSE helpers against their scalar references
-python tests/steam/run_pair.py <web build of tests/steam/steamtest.cpp>   # two players: lobby, chat, P2P (WebWorks server, or the relay with --relay)
 ```
 
-The browser tests need Playwright (`pip install playwright`, then `playwright install msedge` or use an installed
-Edge/Chrome).
+`uewtest` is in `rustlift/target/release/`. The browser tests drive an installed Edge or Chrome headless over the
+DevTools protocol (`UEWASM_BROWSER` points at another Chromium browser), muted.
 
 ## Unreal Engine 3 games
 
@@ -329,7 +342,7 @@ so there is no separate mode to pick. What differs:
   Steam session, so games that insist on Steam still start.
 - **Settings**: `--quality` only applies to UE4/5 games. UE3 games keep their own settings, so change graphics in the
   game's options menu.
-- **Shaders**: `tests/shaders/extract_d3d9.py` pulls every D3D9 shader out of a UE3 game's caches, to check the
+- **Shaders**: `uewtest extract-d3d9` pulls every D3D9 shader out of a UE3 game's caches, to check the
   translator against a whole game before building it (see [docs/RENDERING.md](docs/RENDERING.md)).
 
 ## Known limitations

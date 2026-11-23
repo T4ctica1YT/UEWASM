@@ -6,13 +6,13 @@ page switches (add them to the address, e.g. `index.html?tracering=1`); two need
 For rendering problems (black screen, wrong colours) see [RENDERING.md](RENDERING.md) first.
 When the game runs but computes something wrong (a save that won't load, a failed checksum), see [LIFTER.md](LIFTER.md).
 
-## Keeping the log: `uewasm serve --log`
+## Keeping the log: `uewasm-cli serve --log`
 
 The tools below print to the game's log. To get it in a file while the game runs, without the debug panel's
 *Save log*, serve the build with `--log`:
 
 ```
-python uewasm.py serve builds\MyGame\web --log builds\MyGame\run.log
+uewasm-cli serve builds\MyGame\web --log builds\MyGame\run.log
 ```
 
 The server adds a small script to `index.html` that sends every console line, page error and unhandled promise
@@ -31,22 +31,10 @@ runs. If the tab crashes, the last half second can be missing.
 
 ## Readable crash stacks
 
-Build with function names, so WebAssembly stack traces name the guest functions:
-
-```python
-# builds/build_named.py: the normal command line, with names=True passed to the web build
-import sys
-sys.path.insert(0, r"C:\path\to\UEWASM")
-from uewasm.recomp import build
-orig = build.build_wasm
-build.build_wasm = lambda *a, **k: orig(*a, names=True, **k)
-from uewasm.cli import main
-if __name__ == "__main__":
-    main(sys.argv[1:])
-```
+Build with function names (`--names`), so WebAssembly stack traces name the guest functions:
 
 ```
-python builds/build_named.py recomp "C:\Games\MyGame\Binaries\Win32\MyGame.exe" -o builds/MyGame -y
+uewasm-cli recomp "C:\Games\MyGame\Binaries\Win32\MyGame.exe" -o builds/MyGame -y --names
 ```
 
 Every recompiled frame is then `F_<guest address>`. When the runtime traps (an unknown call target, an invalid
@@ -128,7 +116,7 @@ Example:
 
 ```
 set UEW_EXTRA_CFLAGS=-DUEW_EBPCHECK
-python builds/build_named.py recomp "…\MyGame.exe" -o builds/MyGame -y --threads real
+uewasm-cli recomp "…\MyGame.exe" -o builds/MyGame -y --names --threads real
 ```
 
 ## Hangs
@@ -144,7 +132,8 @@ python builds/build_named.py recomp "…\MyGame.exe" -o builds/MyGame -y --threa
 
 C++ `throw` and SEH `__try` work in 32-bit games: `RaiseException` walks the thread's handler chain (`fs:[0]`) as
 Windows does, and a catch resumes in the catching function (the lifter gives every function with a try block a host
-`setjmp`, and makes each catch continuation and `__except`/`__finally` block an entry point: `uewasm/recomp/eh32.py`).
+`setjmp`, and makes each catch continuation and `__except`/`__finally` block an entry point:
+`rustlift/src/bin/uewrecomp/eh32.rs`).
 Unreal Engine 3 relies on this: a failed package or class load is thrown and caught as a warning.
 
 - `?sehdebug=1` logs every exception with the thrown C++ type and its message (UE3 throws `TCHAR*` strings), each
@@ -157,7 +146,7 @@ Unreal Engine 3 relies on this: a failed package or class load is thrown and cau
 ```
 
 - A catch that lands on an address the lifter didn't make an entry point stops with `catch continuation is not a
-  lifted entry point`: the funclet's `mov eax, continuation; ret` wasn't recognised by `eh32.py`.
+  lifted entry point`: the funclet's `mov eax, continuation; ret` wasn't recognised by `eh32.rs`.
 
 ## Online sign-in errors
 
@@ -244,14 +233,12 @@ in 32 bits breaks on the first allocation instead of deep into a game.
 ## Reading the game's code
 
 The recompiled C is in `builds/<game>/gen/funcs_*.c` (`grep -l "^void F_<address>(CPU" builds/<game>/gen/funcs_*.c`).
-To read the original instructions, any x86 disassembler works on the exe. `builds/<game>/image.bin` is every module
-already relocated to the addresses the build uses, starting at `IMAGE_LO` (in `gen/meta.c`, usually `0x400000`), so an
-address `A` is at file offset `A - IMAGE_LO`; for example with the `iced-x86` Python package:
+To read the original instructions at a guest address, `uewasm-cli disasm` decodes them from the build's `image.bin`
+(every module already relocated to the addresses the build uses; 32- or 64-bit from `gen/meta.c`):
 
-```python
-import iced_x86 as I
-img = open(r"builds\MyGame\image.bin", "rb").read()
-lo, a = 0x400000, 0x636d20
-for ins in I.Decoder(32, img[a - lo:a - lo + 64], ip=a):
-    print(hex(ins.ip), I.Formatter(I.FormatterSyntax.INTEL).format(ins))
 ```
+uewasm-cli disasm builds\MyGame 636d20 40
+```
+
+Any other x86 disassembler works too: an address `A` is at file offset `A - IMAGE_LO` of `image.bin` (`IMAGE_LO` is
+in `gen/meta.c`, usually `0x400000`).

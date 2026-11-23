@@ -1,4 +1,4 @@
-//! The web build's heavy steps, driven by the recompiler (uewasm/recomp/build.py) through a JSON job file:
+//! The web build's heavy steps, driven by uewasm-cli (its build.rs) through a JSON job file:
 //!   uewbuild compile <job.json>   compile the lifted C and the runtime with Emscripten, then link game.js/game.wasm
 //!   uewbuild shell <job.json>     write index.html (and _headers, coi-sw.js), cutting game.wasm into parts if big
 //!   uewbuild single <web dir> <dest.html> [chunk MB]   one .html holding the whole build, for opening from disk
@@ -99,7 +99,7 @@ fn command(prog: &str, env: &HashMap<String, String>) -> Command {
     c
 }
 
-/// shell-style words (as Python's shlex.split): quotes group, backslash escapes outside single quotes
+/// shell-style words: quotes group, backslash escapes outside single quotes
 fn split_words(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut have) = (Vec::new(), String::new(), false);
     let mut it = s.chars().peekable();

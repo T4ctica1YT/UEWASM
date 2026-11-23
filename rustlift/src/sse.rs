@@ -1,4 +1,4 @@
-// SSE instructions: the Rust form of sse.py (explicit forms, then sse.h's XFN helpers for the rest).
+// SSE instructions: explicit forms, then sse.h's XFN helpers for the rest.
 use iced_x86::OpKind;
 
 use crate::func::{h, is_imm, mask, Func, Unsup, R};

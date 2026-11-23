@@ -1,4 +1,4 @@
-// One function at a time to C: the Rust form of lift.py's Func (the text it writes is the same, line for line).
+// One function at a time to C.
 use iced_x86::{Code, ConditionCode, Instruction, OpKind, Register};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -11,7 +11,7 @@ fn un<T>(s: impl Into<String>) -> R<T> {
     Err(Unsup(s.into()))
 }
 
-/// the mnemonic's name as the Python lifter spells it (upper case), from a table made once
+/// the mnemonic's name in upper case, from a table made once
 pub fn mn(ins: &Instruction) -> &'static str {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let t = NAMES.get_or_init(|| iced_x86::Mnemonic::values().map(|m| format!("{:?}", m).to_uppercase()).collect());

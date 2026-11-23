@@ -1,5 +1,5 @@
 // Real connections from a recompiled program: TCP by host name, TCP to a raw address, UDP (a DNS query), and HTTPS through
-// Schannel the way libcurl's schannel backend drives it. In the browser these go through a WISP server (uewasm serve
+// Schannel the way libcurl's schannel backend drives it. In the browser these go through a WISP server (uewasm-cli serve
 // --wisp) and the runtime's Schannel; natively, straight out and Windows' own. Prints OK lines and DONE.
 #define SECURITY_WIN32
 #include <stdio.h>

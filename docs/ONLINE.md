@@ -25,7 +25,7 @@ The first Steam call picks a backend (`ww_active`):
 
 - **WebWorks / relay** (`--steam webworks`, `--relay`). Guest sign-in, lobbies, P2P packets and stats go through
   `uew_webworks.js`. The relay in `uewserve` (`rustlift/src/bin/uewserve/main.rs`) speaks the same protocol, so the page
-  doesn't know which one it talks to. `tests/steam/run_pair.py` runs two players against it.
+  doesn't know which one it talks to. `uewtest steam-pair` runs two players against it.
 - **Steam account** (`--steam account`). `uew_steamcm.js` is a small Steam client. It signs in with a password plus
   Steam Guard, or by QR code (Steam's `BeginAuthSessionViaQR`, the same flow as the desktop client). It logs on with
   the refresh token, then reports the game as running (`ClientGamesPlayed`), fetches the app ownership ticket and
@@ -85,9 +85,9 @@ SDK's network threads waited (seconds per frame during sign-in).
 
 | Change | Run |
 |---|---|
-| sockets, WISP, TLS, crypto | `python tests/net/run_net.py` (TCP, UDP, HTTPS in libcurl's style, a full download, hashes; against native) |
-| Steam lobbies and P2P | build `tests/steam/steamtest.cpp`, then `python tests/steam/run_pair.py <web>` |
-| AES or other hand-written crypto | `python tests/aes/run_aes.py` |
+| sockets, WISP, TLS, crypto | `uewtest net` (TCP, UDP, HTTPS in libcurl's style, a full download, hashes; against native) |
+| Steam lobbies and P2P | build `tests/steam/steamtest.cpp`, then `uewtest steam-pair <web>` |
+| AES or other hand-written crypto | `uewtest aes` |
 | Steam account sign-in | nothing automated (it needs an account). A page that loads `uew_wisp.js` and `uew_steamcm.js` and calls `connect()`, `service("Authentication.GetPasswordRSAPublicKey#1", …)` and an anonymous `ClientLogon` (SteamID type 10) checks the transport and encryption with no account, over both WebSocket and WISP (`?steamwisp=0/1`) |
 
 Never commit anything tied to a real account: tokens, SteamIDs, names, or logs that contain them.

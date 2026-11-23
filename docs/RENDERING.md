@@ -104,7 +104,7 @@ The page loads and the status line goes away, but nothing ever appears.
 4. **Look for `software fallback!`, `WebGPU unavailable` or `null renderer` in the log.** Any of them means
    the browser didn't provide a usable GPU. Fix that first: nothing else in this guide helps until it's solved.
 5. **Serve the build over `http://localhost` or `https://`.** WebGPU only works in secure contexts. Opening
-   `index.html` from disk works only with `--single-file` builds. Use `python uewasm.py serve builds\MyGame\web`
+   `index.html` from disk works only with `--single-file` builds. Use `uewasm-cli serve builds\MyGame\web`
    for normal builds.
 6. **With `--threads real`,** the page must be cross-origin isolated. The build includes a service worker that
    sets this up. If the page loaded before the worker was installed, reload once.
@@ -288,7 +288,7 @@ index.html?arg=-ExecCmds="r.EyeAdaptationQuality 0, r.BloomQuality 0"
 To make them part of the build, pass the same thing with `--game-arg` when you build:
 
 ```
-python uewasm.py recomp "C:\Games\MyGame" --game-arg=-ExecCmds="r.EyeAdaptationQuality 0"
+uewasm-cli recomp "C:\Games\MyGame" --game-arg=-ExecCmds="r.EyeAdaptationQuality 0"
 ```
 
 You can also type them live in the UE developer console. Click **Enable UE dev console** in the debug panel,
@@ -332,7 +332,7 @@ Where things live:
 
 1. **Collect the game's shaders.** This pulls every DXBC blob out of the install:
    ```
-   python tests/shaders/extract_dxbc.py "C:\Games\MyGame" tests/bin/shaders
+   uewtest extract-dxbc "C:\Games\MyGame" tests/bin/shaders
    ```
 2. **Translate them all offline.** This builds the dump tool with MSVC (from a *Developer Command Prompt*):
    ```
@@ -343,20 +343,20 @@ Where things live:
    count. `DXBC_TRACE=1` prints each file name, to find the one that crashes the translator.
 3. **Compile the WGSL with the browser's real compiler:**
    ```
-   python tests/shaders/wgsl_check.py tests/bin/wgsl
+   uewtest wgsl-check tests/bin/wgsl
    ```
-   It groups the errors by kind and writes `wgsl_errors.json`. `tests/shaders/webgl_check.py` does the same for
+   It groups the errors by kind and writes `wgsl_errors.json`. `uewtest webgl-check` does the same for
    the WebGL 2 path.
-4. **Name an unknown opcode.** `tests/shaders/opcode_map.py tests/bin/shaders` lines the token stream up with
+4. **Name an unknown opcode.** `uewtest opcode-map tests/bin/shaders` lines the token stream up with
    `fxc /dumpbin` disassembly and tells you which instruction a number is.
 5. **Fix `dxbc_wgsl.c`, repeat 2–3 until they're clean, then rebuild the game.** Run the same
-   `uewasm recomp` command again with the same output folder. The runtime is always rebuilt, and lifted game
+   `uewasm-cli recomp` command again with the same output folder. The runtime is always rebuilt, and lifted game
    code that didn't change isn't recompiled.
 6. **Check nothing else broke:**
    ```
-   python tests/gfx/run_gfx.py webgpu        # D3D11 triangle, checked per pixel in a headless browser
-   python tests/gfx/run_gfx.py webgpu srgb   # the same on an sRGB swap chain
-   python tests/gfx/run_gfx.py webgl2
+   uewtest gfx webgpu        # D3D11 triangle, checked per pixel in a headless browser
+   uewtest gfx webgpu srgb   # the same on an sRGB swap chain
+   uewtest gfx webgl2
    ```
 
 ### Common translation mistakes and their symptoms
@@ -371,7 +371,7 @@ Where things live:
 | One-pixel seams or a half-pixel shift | `SV_Position` pixel centre, or a `ld`/`Load` offset |
 
 WGSL is stricter than HLSL: no implicit int/float conversion, no out-of-range array indexing without
-clamping, uniformity rules for derivatives. When `wgsl_check.py` reports an error, the fix almost always
+clamping, uniformity rules for derivatives. When `uewtest wgsl-check` reports an error, the fix almost always
 belongs in `dxbc_wgsl.c`, not in the game.
 
 ---
@@ -401,8 +401,8 @@ frame capture shows a draw doing something wrong, to tell a translation bug (the
 what the game really submitted. With Scaleform UIs, `pc6`/`pc7` are the colour transform (multiply, add) and
 `vc6`-`vc13` the position and texture matrices.
 
-To test the translator on a whole game, `tests/shaders/extract_d3d9.py` pulls every D3D9 shader out of a UE3 game's
-shader caches (it unpacks LZO/zlib-compressed packages), and `wgsl_dump` / `wgsl_check.py` work on them unchanged.
+To test the translator on a whole game, `uewtest extract-d3d9` pulls every D3D9 shader out of a UE3 game's
+shader caches (it unpacks LZO/zlib-compressed packages), and `wgsl_dump` / `uewtest wgsl-check` work on them unchanged.
 All 39,286 of Dishonored's shaders translate and compile in Edge.
 
 ## Reporting a rendering bug
