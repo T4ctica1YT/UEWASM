@@ -377,7 +377,9 @@ so there is no separate mode to pick. What differs:
 
 ## Extra Credits
 
-- **[zay](https://github.com/squidward5)** - Helped with UE3 support
+- **[zay](https://github.com/squidward5)** - Helped with UE3 support and more.
+
+- **[Stratus Games / Glitch]** - Made WebWorks / Gave permission for its use in this tool
 
 - **[IdiotOnline](https://github.com/anIdiotonline)** - Tester
 
