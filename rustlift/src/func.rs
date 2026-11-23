@@ -18,13 +18,16 @@ pub fn mn(ins: &Instruction) -> &'static str {
     &t[ins.mnemonic() as usize]
 }
 
-const HANDLED: &[&str] = &["JZ", "JNZ", "JC", "JNC", "MOV", "MOVZX", "MOVSX", "MOVSXD", "LEA", "XCHG", "PUSH", "POP", "PUSHAD", "POPAD", "PUSHFD", "POPFD", "PUSHFQ", "POPFQ", "LAHF", "SAHF", "CLC", "STC", "CMC", "CLD", "STD", "NOP", "PAUSE", "LFENCE", "MFENCE", "SFENCE", "PREFETCHT0", "PREFETCHT1", "PREFETCHT2", "FWAIT", "WAIT", "FNOP", "PREFETCHNTA", "PREFETCHW", "ENDBR64", "ENDBR32", "RDSSPQ", "RDSSPD", "INCSSPQ", "INCSSPD", "SETSSBSY", "SAVEPREVSSP", "RSTORSSP", "XLATB", "CBW", "CWDE", "CDQE", "CWD", "CDQ", "CQO", "BSWAP", "ADD", "SUB", "CMP", "AND", "TEST", "OR", "XOR", "ADC", "SBB", "INC", "DEC", "NEG", "NOT", "RCL", "RCR", "SHL", "SAL", "SHR", "SAR", "ROL", "ROR", "SHLD", "SHRD", "IMUL", "MUL", "DIV", "IDIV", "CMPXCHG", "CMPXCHG16B", "XADD", "BT", "BTS", "BTR", "BTC", "BSF", "BSR", "TZCNT", "LZCNT", "POPCNT", "JMP", "CALL", "RET", "INT3", "UD2", "INT", "HLT", "LEAVE", "FXSAVE", "FXSAVE64", "FXRSTOR", "FXRSTOR64", "CPUID", "XGETBV", "RDTSC", "RDTSCP", "MOVSB", "MOVSW", "MOVSQ", "MOVSD", "STOSB", "STOSW", "STOSD", "STOSQ", "LODSB", "LODSW", "LODSD", "LODSQ", "SCASB", "SCASW", "SCASD", "SCASQ", "CMPSB", "CMPSW", "CMPSQ", "CMPSD"];
+const HANDLED: &[&str] = &["JZ", "JNZ", "JC", "JNC", "MOV", "MOVZX", "MOVSX", "MOVSXD", "LEA", "XCHG", "PUSH", "POP", "PUSHAD", "POPAD", "PUSHFD", "POPFD", "PUSHFQ", "POPFQ", "LAHF", "SAHF", "CLC", "STC", "CMC", "CLD", "STD", "NOP", "PAUSE", "LFENCE", "MFENCE", "SFENCE", "PREFETCHT0", "PREFETCHT1", "PREFETCHT2", "FWAIT", "WAIT", "FNOP", "PREFETCHNTA", "PREFETCHW", "ENDBR64", "ENDBR32", "RDSSPQ", "RDSSPD", "INCSSPQ", "INCSSPD", "SETSSBSY", "SAVEPREVSSP", "RSTORSSP", "XLATB", "CBW", "CWDE", "CDQE", "CWD", "CDQ", "CQO", "BSWAP", "ADD", "SUB", "CMP", "AND", "TEST", "OR", "XOR", "ADC", "SBB", "INC", "DEC", "NEG", "NOT", "RCL", "RCR", "SHL", "SAL", "SHR", "SAR", "ROL", "ROR", "SHLD", "SHRD", "IMUL", "MUL", "DIV", "IDIV", "CMPXCHG", "CMPXCHG16B", "XADD", "BT", "BTS", "BTR", "BTC", "BSF", "BSR", "TZCNT", "LZCNT", "POPCNT", "ANDN", "BEXTR", "BZHI", "BLSR", "BLSI", "BLSMSK", "SHLX", "SHRX", "SARX", "RORX", "PDEP", "PEXT", "MULX", "MOVBE", "JMP", "CALL", "RET", "INT3", "UD2", "INT", "HLT", "LEAVE", "FXSAVE", "FXSAVE64", "FXRSTOR", "FXRSTOR64", "CPUID", "XGETBV", "RDTSC", "RDTSCP", "MOVSB", "MOVSW", "MOVSQ", "MOVSD", "STOSB", "STOSW", "STOSD", "STOSQ", "LODSB", "LODSW", "LODSD", "LODSQ", "SCASB", "SCASW", "SCASD", "SCASQ", "CMPSB", "CMPSW", "CMPSQ", "CMPSD"];
 
 /// mnemonics with a handler in op() (the x87 ones are in x87::has)
 fn handled() -> &'static HashSet<String> {
     static SET: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         let mut s: HashSet<String> = HANDLED.iter().map(|x| x.to_string()).collect();
+        for m in ["JRCXZ", "JECXZ", "LOOP", "LOOPE", "LOOPNE"] {
+            s.insert(m.to_string());
+        }
         for c in ["O", "NO", "B", "AE", "E", "NE", "BE", "A", "S", "NS", "P", "NP", "L", "GE", "LE", "G"] {
             s.insert(format!("SET{c}"));
             s.insert(format!("CMOV{c}"));
@@ -544,6 +547,25 @@ impl<'a> Func<'a> {
             crate::x87::op(self, m)?;
             return Ok(false);
         }
+        // rcx-counted branches: jrcxz/jecxz test the counter, loop/loope/loopne count it down (flags untouched)
+        if m == "JRCXZ" || m == "JECXZ" {
+            let t = self.target(ins.near_branch_target());
+            self.emit(format!("if ({} == 0) {{ {t} }}", if m == "JRCXZ" { "R(1)" } else { "(uint32_t)R(1)" }));
+            return Ok(false);
+        }
+        if m == "LOOP" || m == "LOOPE" || m == "LOOPNE" {
+            let code = format!("{:?}", ins.code());
+            let cond = match m { "LOOPE" => " && CC_E(&F)", "LOOPNE" => " && CC_NE(&F)", _ => "" };
+            let t = self.target(ins.near_branch_target());
+            if code.ends_with("_RCX") {
+                self.emit(format!("R(1) = R(1) - 1; if (R(1) != 0{cond}) {{ {t} }}"));
+            } else if code.ends_with("_ECX") {
+                self.emit(format!("R(1) = (uint32_t)(R(1) - 1); if ((uint32_t)R(1) != 0{cond}) {{ {t} }}"));
+            } else {
+                return un("16-bit loop counter");
+            }
+            return Ok(false);
+        }
         if (m.starts_with("SET") && m.len() <= 5) || m.starts_with("CMOV") || (m.starts_with('J') && m != "JMP") {
             if m.starts_with("SET") {
                 let c = self.cc();
@@ -790,6 +812,88 @@ impl<'a> Func<'a> {
             "POPCNT" => {
                 let v = self.rd(1, None)?;
                 self.emit(format!("{{ uint64_t r_ = POPCNT64({v}); rt_setflags(&F, r_ ? 0 : 0x40);"));
+                self.wr(0, "r_")?;
+                self.emit("}");
+            }
+            // BMI1/BMI2 (compilers targeting AVX2-era CPUs use them for bit fields and shifts) and MOVBE
+            "ANDN" | "BEXTR" | "BZHI" | "BLSR" | "BLSI" | "BLSMSK" => {
+                let s = self.size(0)?;
+                let (bits, mk) = (s * 8, mask(s));
+                let a = self.rd(1, None)?;
+                let (r, cf) = match m {
+                    "ANDN" => {
+                        let b = self.rd(2, None)?;
+                        (format!("~({a}) & ({b})"), None)
+                    }
+                    "BEXTR" => {
+                        let ctl = self.rd(2, None)?;
+                        self.emit(format!("{{ uint64_t c_ = {ctl}, st_ = c_ & 0xFF, ln_ = (c_ >> 8) & 0xFF, v_ = st_ < {bits} ? ({a}) >> st_ : 0;"));
+                        ("ln_ < 64 ? v_ & ((1ull << ln_) - 1) : v_".to_string(), None)
+                    }
+                    "BZHI" => {
+                        let idx = self.rd(2, None)?;
+                        self.emit(format!("{{ uint64_t n_ = ({idx}) & 0xFF;"));
+                        (format!("n_ < {bits} ? ({a}) & ((1ull << n_) - 1) : ({a})"), Some(format!("n_ > {}", bits - 1)))
+                    }
+                    "BLSR" => (format!("({a}) & (({a}) - 1)"), Some(format!("(({a}) & {mk}) == 0"))),
+                    "BLSI" => (format!("({a}) & (0 - ({a}))"), Some(format!("(({a}) & {mk}) != 0"))),
+                    _ => (format!("({a}) ^ (({a}) - 1)"), Some(format!("(({a}) & {mk}) == 0"))),
+                };
+                self.emit(format!("{{ uint64_t r_ = ({r}) & {mk}; FL(F_LOGIC, {bits}, 0, 0, r_);"));
+                if let Some(cf) = &cf {
+                    self.emit(format!("rt_setcf(&F, {cf});"));
+                }
+                self.wr(0, "r_")?;
+                self.emit(if m == "BZHI" || m == "BEXTR" { "} }" } else { "}" });
+            }
+            "SHLX" | "SHRX" | "SARX" | "RORX" => {
+                let s = self.size(0)?;
+                let bits = s * 8;
+                let a = self.rd(1, None)?;
+                let n = if m == "RORX" { format!("{}", ins.immediate(2) as u32 & (bits - 1)) } else { format!("(({}) & {})", self.rd(2, None)?, bits - 1) };
+                let r = match (m, s) {
+                    ("SHLX", _) => format!("({a}) << n_"),
+                    ("SHRX", _) => format!("({a}) >> n_"),
+                    ("SARX", 8) => format!("(uint64_t)((int64_t)({a}) >> n_)"),
+                    ("SARX", _) => format!("(uint64_t)(uint32_t)((int32_t)({a}) >> n_)"),
+                    (_, 8) => format!("(({a}) >> n_) | (({a}) << ((64 - n_) & 63))"),
+                    _ => format!("(uint64_t)(((uint32_t)({a}) >> n_) | ((uint32_t)({a}) << ((32 - n_) & 31)))"),
+                };
+                self.emit(format!("{{ unsigned n_ = {n}; uint64_t r_ = ({r}) & {};", mask(s)));
+                self.wr(0, "r_")?;
+                self.emit("}");
+            }
+            "PDEP" | "PEXT" => {
+                let s = self.size(0)?;
+                let src = self.rd(1, None)?;
+                let msk = self.rd(2, None)?;
+                let step = if m == "PDEP" { "if (s_ & b_) r_ |= m_ & (0 - m_);" } else { "if (s_ & m_ & (0 - m_)) r_ |= b_;" };
+                self.emit(format!("{{ uint64_t s_ = {src}, m_ = ({msk}) & {}, r_ = 0; for (uint64_t b_ = 1; m_; b_ <<= 1) {{ {step} m_ &= m_ - 1; }}", mask(s)));
+                self.wr(0, "r_")?;
+                self.emit("}");
+            }
+            "MULX" => {
+                let s = self.size(0)?;
+                let src = self.rd(2, None)?;
+                if s == 8 {
+                    self.emit(format!("{{ uint64_t hi_, lo_ = MULU64(R(2), {src}, &hi_);"));
+                } else {
+                    self.emit(format!("{{ uint64_t p_ = (uint64_t)(uint32_t)R(2) * (uint32_t)({src}), hi_ = p_ >> 32, lo_ = (uint32_t)p_;"));
+                }
+                // the low half goes first: with both operands the same register, the high half is what stays
+                self.wr(1, "lo_")?;
+                self.wr(0, "hi_")?;
+                self.emit("}");
+            }
+            "MOVBE" => {
+                let s = self.size(0)?;
+                let v = self.rd(1, None)?;
+                let sw = match s {
+                    8 => format!("BSWAP64({v})"),
+                    4 => format!("BSWAP32({v})"),
+                    _ => format!("BSWAP16({v})"),
+                };
+                self.emit(format!("{{ uint64_t r_ = {sw};"));
                 self.wr(0, "r_")?;
                 self.emit("}");
             }

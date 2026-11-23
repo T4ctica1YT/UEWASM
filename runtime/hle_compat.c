@@ -902,7 +902,6 @@ static void str_to_bin(CPU* c, int wide)
 HLE(CryptStringToBinaryW) { str_to_bin(c, 1); }
 HLE(CryptStringToBinaryA) { str_to_bin(c, 0); }
 HLE(CryptDecodeObjectEx) { hle_set_error(0x80092004); RET(0); }
-HLE(CertAddEncodedCertificateToStore) { if (ARG(6)) ST64(ARG(6), 0); RET(1); }
 HLE(CertFindExtension) { RET(0); }
 HLE(PFXImportCertStore) { hle_set_error(0x80092004); RET(0); }
 

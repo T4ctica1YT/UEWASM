@@ -1,0 +1,26 @@
+<script>
+(() => {
+  let buf = [], busy = false;
+  const t0 = performance.now();
+  const keep = (k, args) => {
+    const s = Array.from(args).map(a => typeof a === "string" ? a : (a && a.stack) || String(a)).join(" ");
+    buf.push(((performance.now() - t0) / 1000).toFixed(1) + (k === "log" ? " " : " [" + k + "] ") + s);
+  };
+  for (const k of ["log", "info", "warn", "error"]) {
+    const orig = console[k].bind(console);
+    console[k] = (...a) => { keep(k, a); orig(...a); };
+  }
+  addEventListener("error", e => keep("page error", [e.message + " at " + e.filename + ":" + e.lineno]));
+  addEventListener("unhandledrejection", e => keep("unhandled rejection", [e.reason]));
+  const flush = () => {
+    if (busy || !buf.length) return;
+    const body = buf.join("\n") + "\n";
+    buf = [];
+    busy = true;
+    fetch("/__uewlog", { method: "POST", body, keepalive: body.length < 60000 }).catch(() => {}).finally(() => { busy = false; });
+  };
+  setInterval(flush, 500);
+  addEventListener("pagehide", () => { if (buf.length) navigator.sendBeacon("/__uewlog", buf.join("\n") + "\n"); buf = []; });
+  keep("log", ["[uewlog] page " + location.href + " " + navigator.userAgent]);
+})();
+</script>

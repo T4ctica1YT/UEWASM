@@ -9,6 +9,44 @@
 #include <math.h>
 #include <strings.h>
 #include "fastmem.h"
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
+
+/* the first and last differing bytes of two buffers in [lo, hi): dynamic-buffer uploads compare a whole mapped buffer
+   with its shadow (megabytes a frame), so 64 bytes a step with SIMD where there is any; diff_lo returns hi when equal */
+static uint32_t diff_lo(const uint8_t* a, const uint8_t* b, uint32_t lo, uint32_t hi)
+{
+#ifdef __wasm_simd128__
+    while (lo + 64 <= hi) {
+        v128_t x = wasm_v128_xor(wasm_v128_load(a + lo), wasm_v128_load(b + lo));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + lo + 16), wasm_v128_load(b + lo + 16)));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + lo + 32), wasm_v128_load(b + lo + 32)));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + lo + 48), wasm_v128_load(b + lo + 48)));
+        if (wasm_v128_any_true(x)) break;
+        lo += 64;
+    }
+#endif
+    while (lo + 8 <= hi && !memcmp(a + lo, b + lo, 8)) lo += 8;
+    while (lo < hi && a[lo] == b[lo]) lo++;
+    return lo;
+}
+static uint32_t diff_hi(const uint8_t* a, const uint8_t* b, uint32_t lo, uint32_t hi)
+{
+#ifdef __wasm_simd128__
+    while (hi >= lo + 64) {
+        v128_t x = wasm_v128_xor(wasm_v128_load(a + hi - 64), wasm_v128_load(b + hi - 64));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + hi - 48), wasm_v128_load(b + hi - 48)));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + hi - 32), wasm_v128_load(b + hi - 32)));
+        x = wasm_v128_or(x, wasm_v128_xor(wasm_v128_load(a + hi - 16), wasm_v128_load(b + hi - 16)));
+        if (wasm_v128_any_true(x)) break;
+        hi -= 64;
+    }
+#endif
+    while (hi >= lo + 8 && !memcmp(a + hi - 8, b + hi - 8, 8)) hi -= 8;
+    while (hi > lo && a[hi - 1] == b[hi - 1]) hi--;
+    return hi;
+}
 #define memcmp fast_memcmp
 
 int uewg_init(int w, int h, void* ring, int ring_size);
@@ -622,12 +660,9 @@ static void buffer_put(GpuRes* r, WTex* t, uint32_t off, const uint8_t* p, uint3
    app may write over bytes earlier commands of this submit still read, so those go through the ring, in order */
 static void diff_put(GpuRes* r, WTex* t, const uint8_t* p, uint32_t a, uint32_t b, int direct)
 {
-    uint32_t lo = a, hi = b;
-    while (lo + 8 <= hi && !memcmp(p + lo, t->shadow + lo, 8)) lo += 8;
-    while (lo < hi && p[lo] == t->shadow[lo]) lo++;
-    if (lo == hi) return;
-    while (hi >= lo + 8 && !memcmp(p + hi - 8, t->shadow + hi - 8, 8)) hi -= 8;
-    while (hi > lo && p[hi - 1] == t->shadow[hi - 1]) hi--;
+    uint32_t lo = diff_lo(p, t->shadow, a, b), hi;
+    if (lo == b) return;
+    hi = diff_hi(p, t->shadow, lo, b);
     lo &= ~3u;
     hi = (hi + 3) & ~3u;
     if (hi > r->width) hi = r->width;
@@ -643,6 +678,34 @@ static void lazy_range(GpuRes* r, uint64_t a, uint64_t b)
     if (b > r->width) b = r->width;
     if (a >= b) return;
     diff_put(r, t, G2H(r->backing + r->sub_offset[0]), (uint32_t)a, (uint32_t)b, t->discard_serial != g_serial);
+}
+/* a draw's range of a buffer DISCARDed and already used in this submit: copying it into the buffer would need the
+   render pass ended (87 times a frame in Crab Champions), so the draw reads those bytes from the ring instead. The
+   buffer and its shadow keep the old bytes, which later diffs still compare against. Slot 16 is the index buffer. */
+static struct { int on; uint32_t ro, gen; uint64_t a, b; } lz[17];
+static void lazy_draw(GpuRes* r, uint64_t a, uint64_t b, int slot)
+{
+    WTex* t = T(r);
+    lz[slot].on = 0;
+    if (!t || !t->lazy || !t->shadow || !r->backing) return;
+    if (b > r->width) b = r->width;
+    if (a >= b) return;
+    if (t->discard_serial != g_serial || t->used != g_serial || b - a > ring_size / 8) { lazy_range(r, a, b); return; }
+    const uint8_t* p = G2H(r->backing + r->sub_offset[0]);
+    if (diff_lo(p, t->shadow, (uint32_t)a, (uint32_t)b) == b) return;
+    a &= ~3ull;
+    lz[slot].ro = ring_put(p + a, (uint32_t)(b - a), (uint32_t)(b - a));
+    lz[slot].a = a; lz[slot].b = b; lz[slot].gen = ring_gen; lz[slot].on = 1;
+}
+/* the ring offset to bind for a slot whose buffer would be bound at base, or -1 (then the range goes in the usual way) */
+static int64_t lazy_bind(GpuRes* r, int slot, uint64_t base, uint32_t align)
+{
+    if (!lz[slot].on) return -1;
+    lz[slot].on = 0;
+    int64_t o = (int64_t)lz[slot].ro - ((int64_t)lz[slot].a - (int64_t)base);
+    if (o >= 0 && !(o % align) && lz[slot].gen == ring_gen) return o;   /* a wrap since would overwrite it */
+    diff_put(r, T(r), G2H(r->backing + r->sub_offset[0]), (uint32_t)lz[slot].a, (uint32_t)lz[slot].b, 0);
+    return -1;
 }
 /* everything (indirect draws, copies, the geometry shader path: nothing tells which bytes they read) */
 static void lazy_all(GpuRes* r)
@@ -694,10 +757,13 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
         return;
     }
     if (r->type == RES_BUFFER && !box && r->width >= 65536 && t->id) {
-        /* NO_OVERWRITE into a buffer only draws read (vertex/index): left for the draws (lazy_range above) */
+        /* NO_OVERWRITE or DISCARD into a buffer only draws read (vertex/index): left for the draws (lazy_range above).
+           Unreal 4/5 discard-map their big dynamic vertex and index buffers every frame and rewrite a few percent of
+           them (Crab Champions: 2.9 GB compared to send 65 MB); after a DISCARD the draws' ranges go through the ring,
+           in command order, so earlier draws of the frame still see the old bytes */
         static int nolazy = -1;
         if (r->map_type == 4) t->discard_serial = g_serial;
-        if (r->map_type == 5 && t->shadow && (r->bind & 3) && !(r->bind & ~3u) && src == r->backing + r->sub_offset[0] &&
+        if ((r->map_type == 5 || r->map_type == 4) && t->shadow && (r->bind & 3) && !(r->bind & ~3u) && src == r->backing + r->sub_offset[0] &&
             !dbg_flag("nolazybuffers", &nolazy)) {
             t->lazy = 1;
             return;
@@ -715,22 +781,25 @@ static void res_upload(GpuRes* r, uint32_t sub, const int32_t* box, uint64_t src
         }
         /* ?uploadstats=1: how much the dynamic-buffer diff scans against what actually changes */
         static int ustats = -1;
-        static uint64_t us_calls, us_scan, us_sent, us_type[8], us_big;
+        static uint64_t us_calls, us_scan, us_sent, us_type[8], us_big, us_bind[16];
         if (dbg_flag("uploadstats", &ustats)) {
             us_calls++; us_scan += n; us_type[r->map_type & 7]++; if (n > us_big) us_big = n;
+            us_bind[(r->bind & 1 ? 1 : 0) | (r->bind & 2 ? 2 : 0) | (r->bind & 4 ? 4 : 0) | (r->bind & 8 ? 8 : 0)] += n >> 10;
             if (us_calls % 4000 == 0) {
                 host_log("[upload] %llu diffs of buffers >= 64 KB: %.0f MB scanned, %.1f MB sent, largest %u KB; map types discard %llu, no-overwrite %llu, write %llu, other %llu",
                          (unsigned long long)us_calls, us_scan / 1048576.0, us_sent / 1048576.0, (unsigned)(us_big >> 10), (unsigned long long)us_type[4],
                          (unsigned long long)us_type[5], (unsigned long long)us_type[2], (unsigned long long)(us_type[0] + us_type[1] + us_type[3] + us_type[6] + us_type[7]));
+                host_log("[upload] scanned by binding (KB): vb %llu, ib %llu, cb %llu, srv %llu, vb+srv %llu, ib+srv %llu, other %llu",
+                         (unsigned long long)us_bind[1], (unsigned long long)us_bind[2], (unsigned long long)us_bind[4], (unsigned long long)us_bind[8],
+                         (unsigned long long)us_bind[9], (unsigned long long)us_bind[10],
+                         (unsigned long long)(us_bind[3] + us_bind[5] + us_bind[6] + us_bind[7] + us_bind[11] + us_bind[12] + us_bind[13] + us_bind[14] + us_bind[15] + us_bind[0]));
+                memset(us_bind, 0, sizeof us_bind);
                 us_scan = us_sent = 0;
             }
         }
-        uint32_t lo = 0, hi = n;
-        while (lo + 8 <= n && !memcmp(p + lo, t->shadow + lo, 8)) lo += 8;
-        while (lo < n && p[lo] == t->shadow[lo]) lo++;
+        uint32_t lo = diff_lo(p, t->shadow, 0, n), hi;
         if (lo == n) return;
-        while (hi >= lo + 8 && !memcmp(p + hi - 8, t->shadow + hi - 8, 8)) hi -= 8;
-        while (hi > lo && p[hi - 1] == t->shadow[hi - 1]) hi--;
+        hi = diff_hi(p, t->shadow, lo, n);
         lo &= ~3u;
         hi = (hi + 3) & ~3u;
         if (hi > n) hi = n;
@@ -851,7 +920,6 @@ static int make_view(GpuView* v, WView* w, const char* dim, int force_single)
     bp(&jb, "{\"tex\":%d,\"dim\":\"%s\",\"mip\":%u,\"mips\":%u,\"layer\":%u,\"layers\":%u,\"aspect\":\"%s\"", t->id, dim, w->mip, mips, w->layer, layers,
        w->stencil_aspect ? "stencil-only" : w->depth_aspect ? "depth-only" : "all");
     if (fmt) bp(&jb, ",\"format\":\"%s\"", fmt);
-    if (v->format == 65 && !w->depth_aspect) bp(&jb, ",\"swizzle\":\"000r\"");
     bp(&jb, "}");
     return uewg_view_create(jb.p);
 }
@@ -2392,6 +2460,15 @@ static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vert
     uint32_t nl = first_rt ? view_layers(first_rt) : c->dsv ? view_layers(c->dsv) : 0;
     if (!nl) DROP(0);
     if (nl > 256) nl = 256;
+    {
+        static int said, dbg = -1;
+        if (dbg < 0) dbg = host_query_flag("texdebug");
+        if (dbg && said < 40) {
+            said++;
+            host_log("[tex] layered draw: %u layers, target type %d fmt %u, %u verts x %u, gs layer reg %d", nl,
+                     first_rt && first_rt->res ? first_rt->res->type : -1, first_rt ? first_rt->format : 0, count, instances, g->layer_reg);
+        }
+    }
     uint32_t nprim = c->topology == 5 ? (count >= 3 ? count - 2 : 0) : c->topology == 3 ? (count >= 2 ? count - 1 : 0) : count / (uint32_t)g->nv;
     if (!nprim) return;
     /* each primitive lands at most once per layer */
@@ -2444,6 +2521,9 @@ static void gs_draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vert
     k.topology = 4;
     int rpipe = render_pipeline(c, rp, &k);
     if (!rpipe) DROP(4);
+    /* wait for both pipelines like any draw: a layered draw is often made once (a LUT, a volume's first fill) */
+    wait_pipe(g->pipe);
+    wait_pipe(rpipe);
     pk[n++] = rpipe;
     pk[n++] = rp->cb_group[0] ? rp->cb_group[0] : empty_bg; pk[n++] = 0;
     static int pt_bg, pt_bg_buf, pt_bg_layout;
@@ -2518,6 +2598,7 @@ static void sync_lazy(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_ve
 {
     uint32_t mn = 0, mx = 0;
     int span = -1;
+    for (int i = 0; i < 17; i++) lz[i].on = 0;
     for (int i = 0; i < 16; i++) {
         GpuRes* vb = c->vb[i];
         WTex* t = T(vb);
@@ -2534,13 +2615,13 @@ static void sync_lazy(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_ve
             if (b < a) b = a;
             v0 = (uint64_t)a; v1 = (uint64_t)b;
         }
-        lazy_range(vb, c->vb_offset[i] + v0 * st, c->vb_offset[i] + v1 * st);
+        lazy_draw(vb, c->vb_offset[i] + v0 * st, c->vb_offset[i] + v1 * st, i);
     }
     WTex* it = T(c->ib);
     if (indexed && it && it->lazy) {
         uint64_t isz = c->ib_format == 42 ? 4 : 2;
         if (indirect) lazy_all(c->ib);
-        else lazy_range(c->ib, c->ib_offset + first * isz, c->ib_offset + ((uint64_t)first + count) * isz);
+        else lazy_draw(c->ib, c->ib_offset + first * isz, c->ib_offset + ((uint64_t)first + count) * isz, 16);
     }
 }
 
@@ -2653,9 +2734,12 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
             if (want_vb >> i & 1) { pk[n++] = i; pk[n++] = -1; pk[n++] = 0; nvb++; }
             continue;
         }
-        t->used = g_serial;
-        pk[n++] = i; pk[n++] = t->id; pk[n++] = (int32_t)((c->vb_offset[i] + (inst_step[i] ? shift / inst_step[i] * c->vb_stride[i] : vshift * c->vb_stride[i])) & ~3u);
+        uint32_t boff = (uint32_t)((c->vb_offset[i] + (inst_step[i] ? shift / inst_step[i] * c->vb_stride[i] : vshift * c->vb_stride[i])) & ~3u);
+        int64_t ro = lazy_bind(c->vb[i], i, boff, 4);
         nvb++;
+        if (ro >= 0) { pk[n++] = i; pk[n++] = -3; pk[n++] = (int32_t)ro; continue; }   /* -3: the ring */
+        t->used = g_serial;
+        pk[n++] = i; pk[n++] = t->id; pk[n++] = (int32_t)boff;
     }
     pk[at] = nvb;
     int m = put_fixed(c, w, h, n);
@@ -2666,8 +2750,9 @@ static void draw(GpuCtx* c, uint32_t count, uint32_t first, int32_t base_vertex,
     if (indexed) {
         WTex* t = T(c->ib);
         if (!t || !t->id) DROP(6);
-        t->used = g_serial;
-        pk[n++] = t->id; pk[n++] = c->ib_format == 42; pk[n++] = (int32_t)c->ib_offset;
+        int64_t ro = lazy_bind(c->ib, 16, c->ib_offset, c->ib_format == 42 ? 4 : 2);
+        if (ro >= 0) { pk[n++] = -3; pk[n++] = c->ib_format == 42; pk[n++] = (int32_t)ro; }
+        else { t->used = g_serial; pk[n++] = t->id; pk[n++] = c->ib_format == 42; pk[n++] = (int32_t)c->ib_offset; }
     }
     uewg_draw(pk);
     drawn++;

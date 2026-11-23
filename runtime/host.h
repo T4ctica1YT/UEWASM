@@ -124,6 +124,8 @@ extern const uint32_t rt_steam_appid;
 #define HLE32_ESP(c) ((uint32_t)ld64_(MEMB, (c)->r[4] + 8ull * 21))
 #define HLE32_ECX(c) ((uint32_t)ld64_(MEMB, (c)->r[4] + 8ull * 22))
 int host_query_flag(const char* name);
+/* opens an http(s) address in a new browser tab (a sign-in page, a store link); 1 when shown or offered */
+int host_open_url(const char* url);
 /* a page parameter in hex (?name=1e3100000), 0 when absent */
 double host_query_hex(const char* name);
 int host_query_int(const char* name);

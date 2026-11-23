@@ -238,6 +238,7 @@ void host_browser_turn(void) {}
 void host_browser_turned(void) {}
 int host_ext_waits;
 int host_query_flag(const char* name) { (void)name; return 0; }
+int host_open_url(const char* url) { (void)url; return 0; }
 double host_query_hex(const char* name) { const char* e = getenv(name); return e ? (double)strtoull(e, NULL, 16) : 0; }
 int host_query_int(const char* name) { (void)name; return 0; }
 int host_page_int(const char* name) { (void)name; return 0; }

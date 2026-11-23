@@ -1,5 +1,7 @@
 /* Winsock inside the page: TCP and UDP between sockets of this process over 127.0.0.1 (libraries such as libcurl
-   make a loopback socket pair to wake themselves), and an offline machine for every other address. */
+   make a loopback socket pair to wake themselves). Other addresses are offline, unless the page carries them: an
+   offline stand-in for a service (Module.uewNet backends), or real connections through a WISP server (uew_wisp.js),
+   which takes every other host name and address, TCP and UDP. */
 #include "host.h"
 #include "sched.h"
 
@@ -19,6 +21,9 @@ typedef struct Sock {
     uint8_t* buf; uint32_t head, len;
     struct { uint16_t from; uint32_t n; uint8_t* p; } dgram[QMAX]; int nd;
     int bridge;                     /* a connection the page serves (Module.uewNet): its id there */
+    uint8_t peer_ip[4];             /* bridged: the address it went to, as the game named it */
+    uint16_t peer_port;
+    struct { uint8_t ip[4]; uint16_t port; int id; } ub[8]; int nub;   /* bridged UDP: one stream per destination */
 } Sock;
 
 /* The page may serve some host names itself (an offline stand-in for a game's online services): Module.uewNet.claim(name)
@@ -27,14 +32,18 @@ typedef struct Sock {
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 int net_claim(const char* name);
-int net_open(int route, int port);
+int net_open(int route, int port, int udp);
+int net_recv1(int id, uint8_t* p, int cap);
+int net_claim_ip(const char* ip);
 void net_send(int id, const uint8_t* p, int n);
 int net_avail(int id);
 int net_recv(int id, uint8_t* p, int cap);
 void net_close(int id);
 #else
 static int net_claim(const char* name) { (void)name; return 0; }
-static int net_open(int route, int port) { (void)route; (void)port; return 0; }
+static int net_open(int route, int port, int udp) { (void)route; (void)port; (void)udp; return 0; }
+static int net_recv1(int id, uint8_t* p, int cap) { (void)id; (void)p; (void)cap; return -1; }
+static int net_claim_ip(const char* ip) { (void)ip; return 0; }
 static void net_send(int id, const uint8_t* p, int n) { (void)id; (void)p; (void)n; }
 static int net_avail(int id) { (void)id; return -1; }
 static int net_recv(int id, uint8_t* p, int cap) { (void)id; (void)p; (void)cap; return -1; }
@@ -96,6 +105,7 @@ HLE(closesocket)
     Sock* k = get(A1);
     if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
     if (k->bridge) net_close(k->bridge);
+    for (int i = 0; i < k->nub; i++) net_close(k->ub[i].id);
     if (k->peer >= 0 && socks[k->peer].used) { socks[k->peer].peer_closed = 1; socks[k->peer].peer = -1; }
     for (int i = 0; i < k->nq; i++) { Sock* q = &socks[k->queue[i]]; free_buf(q); q->used = 0; }
     free_buf(k);
@@ -127,6 +137,43 @@ static void put_addr(Sock* k, uint64_t sa, uint64_t lenp, uint16_t port)
     if (lenp) ST32(lenp, n);
 }
 
+/* a page route for an IPv4 sockaddr: 127.1.x.y names a host the page claimed; other non-loopback addresses go to the
+   page when it carries real connections (WISP); 0 when nothing takes it */
+static int route_of(uint64_t sa)
+{
+    if (LD16(sa) != 2) return 0;
+    uint8_t a = (uint8_t)LD8(sa + 4), b = (uint8_t)LD8(sa + 5);
+    if (a == 127 && b == 1) return (int)(LD8(sa + 6) << 8 | LD8(sa + 7));
+    if (is_loopback(sa)) return 0;
+    char ip[20];
+    snprintf(ip, sizeof ip, "%u.%u.%u.%u", a, b, (unsigned)LD8(sa + 6), (unsigned)LD8(sa + 7));
+    return net_claim_ip(ip);
+}
+static void put_ip(Sock* k, uint64_t sa, uint64_t lenp, const uint8_t ip[4], uint16_t port)
+{
+    if (!sa) return;
+    uint32_t cap = lenp ? (uint32_t)LD32(lenp) : 16;
+    uint8_t tmp[16] = { 2, 0, (uint8_t)(port >> 8), (uint8_t)port, ip[0], ip[1], ip[2], ip[3] };
+    (void)k;
+    memcpy(G2H(sa), tmp, cap < 16 ? cap : 16);
+    if (lenp) ST32(lenp, 16);
+}
+/* the bridged UDP stream to a destination, opened on first use */
+static int udp_stream(Sock* k, uint64_t to)
+{
+    uint8_t ip[4] = { (uint8_t)LD8(to + 4), (uint8_t)LD8(to + 5), (uint8_t)LD8(to + 6), (uint8_t)LD8(to + 7) };
+    uint16_t port = sa_port(to);
+    for (int i = 0; i < k->nub; i++) if (!memcmp(k->ub[i].ip, ip, 4) && k->ub[i].port == port) return k->ub[i].id;
+    if (k->nub == 8) return 0;
+    int route = route_of(to);
+    int id = route ? net_open(route, port, 1) : 0;
+    if (!id) return 0;
+    memcpy(k->ub[k->nub].ip, ip, 4);
+    k->ub[k->nub].port = port;
+    k->ub[k->nub++].id = id;
+    return id;
+}
+
 HLE(bind)
 {
     NL("bind %llx %llx %llx %llx", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A3, (unsigned long long)A4);
@@ -149,6 +196,7 @@ HLE(getsockname)
 HLE(getpeername)
 {
     Sock* k = get(A1);
+    if (k && k->bridge) { put_ip(k, A2, A3, k->peer_ip, k->peer_port); RET(0); return; }
     if (!k || k->peer < 0) { err(k ? E_NOTCONN : E_NOTSOCK); RET((uint64_t)-1); return; }
     put_addr(k, A2, A3, socks[k->peer].port);
     RET(0);
@@ -177,10 +225,12 @@ HLE(connect)
     if (!A2) { err(E_INVAL); RET((uint64_t)-1); return; }
     if (k->connected) { err(E_ISCONN); RET((uint64_t)-1); return; }
     uint16_t port = sa_port(A2);
-    if (k->type == 1 && LD16(A2) == 2 && LD8(A2 + 4) == 127 && LD8(A2 + 5) == 1) {
-        int route = (int)(LD8(A2 + 6) << 8 | LD8(A2 + 7));
-        k->bridge = net_open(route, port);
+    int route = route_of(A2);
+    if (route) {
+        k->bridge = net_open(route, port, k->type == 2);
         if (!k->bridge) { err(E_REFUSED); RET((uint64_t)-1); return; }
+        for (int i = 0; i < 4; i++) k->peer_ip[i] = (uint8_t)LD8(A2 + 4 + i);
+        k->peer_port = port;
         if (!k->port) k->port = free_port();
         k->connected = 1;
         RET(0);
@@ -214,6 +264,8 @@ static void pull(Sock* k)
 
 static int readable(Sock* k)
 {
+    for (int i = 0; i < k->nub; i++) if (net_avail(k->ub[i].id) > 0) return 1;
+    if (k->bridge && k->type == 2) return net_avail(k->bridge) > 0 || k->nd > 0;
     if (k->bridge) return k->len > 0 || net_avail(k->bridge) != 0;
     if (k->listening) return k->nq > 0;
     if (k->type == 2) return k->nd > 0;
@@ -293,10 +345,37 @@ HLE(send)
     NL("send %llx %llx %llx %llx", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A3, (unsigned long long)A4);
     Sock* k = get(A1);
     if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
-    if (k->type == 2) { err(E_NOTCONN); RET((uint64_t)-1); return; }
+    if (k->type == 2 && k->bridge) { net_send(k->bridge, G2H(A2), (int)A3); RET(A3); return; }
+    if (k->type == 2 && k->peer < 0) { err(E_NOTCONN); RET((uint64_t)-1); return; }
+    if (k->type == 2) {
+        Sock* d = &socks[k->peer];
+        if (d->used && d->nd < QMAX) {
+            d->dgram[d->nd].p = malloc(A3 ? A3 : 1);
+            memcpy(d->dgram[d->nd].p, G2H(A2), (size_t)A3);
+            d->dgram[d->nd].n = (uint32_t)A3;
+            d->dgram[d->nd].from = k->port;
+            d->nd++;
+        }
+        RET(A3);
+        return;
+    }
     RET((uint64_t)do_send(c, k, G2H(A2), (uint32_t)A3));
 }
-HLE(recv) { NL("recv %llx %llx %llx", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A3); RET((uint64_t)do_recv(c, A1, G2H(A2), (uint32_t)A3, (A4 & 2) != 0)); }
+HLE(recv)
+{
+    NL("recv %llx %llx %llx", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A3);
+    Sock* k = get(A1);
+    if (k && k->type == 2 && k->bridge) {
+        while (net_avail(k->bridge) <= 0) {
+            if (k->nonblock) { err(E_WOULDBLOCK); RET((uint64_t)-1); return; }
+            sched_sleep(c, 1);
+            if (!(k = get(A1))) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
+        }
+        RET((uint64_t)net_recv1(k->bridge, G2H(A2), (int)A3));
+        return;
+    }
+    RET((uint64_t)do_recv(c, A1, G2H(A2), (uint32_t)A3, (A4 & 2) != 0));
+}
 
 HLE(sendto)
 {
@@ -304,7 +383,16 @@ HLE(sendto)
     if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
     if (k->type != 2) { RET((uint64_t)do_send(c, k, G2H(A2), (uint32_t)A3)); return; }
     uint64_t to = ARG(5);
-    int d = to ? (is_loopback(to) ? find_listener(sa_port(to), 2) : -2) : k->peer;
+    if (!to && k->bridge) { net_send(k->bridge, G2H(A2), (int)A3); RET(A3); return; }
+    if (to && !is_loopback(to)) {
+        int id = udp_stream(k, to);
+        if (!id) { err(E_UNREACH); RET((uint64_t)-1); return; }
+        if (!k->port) k->port = free_port();
+        net_send(id, G2H(A2), (int)A3);
+        RET(A3);
+        return;
+    }
+    int d = to ? find_listener(sa_port(to), 2) : k->peer;
     if (d == -2) { err(E_UNREACH); RET((uint64_t)-1); return; }
     if (!k->port) k->port = free_port();
     /* to a closed port UDP is just lost */
@@ -324,7 +412,22 @@ HLE(recvfrom)
     Sock* k = get(A1);
     if (!k) { err(E_NOTSOCK); RET((uint64_t)-1); return; }
     if (k->type != 2) { RET((uint64_t)do_recv(c, A1, G2H(A2), (uint32_t)A3, (A4 & 2) != 0)); return; }
-    while (!k->nd) {
+    for (;;) {
+        /* datagrams that came back on bridged streams: one per call, from the address it was sent to */
+        for (int i = 0; i < k->nub; i++)
+            if (net_avail(k->ub[i].id) > 0) {
+                int n = net_recv1(k->ub[i].id, G2H(A2), (int)A3);
+                put_ip(k, ARG(5), ARG(6), k->ub[i].ip, k->ub[i].port);
+                RET((uint64_t)(n < 0 ? 0 : n));
+                return;
+            }
+        if (k->bridge && net_avail(k->bridge) > 0) {
+            int n = net_recv1(k->bridge, G2H(A2), (int)A3);
+            put_ip(k, ARG(5), ARG(6), k->peer_ip, k->peer_port);
+            RET((uint64_t)(n < 0 ? 0 : n));
+            return;
+        }
+        if (k->nd) break;
         if (k->nonblock) { err(E_WOULDBLOCK); RET((uint64_t)-1); return; }
         sched_sleep(c, 1);
         k = get(A1);
@@ -443,7 +546,7 @@ HLE(WSAPoll)
     }
 }
 
-/* ---- names and addresses: numbers and localhost resolve, other names don't (offline) ---- */
+/* ---- names and addresses: numbers and localhost resolve; other names only when the page takes them ---- */
 
 HLE(htons) { RET((uint16_t)(((A1 & 0xFF) << 8) | ((A1 >> 8) & 0xFF))); }
 HLE(ntohs) { hle_htons(c); }

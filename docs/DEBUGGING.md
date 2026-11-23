@@ -99,7 +99,7 @@ what a stack pointer loaded from something that was never a stack address looks 
 ```
 
 The usual cause is a call that pops the wrong number of argument bytes (32-bit `stdcall`). Imports take theirs from
-Windows' own DLLs (`uewasm/recomp/stdcall.py`, cached in `stdcall32.json`; documented values for the ones that can't
+Windows' own DLLs (`rustlift/src/bin/uewrecomp/stdcall.rs`, cached in `stdcall32.json`; documented values for the ones that can't
 be read there); COM methods the runtime implements need a per-method table (`com_nargs()`), and an interface that
 lacks one says so the first time a 32-bit game creates it:
 
@@ -229,14 +229,14 @@ in 32 bits breaks on the first allocation instead of deep into a game.
 ## Reading the game's code
 
 The recompiled C is in `builds/<game>/gen/funcs_*.c` (`grep -l "^void F_<address>(CPU" builds/<game>/gen/funcs_*.c`).
-To read the original instructions, any x86 disassembler works on the exe; the recompiler's own loader gives the
-image at the address the build uses:
+To read the original instructions, any x86 disassembler works on the exe. `builds/<game>/image.bin` is every module
+already relocated to the addresses the build uses, starting at `IMAGE_LO` (in `gen/meta.c`, usually `0x400000`), so an
+address `A` is at file offset `A - IMAGE_LO`; for example with the `iced-x86` Python package:
 
 ```python
-from uewasm.recomp import pe
 import iced_x86 as I
-p = pe.load(r"C:\Games\MyGame\Binaries\Win32\MyGame.exe")
-img = p.image(0x400000)
-for ins in I.Decoder(32, img[0x236d20:0x236d60], ip=0x636d20):
+img = open(r"builds\MyGame\image.bin", "rb").read()
+lo, a = 0x400000, 0x636d20
+for ins in I.Decoder(32, img[a - lo:a - lo + 64], ip=a):
     print(hex(ins.ip), I.Formatter(I.FormatterSyntax.INTEL).format(ins))
 ```

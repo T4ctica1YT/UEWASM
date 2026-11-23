@@ -45,7 +45,6 @@ def main():
     ap.add_argument("--no-wasm", action="store_true")
     ap.add_argument("--x86", action="store_true", help="build the tests as 32-bit programs")
     ap.add_argument("--threads", choices=["coop", "real"], default="coop", help="web build threading (real: guest threads on several cores)")
-    ap.add_argument("--lifter", choices=["python", "rust"], default="python", help="which lifter recompiles the tests")
     ap.add_argument("--mem64", action="store_true", help="64-bit memory (wasm64) with 5 GB of guest memory, so guest addresses pass 4 GB")
     a = ap.parse_args()
     env = build.msvc_env("x86" if a.x86 else "x64")
@@ -54,7 +53,7 @@ def main():
     for src in srcs:
         exe = compile_test(src, env, a.x86)
         out = exe.parent / "recomp"
-        build.recompile(exe, out, mem_mb=5120 if a.mem64 else 256, log=lambda *_: None, lifter=a.lifter)
+        build.recompile(exe, out, mem_mb=5120 if a.mem64 else 256, log=lambda *_: None)
         native = build.build_native(out, log=lambda *_: None, mem64=a.mem64)
         clean_saved(exe.parent)
         ref = run([str(exe)], cwd=exe.parent)

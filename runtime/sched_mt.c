@@ -574,8 +574,12 @@ static int frame_check(GThread* t) { return host_frame_seq() != (uint32_t)t->blo
 void sched_frame_report(void)
 {
     static int reports;
+    static double avg_ms;
     uint64_t now = host_ticks_ns(), last = report_last;
-    if (last && now - last > 100000000ull && reports < 300) {
+    double ms = last ? (now - last) / 1e6 : 0, prev = avg_ms;
+    if (last) avg_ms = avg_ms ? avg_ms * 0.9 + ms * 0.1 : ms;
+    /* a hitch: over 100 ms and well over the recent frames (a slow device's every frame isn't one) */
+    if (last && ms > 100 && ms > 2.5 * prev && reports < 300) {
         char line[512];
         int n = snprintf(line, sizeof line, "[hitch] %.0f ms frame:", (now - last) / 1e6);
         for (int k = 0; k < 6; k++) {

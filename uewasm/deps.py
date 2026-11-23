@@ -87,9 +87,13 @@ def cargo():
     return c if Path(c).exists() else None
 
 
-def rust_lifter_ready():
+RUST_TOOLS = ("uewlift", "uewrecomp", "uewbuild", "uewpack", "uewserve")
+
+
+def rust_tools_ready():
+    """the recompiler's Rust tools are built (the app ships them), or can be built here"""
     from .recomp.build import RUST_DIR
-    return (RUST_DIR / "target" / "release" / f"uewlift{EXE}").exists() or cargo() is not None
+    return all((RUST_DIR / "target" / "release" / f"{t}{EXE}").exists() for t in RUST_TOOLS) or cargo() is not None
 
 
 def module(name):
@@ -187,7 +191,7 @@ class Need:
 
 
 def missing(o):
-    """what the chosen options need that this PC lacks; o has the build options' keys (native, lifter, wasm_opt, videos, aes)"""
+    """what the chosen options need that this PC lacks; o has the build options' keys (native, wasm_opt, videos, aes)"""
     out = []
     root = find_emsdk()
     if not root:
@@ -206,11 +210,11 @@ def missing(o):
                         "with 'Desktop development with C++')." + ("\n\nUEWASM can install the Build Tools for you with winget "
                                                                    "(about 6 GB; Windows asks for administrator rights)." if winget() else ""),
                         install=("Install Build Tools for me", install_msvc) if winget() else None, off="Skip the native test .exe", url=VS_URL))
-    if o.get("lifter") == "rust" and not rust_lifter_ready():
+    if not rust_tools_ready():
         out.append(Need("rust", "Rust", "Rust isn't installed",
-                        "The Rust recompiler is built from source the first time it's used, which needs the Rust toolchain. "
-                        "The Python recompiler gives the same result, only slower." + ("\n\nUEWASM can install Rust for you with winget." if winget() else ""),
-                        install=("Install Rust for me", install_rust) if winget() else None, off="Use the Python recompiler", url=RUSTUP_URL))
+                        "The recompiler's tools (rustlift/) are built from source the first time they're used, which needs the Rust "
+                        "toolchain." + ("\n\nUEWASM can install Rust for you with winget." if winget() else ""),
+                        install=("Install Rust for me", install_rust) if winget() else None, url=RUSTUP_URL))
     if o.get("videos") and not module("imageio_ffmpeg"):
         out.append(Need("ffmpeg", "imageio-ffmpeg", "The video encoder isn't installed",
                         "Shrinking videos uses ffmpeg from the imageio-ffmpeg Python package, which isn't installed.",
@@ -231,7 +235,7 @@ def status():
         "emsdk": str(root) if root else None,
         "binaryen": bool(root and binaryen(root)),
         "msvc": msvc(),
-        "rust": cargo() or ("built" if rust_lifter_ready() else None),
+        "rust": cargo() or ("built" if rust_tools_ready() else None),
         "ffmpeg": module("imageio_ffmpeg"),
         "crypto": module("Crypto"),
     }

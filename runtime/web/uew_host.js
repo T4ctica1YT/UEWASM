@@ -171,6 +171,30 @@ addToLibrary({
     if (typeof location === "undefined") return 0;
     return new RegExp("[?&]" + UTF8ToString(name) + "=1(&|$)").test(location.search) ? 1 : 0;
 },
+  // a game opening a web page (an Epic account sign-in, a store link): a new tab, or, when the browser blocks tabs not
+  // opened by a click, a bar the player clicks
+  host_open_url__proxy: 'sync',
+  host_open_url__deps: ['$UTF8ToString'],
+  host_open_url__sig: 'ip',
+  host_open_url: function (p) {
+    if (typeof document === "undefined") return 0;
+    const url = UTF8ToString(p);
+    if (!/^https?:\/\//i.test(url)) return 0;
+    console.log("[web] the game opens " + url);
+    let w = null;
+    try { w = window.open(url, "_blank", "noopener"); } catch (e) { }
+    if (w) return 1;
+    const bar = document.createElement("div");
+    bar.style.cssText = "position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:2147483647;background:#1b1f24;color:#e6e6e6;" +
+      "font:14px system-ui,sans-serif;padding:10px 14px;border-radius:8px;box-shadow:0 6px 24px #000a;display:flex;gap:12px;align-items:center";
+    const host = (() => { try { return new URL(url).host; } catch (e) { return url; } })();
+    bar.innerHTML = '<span>The game wants to open <b></b></span><button style="padding:6px 12px;border:0;border-radius:4px;background:#2d73ff;color:#fff;cursor:pointer">Open</button><a href="#" style="color:#9aa">Not now</a>';
+    bar.querySelector("b").textContent = host;
+    bar.querySelector("button").onclick = () => { window.open(url, "_blank", "noopener"); bar.remove(); };
+    bar.querySelector("a").onclick = e => { e.preventDefault(); bar.remove(); };
+    document.body.appendChild(bar);
+    return 1;
+},
   host_query_hex__proxy: 'sync',
   host_query_hex__deps: ['$UTF8ToString'],
   host_query_hex__sig: 'dp',
@@ -300,25 +324,42 @@ addToLibrary({
     HEAPU8.set(l.b, body);
     Module.uewNet.last = null;
 },
+  // routes: a host name an offline backend takes (Module.uewNet.claim/open), or one the WISP client carries for real
+  // (Module.uewNet.wisp, uew_wisp.js); route numbers are what the runtime puts in 127.1.x.y addresses
   net_claim__proxy: 'sync',
   net_claim__deps: ['$UTF8ToString', '$stringToNewUTF8'],
   net_claim__sig: 'ip',
   net_claim: function (name) {
     const n = Module.uewNet;
-    if (!n || !n.claim) return 0;
+    if (!n) return 0;
     const s = UTF8ToString(name);
-    if (!n.claim(s)) return 0;
-    n.names = n.names || [""];
-    let i = n.names.indexOf(s);
-    if (i < 0) { i = n.names.length; n.names.push(s); }
+    const wisp = !(n.claim && n.claim(s));
+    if (wisp && !(n.wisp && n.wisp.ok(s))) return 0;
+    n.names = n.names || [null];
+    let i = n.names.findIndex(r => r && r.name === s && r.wisp === wisp);
+    if (i < 0) { i = n.names.length; n.names.push({ name: s, wisp }); }
+    return i;
+},
+  net_claim_ip__proxy: 'sync',
+  net_claim_ip__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_claim_ip__sig: 'ip',
+  net_claim_ip: function (ip) {
+    const n = Module.uewNet;
+    const s = UTF8ToString(ip);
+    if (!n || !n.wisp || !n.wisp.ok(s)) return 0;
+    n.names = n.names || [null];
+    let i = n.names.findIndex(r => r && r.name === s && r.wisp);
+    if (i < 0) { i = n.names.length; n.names.push({ name: s, wisp: true }); }
     return i;
 },
   net_open__proxy: 'sync',
   net_open__deps: ['$UTF8ToString', '$stringToNewUTF8'],
-  net_open__sig: 'iii',
-  net_open: function (route, port) {
+  net_open__sig: 'iiii',
+  net_open: function (route, port, udp) {
     const n = Module.uewNet;
-    const c = n && n.open ? n.open(n.names[route], port) : null;
+    const r = n && n.names ? n.names[route] : null;
+    if (!r) return 0;
+    const c = r.wisp ? n.wisp.open(r.name, port, !!udp) : n.open ? n.open(r.name, port) : null;
     if (!c) return 0;
     n.conns = n.conns || [null];
     const id = n.conns.length;
@@ -327,6 +368,20 @@ addToLibrary({
     c.end = () => { c.closed = true; };
     n.conns.push(c);
     return id;
+},
+  // one datagram (bridged UDP keeps each packet as it arrived)
+  net_recv1__proxy: 'sync',
+  net_recv1__deps: ['$UTF8ToString', '$stringToNewUTF8'],
+  net_recv1__sig: 'iipi',
+  net_recv1: function (id, p, cap) {
+    const c = Module.uewNet.conns[id];
+    if (!c) return -1;
+    if (!c.q.length) return c.closed ? -1 : 0;
+    const d = c.q.shift();
+    c.qlen -= d.length;
+    const k = Math.min(cap, d.length);
+    HEAPU8.set(d.subarray(0, k), p);
+    return k;
 },
   net_send__proxy: 'sync',
   net_send__deps: ['$UTF8ToString', '$stringToNewUTF8'],

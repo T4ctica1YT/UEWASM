@@ -395,7 +395,24 @@ HLE(PathCchRemoveBackslash)
     if (n > 3 && (LD16(A1 + 2 * (n - 1)) == '\\')) { ST16(A1 + 2 * (n - 1), 0); RET(0); return; }
     RET(1);
 }
-HLE(ShellExecuteA) { RET(2); }    /* SE_ERR_FNF: nothing to launch */
+/* ShellExecute: a web address opens in a new browser tab (sign-in pages, store links); anything else there's nothing to
+   launch for (SE_ERR_FNF). Success is a value above 32. */
+static uint32_t shell_open(const char* file) { return file && host_open_url(file) ? 42 : 2; }
+HLE(ShellExecuteA) { RET(shell_open(A3 ? GSTR(A3) : NULL)); }
+HLE(ShellExecuteW) { char f[2048] = ""; if (A3) wstr_to_utf8(A3, f, sizeof f); RET(shell_open(f)); }
+/* SHELLEXECUTEINFOW: cbSize, fMask, hwnd, lpVerb, lpFile, lpParameters, lpDirectory, nShow, hInstApp */
+HLE(ShellExecuteExW)
+{
+    uint64_t i = A1;
+    if (!i) { hle_set_error(87); RET(0); return; }
+    char f[2048] = "";
+    uint64_t file = LDP(i + (RT_G32 ? 16 : 24));
+    if (file) wstr_to_utf8(file, f, sizeof f);
+    uint32_t r = shell_open(f);
+    STP(i + (RT_G32 ? 32 : 56), r);
+    if (r <= 32) { hle_set_error(2); RET(0); return; }
+    RET(1);
+}
 HLE(SHCreateItemFromParsingName) { if (A4) ST64(A4, 0); RET(0x80004001); }
 
 /* ---- version info, ANSI ---- */
@@ -430,13 +447,6 @@ HLE(EventActivityIdControl) { if (A2) memset(G2H(A2), 0, 16); RET(0); }
 HLE(EventWrite) { RET(0); }
 HLE(EventEnabled) { RET(0); }
 HLE(LookupPrivilegeValueW) { if (A3) { ST32(A3, 20); ST32(A3 + 4, 0); } RET(1); }
-HLE(SystemFunction036)   /* RtlGenRandom */
-{
-    static uint64_t s = 0x9E3779B97F4A7C15ull;
-    s ^= host_ticks_ns();
-    for (uint32_t i = 0; i < (uint32_t)A2; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ST8(A1 + i, (uint8_t)s); }
-    RET(1);
-}
 HLE(BuildExplicitAccessWithNameW) { if (A1) memset(G2H(A1), 0, 48); RET(0); }
 HLE(BuildSecurityDescriptorW) { if (ARG(8)) ST32(ARG(8), 0); if (ARG(9)) ST64(ARG(9), 0); RET(50); }
 HLE(ConvertStringSecurityDescriptorToSecurityDescriptorW) { hle_set_error(50); RET(0); }
@@ -536,13 +546,10 @@ HLE(WSASend) { hle_set_error(10045); RET((uint64_t)-1); }
 HLE(WSASendDisconnect) { hle_set_error(10045); RET((uint64_t)-1); }
 
 /* ---- crypto: no certificate stores or keys ---- */
-HLE(CertOpenSystemStoreW) { RET(0); }
-HLE(CertOpenSystemStoreA) { RET(0); }
 HLE(CertCreateContext) { RET(0); }
 HLE(CertGetEnhancedKeyUsage) { hle_set_error(0x80092004); RET(0); }
 HLE(CertGetIntendedKeyUsage) { RET(0); }
 HLE(CertSetCertificateContextProperty) { RET(1); }
-HLE(CertVerifyCertificateChainPolicy) { if (A4) ST32(A4 + 4, 0x800B0109); RET(1); }
 HLE(CryptAcquireCertificatePrivateKey) { hle_set_error(0x8009200B); RET(0); }
 HLE(PFXExportCertStoreEx) { RET(0); }
 HLE(NCryptFreeObject) { RET(0); }
@@ -763,7 +770,6 @@ HLE(AppPolicyGetProcessTerminationMethod) { if (A2) ST32(A2, 0); RET(0); }
 HLE(AppPolicyGetWindowingModel) { if (A2) ST32(A2, 1); RET(0); }   /* ClassicDesktop */
 HLE(AppPolicyGetShowDeveloperDiagnostic) { if (A2) ST32(A2, 1); RET(0); }
 /* version checks pass: the reported Windows (10) is new enough for whatever is asked */
-HLE(RtlVerifyVersionInfo) { RET(0); }
 HLE(RtlGetDeviceFamilyInfoEnum) { if (A1) ST64(A1, 0x000A000047BA0000ull); if (A2) ST32(A2, 3); if (A3) ST32(A3, 1); RET(0); }   /* Windows.Desktop */
 HLE(AddDllDirectory) { RET(0x7A000401); }
 HLE(RemoveDllDirectory) { RET(1); }

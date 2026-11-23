@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="icon" href="__ICON__">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: absolute; inset: 0; margin: auto; max-width: 100%; max-height: 100%; aspect-ratio: __W__ / __H__;
+           width: 100%; height: auto; outline: none; }
+  @media (min-aspect-ratio: __W__ / __H__) { canvas { width: auto; height: 100%; } }
+  #status { position: fixed; left: 16px; bottom: 12px; font: 13px system-ui, sans-serif; color: #9a9a9a; pointer-events: none; }
+  #fps { position: fixed; left: 8px; top: 6px; font: 600 13px ui-monospace, Consolas, monospace; color: #e8e8e8; background: #000a;
+         padding: 2px 6px; border-radius: 4px; pointer-events: none; display: none; }
+</style>
+</head>
+<body>
+<canvas id="canvas" width="__W__" height="__H__" tabindex="0"></canvas>
+<script>
+  // render size, read once by the game at start: "native" (--resolution native, or ?res=native) draws at the window's own
+  // pixel count instead of a fixed size the page scales up, so text and UI stay sharp; ?res=WxH picks a size
+  (() => {
+    const c = document.getElementById("canvas");
+    const want = new URLSearchParams(location.search).get("res") || "__RES__";
+    let w = 0, h = 0;
+    if (want === "native") {
+      const d = Math.min(window.devicePixelRatio || 1, 3);
+      // a page loading in a hidden or not yet laid out view reads a 0x0 window: the screen stands in
+      w = (innerWidth || screen.availWidth || 1280) * d; h = (innerHeight || screen.availHeight || 720) * d;
+      const s = Math.min(1, 3840 / w, 2160 / h);
+      w = Math.round(w * s); h = Math.round(h * s);
+    } else {
+      const m = /^(\d{3,5})x(\d{3,5})$/.exec(want);
+      if (m) { w = +m[1]; h = +m[2]; }
+    }
+    if (w >= 320 && h >= 200) {
+      // multiples of 8: Unreal Engine 3 rounds its depth buffer up to 8 pixels, and D3D11 draws to a smaller back
+      // buffer with it while WebGPU wants attachments of one size (at 1600x900 every frame failed: depth 1600x904)
+      w &= ~7; h &= ~7;
+      c.width = w; c.height = h; c.style.aspectRatio = `${w} / ${h}`;
+      // Unreal Engine 3 takes its render size from its settings files (Rocket League: 1280x720) unless the command line
+      // gives one
+      window.uewResArgs = [`-ResX=${w}`, `-ResY=${h}`];
+    }
+  })();
+</script>
+<div id="status">Loading…</div>
+<div id="fps"></div>
+<script>
+  // frame counter: Ctrl+Shift+F toggles it (remembered), ?fps=1 or ?fps=0 in the address overrides
+  (() => {
+    const el = document.getElementById("fps");
+    let on = __FPS__;
+    try { const v = localStorage.getItem("uewFps"); if (v !== null) on = v === "1"; } catch (e) {}
+    const q = new URLSearchParams(location.search).get("fps");
+    if (q !== null) on = q !== "0";
+    const show = () => { el.style.display = on ? "block" : "none"; };
+    show();
+    addEventListener("keydown", e => {
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyF") {
+        on = !on; show();
+        try { localStorage.setItem("uewFps", on ? "1" : "0"); } catch (err) {}
+        e.preventDefault(); e.stopImmediatePropagation();
+      }
+    }, true);
+    let last = performance.now(), frames = 0, worst = 0, prev = 0, prevT = last;
+    const tick = now => {
+      const n = (window.Module && Module.uewPresents) || 0;
+      if (n !== prev) { worst = Math.max(worst, now - prevT); prev = n; prevT = now; }
+      if (now - last >= 500) {
+        const fps = (n - frames) * 1000 / (now - last);
+        if (on) el.textContent = `${fps.toFixed(0)} FPS  ${fps ? (1000 / fps).toFixed(1) : "-"} ms  worst ${worst.toFixed(0)} ms`;
+        frames = n; last = now; worst = 0;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  })();
+</script>
+<script>
+  const status = document.getElementById("status");
+  const parts = __PARTS__;
+  var Module = {
+    canvas: document.getElementById("canvas"),
+    arguments: __ARGS__.concat(window.uewResArgs || [], new URLSearchParams(location.search).getAll("arg")),
+    uewSave: __SAVE__,
+    uewSeed: __SEED__,
+    uewAsyncShaders: __ASYNC__,
+    uewDebugPanel: __DEBUG__,
+    uewNetPlaceholders: __PLACEHOLDERS__,
+    uewCacheMB: __CACHEMB__,
+    uewGpuMB: __GPUMB__,
+    uewSteam: __STEAM__,
+    uewWisp: __WISP__,
+    print: t => console.log(t),
+    printErr: t => console.log(t),
+    setStatus: t => { if (t) status.textContent = t; },
+    onRuntimeInitialized: () => { status.textContent = ""; },
+  };
+  if (parts.length) {
+    // the parts download together and are fed in order to a streaming compile, which runs while they arrive
+    Module.instantiateWasm = (imports, done) => {
+      let got = 0;
+      const res = parts.map(u => fetch(u));
+      const body = new ReadableStream({
+        async start(ctl) {
+          for (let i = 0; i < res.length; i++) {
+            const r = await res[i];
+            if (!r.ok) throw new Error(`HTTP ${r.status} for ${parts[i]}`);
+            const rd = r.body.getReader();
+            for (;;) {
+              const { done: end, value } = await rd.read();
+              if (end) break;
+              got += value.length;
+              status.textContent = `Loading code ${Math.round(got / 1048576)} MB`;
+              ctl.enqueue(value);
+            }
+          }
+          status.textContent = "Compiling…";
+          ctl.close();
+        }
+      });
+      WebAssembly.instantiateStreaming(new Response(body, { headers: { "Content-Type": "application/wasm" } }), imports)
+        .then(r => done(r.instance, r.module))
+        .catch(e => { status.textContent = "Failed to load: " + e.message; });
+      return {};
+    };
+  }
+</script>
+<script src="game.js"></script>
+</body>
+</html>

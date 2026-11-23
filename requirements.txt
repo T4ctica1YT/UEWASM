@@ -1,5 +1,4 @@
-# recompiler
-iced-x86>=1.21
+# recompiler (the tools themselves are Rust, in rustlift/)
 psutil>=5.9
 
 # optional: video re-encoding and Unreal pak rewriting (--video-height)

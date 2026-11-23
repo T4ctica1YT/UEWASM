@@ -148,9 +148,75 @@ HLE(VirtualQuery)
     ST32(A2 + 40, m ? 0x1000000 : 0x20000);
     RET(48);
 }
-HLE(VerSetConditionMask) { RET(A1); }
-HLE(VerifyVersionInfoW) { RET(1); }
-HLE(VerifyVersionInfoA) { RET(1); }
+void hle_set_error(uint32_t e);
+/* version checks against what GetVersionEx reports (Windows 10 build 19045, workstation, no service pack): each
+   VER_* field's condition sits in 3 bits at 3 * its bit index; major, minor and the service pack compare as one
+   version under the condition of the most significant one given, as Windows does */
+HLE(VerSetConditionMask)
+{
+    uint64_t m = RT_G32 ? (uint32_t)A1 | (uint64_t)(uint32_t)A2 << 32 : A1;
+    uint32_t type = (uint32_t)(RT_G32 ? A3 : A2), cond = (uint32_t)(RT_G32 ? A4 : A3) & 7;
+    for (int i = 0; i < 8; i++)
+        if (type & (1u << i)) m = (m & ~(7ull << (3 * i))) | (uint64_t)cond << (3 * i);
+    RET(m);   /* a 32-bit caller gets it in edx:eax (rt_hle32 splits it) */
+}
+
+static int ver_cmp(int64_t have, int64_t want, int cond)
+{
+    switch (cond) {
+    case 1: return have == want;
+    case 2: return have > want;
+    case 3: return have >= want;
+    case 4: return have < want;
+    case 5: return have <= want;
+    default: return 0;
+    }
+}
+
+/* 1 when the system matches; wide: OSVERSIONINFOEXW (else the A form, with a 128-byte service pack string) */
+static int verify_version(uint64_t vi, uint32_t type, uint64_t m, int wide)
+{
+    uint64_t sp = vi + 20 + (wide ? 256 : 128);
+    int64_t have[4] = { 10, 0, 0, 0 }, want[4] = { LD32(vi + 4), LD32(vi + 8), LD16(sp), LD16(sp + 2) };
+    static const uint32_t bits[4] = { 2, 1, 0x20, 0x10 };
+    static const int idx[4] = { 1, 0, 5, 4 };
+    int lead = -1;
+    for (int i = 0; i < 4 && lead < 0; i++) if (type & bits[i]) lead = i;
+    if (lead >= 0) {
+        int cond = (int)(m >> (3 * idx[lead]) & 7), r = 0;
+        for (int i = lead; i < 4; i++) {
+            if (!(type & bits[i])) continue;
+            if (have[i] != want[i]) { r = have[i] > want[i] ? 1 : -1; break; }
+        }
+        if (!ver_cmp(r, 0, cond)) return 0;
+    }
+    if ((type & 4) && !ver_cmp(19045, LD32(vi + 12), (int)(m >> 6 & 7))) return 0;
+    if ((type & 8) && !ver_cmp(2, LD32(vi + 16), (int)(m >> 9 & 7))) return 0;
+    if (type & 0x40) {
+        uint32_t want_s = LD16(sp + 4), have_s = 0x100, c = (uint32_t)(m >> 18 & 7);   /* VER_SUITE_SINGLEUSERTS */
+        if (c == 6 ? (have_s & want_s) != want_s : !(have_s & want_s)) return 0;
+    }
+    if ((type & 0x80) && !ver_cmp(1, LD8(sp + 6), (int)(m >> 21 & 7))) return 0;   /* VER_NT_WORKSTATION */
+    return 1;
+}
+
+static void verify_version_info(CPU* c, int wide)
+{
+    uint32_t type = (uint32_t)A2;
+    uint64_t m = RT_G32 ? (uint32_t)A3 | (uint64_t)(uint32_t)A4 << 32 : A3;
+    if (!A1 || !type || !m) { hle_set_error(87); RET(0); return; }
+    if (!verify_version(A1, type, m, wide)) { hle_set_error(1150); RET(0); return; }   /* ERROR_OLD_WIN_VERSION */
+    RET(1);
+}
+HLE(VerifyVersionInfoW) { verify_version_info(c, 1); }
+HLE(VerifyVersionInfoA) { verify_version_info(c, 0); }
+HLE(RtlVerifyVersionInfo)
+{
+    uint32_t type = (uint32_t)A2;
+    uint64_t m = RT_G32 ? (uint32_t)A3 | (uint64_t)(uint32_t)A4 << 32 : A3;
+    if (!A1 || !type || !m) { RET(0xC000000D); return; }
+    RET(verify_version(A1, type, m, 1) ? 0 : 0xC0000059);   /* STATUS_REVISION_MISMATCH */
+}
 HLE(GetVersion) { RET(0x47BB000A); }
 HLE(GetVersionExW)
 {

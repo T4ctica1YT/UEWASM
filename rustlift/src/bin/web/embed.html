@@ -1,0 +1,23 @@
+<script>
+  // single-file build: the code and game files are in this page; each piece becomes a Blob (kept outside the script heap)
+  (() => {
+    const dec = s => Uint8Array.fromBase64 ? Uint8Array.fromBase64(s) : Uint8Array.from(atob(s), ch => ch.charCodeAt(0));
+    const parts = new Map(), wasm = [];
+    let index = "";
+    for (const el of [...document.querySelectorAll('script[type="application/x-uew"]')]) {
+      const n = el.dataset.n, t = el.textContent;
+      el.remove();
+      if (n == "index") index = t;
+      else if (n.startsWith("wasm.")) wasm[+n.slice(5)] = new Blob([dec(t)]);
+      else parts.set(n, new Blob([dec(t)]));
+    }
+    Module.uewEmbed = { index, part: n => parts.get(n) };
+    Module.instantiateWasm = (imports, done) => {
+      status.textContent = "Compiling…";
+      const code = new Response(new Blob(wasm).stream().pipeThrough(new DecompressionStream("gzip")), { headers: { "Content-Type": "application/wasm" } });
+      WebAssembly.instantiateStreaming(code, imports).then(r => { wasm.length = 0; done(r.instance, r.module); })
+        .catch(e => { status.textContent = "Failed to load: " + e.message; });
+      return {};
+    };
+  })();
+</script>

@@ -27,7 +27,7 @@ const UEWG = {
     ctx.configure({ device, format, alphaMode: "opaque" });
     const g = Module.uewg = {
       device, queue: device.queue, ctx, canvasFormat: format, o: [null], free: [], features: new Set(features), errors: 0,
-      ring: device.createBuffer({ size: ringSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
+      ring: device.createBuffer({ size: ringSize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.VERTEX | GPUBufferUsage.INDEX | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
       ringPtr, enc: null, pass: null, blit: null, frames: 0, draws: 0, dummies: new Map(),
     };
     g.errKinds = new Map();
@@ -860,7 +860,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     const nvb = I[i++];
     for (let k = 0; k < nvb; k++) {
       const slot = I[i], id = I[i + 1], off = I[i + 2], o = slot * 3;
-      if (st.vb[o] !== id || st.vb[o + 1] !== off) { pass.setVertexBuffer(slot, id < 0 ? g.zeroVB() : g.o[id], off); st.vb[o] = id; st.vb[o + 1] = off; }
+      if (st.vb[o] !== id || st.vb[o + 1] !== off) { pass.setVertexBuffer(slot, id === -3 ? g.ring : id < 0 ? g.zeroVB() : g.o[id], off); st.vb[o] = id; st.vb[o + 1] = off; }
       i += 3;
     }
     if (st.vp[0] !== F[i] || st.vp[1] !== F[i + 1] || st.vp[2] !== F[i + 2] || st.vp[3] !== F[i + 3] || st.vp[4] !== F[i + 4] || st.vp[5] !== F[i + 5]) {
@@ -885,7 +885,7 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     // count -1: indirect, with the arguments buffer and offset in place of instances and first
     if (indexed) {
       if (st.ib[0] !== I[i] || st.ib[1] !== I[i + 1] || st.ib[2] !== I[i + 2]) {
-        pass.setIndexBuffer(g.o[I[i]], I[i + 1] ? "uint32" : "uint16", I[i + 2]);
+        pass.setIndexBuffer(I[i] === -3 ? g.ring : g.o[I[i]], I[i + 1] ? "uint32" : "uint16", I[i + 2]);
         st.ib.set(I.subarray(i, i + 3));
       }
       if (count === -1) pass.drawIndexedIndirect(g.o[instances], first);
@@ -1213,7 +1213,10 @@ fn small(v: u32, sh: u32) -> u32 { return fb(unpack2x16float(v << sh).x); }
     if (g.prof) g.prof.frameEnd();
     // long frames: what happened in them (new shaders and pipelines, file downloads)
     const now = performance.now(), h = g.hitch, F = Module.uewFiles || {};
-    if (h.last && now - h.last > 100 && g.frames > 60 && h.logged < 300) {
+    const dt = h.last ? now - h.last : 0, prev = h.avg || dt;
+    if (h.last) h.avg = h.avg ? h.avg * 0.9 + dt * 0.1 : dt;
+    // a hitch: over 100 ms and well over the recent frames (a slow device's every frame isn't one)
+    if (h.last && dt > 100 && dt > 2.5 * prev && g.frames > 60 && h.logged < 300) {
       h.logged++;
       console.log(`[hitch] ${(now - h.last).toFixed(0)} ms frame: ${h.sh + h.psh} new shaders, ${h.pipe + h.ppipe} new pipelines (this frame and the one before), ${h.rb} GPU readbacks, ` +
         `${(((F.fetched || 0) - h.bytes) / 1048576).toFixed(1)} MB in ${(F.requests || 0) - h.req} downloads (${((F.fetchMs || 0) - h.fms).toFixed(0)} ms waiting)`);

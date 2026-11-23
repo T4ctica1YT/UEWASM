@@ -15,7 +15,7 @@ pub struct Settings {
     pub renderer: String,
     pub threads: String,
     pub opt: String,
-    pub lifter: String,
+    pub steam: String,
     pub quality: String,
     pub videos: String,
     pub priority: String,
@@ -36,6 +36,11 @@ pub struct Settings {
     pub placeholders: bool,
     pub aes_on: bool,
     pub aes_key: String,
+    pub relay: bool,
+    pub wisp: bool,
+    pub wisp_url: String,
+    pub steam_wisp: bool,
+    pub eos: String,
 }
 
 impl Settings {
@@ -47,19 +52,20 @@ impl Settings {
         let b = |k: &str, d: bool| v.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
         Settings {
             game: s("game", ""), out: s("out", ""), renderer: s("renderer", "WebGPU (recommended)"), threads: s("threads", "Cooperative (no special hosting)"),
-            opt: s("opt", "Balanced (-O2)"), lifter: s("lifter", "Python (original)"), quality: s("quality", "Game's own setting"), videos: s("videos", "Keep original videos"),
+            opt: s("opt", "Balanced (-O2)"), steam: s("steam", "WebWorks server (sign-in, lobbies, multiplayer)"), quality: s("quality", "Game's own setting"), videos: s("videos", "Keep original videos"),
             priority: s("priority", "High (fastest, tuned to this PC)"), backend: s("backend", "None (games play offline as usual)"),
             resolution: s("resolution", "1280x720"), mem: n("mem", 3072), part: n("part", 16), mem_limit: n("mem_limit", 8),
             game_dlls: b("game_dlls", true), sys_dlls: b("sys_dlls", true), native: b("native", false), compress: b("compress", false),
             wasm_opt: b("wasm_opt", false), single: b("single", false), show_fps: b("show_fps", false), async_shaders: b("async_shaders", true),
-            debug_panel: b("debug_panel", true), placeholders: b("placeholders", false), aes_on: b("aes_on", false), aes_key: String::new(),
+            debug_panel: b("debug_panel", true), placeholders: b("placeholders", false), aes_on: b("aes_on", false), aes_key: String::new(), relay: b("relay", false), wisp: b("wisp", false), wisp_url: s("wisp_url", ""), steam_wisp: b("steam_wisp", false),
+            eos: s("eos", "Stand-in in the page (offline sign-in, local lobbies)"),
         }
     }
 
     /// the key itself is never written to disk
     pub fn save(&self) {
         let v = json!({
-            "game": self.game, "out": self.out, "renderer": self.renderer, "threads": self.threads, "opt": self.opt, "lifter": self.lifter, "quality": self.quality,
+            "game": self.game, "out": self.out, "renderer": self.renderer, "threads": self.threads, "opt": self.opt, "steam": self.steam, "relay": self.relay, "wisp": self.wisp, "wisp_url": self.wisp_url, "steam_wisp": self.steam_wisp, "eos": self.eos, "quality": self.quality,
             "videos": self.videos, "priority": self.priority, "backend": self.backend, "resolution": self.resolution, "mem": self.mem,
             "part": self.part, "mem_limit": self.mem_limit, "game_dlls": self.game_dlls, "sys_dlls": self.sys_dlls, "native": self.native,
             "compress": self.compress, "wasm_opt": self.wasm_opt, "single": self.single, "show_fps": self.show_fps,

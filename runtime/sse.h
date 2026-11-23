@@ -340,6 +340,10 @@ XS(PHSUBW)(XMM* d, XMM s) { XMM t; LANES(4) { t.w[i] = (uint16_t)(d->w[2 * i] - 
 XS(PHSUBD)(XMM* d, XMM s) { XMM t; LANES(2) { t.d[i] = d->d[2 * i] - d->d[2 * i + 1]; t.d[2 + i] = s.d[2 * i] - s.d[2 * i + 1]; } *d = t; }
 XS(PMADDUBSW)(XMM* d, XMM s) { XMM t; LANES(8) t.w[i] = (uint16_t)sat16(d->b[2 * i] * (int8_t)s.b[2 * i] + d->b[2 * i + 1] * (int8_t)s.b[2 * i + 1]); *d = t; }
 XS(PMULHRSW)(XMM* d, XMM s) { LANES(8) d->w[i] = (uint16_t)((((int32_t)(int16_t)d->w[i] * (int16_t)s.w[i] >> 14) + 1) >> 1); }
+XFN(PHADDSW)(XMM* d, XMM s) { XMM t; LANES(4) { t.w[i] = (uint16_t)sat16((int16_t)d->w[2 * i] + (int16_t)d->w[2 * i + 1]); t.w[4 + i] = (uint16_t)sat16((int16_t)s.w[2 * i] + (int16_t)s.w[2 * i + 1]); } *d = t; }
+XFN(PHSUBSW)(XMM* d, XMM s) { XMM t; LANES(4) { t.w[i] = (uint16_t)sat16((int16_t)d->w[2 * i] - (int16_t)d->w[2 * i + 1]); t.w[4 + i] = (uint16_t)sat16((int16_t)s.w[2 * i] - (int16_t)s.w[2 * i + 1]); } *d = t; }
+XFN(PHMINPOSUW)(XMM* d, XMM s) { int k = 0; LANES(8) if (s.w[i] < s.w[k]) k = i; uint16_t m = s.w[k]; memset(d, 0, 16); d->w[0] = m; d->w[1] = (uint16_t)k; }
+XFN(DPPD)(XMM* d, XMM s, int imm) { double sum = ((imm & 16) ? d->g[0] * s.g[0] : 0.0) + ((imm & 32) ? d->g[1] * s.g[1] : 0.0); d->g[0] = (imm & 1) ? sum : 0.0; d->g[1] = (imm & 2) ? sum : 0.0; }
 XFN(PMOVZXBQ)(XMM* d, XMM s) { XMM t; LANES(2) t.q[i] = s.b[i]; *d = t; }
 XFN(PMOVZXWQ)(XMM* d, XMM s) { XMM t; LANES(2) t.q[i] = s.w[i]; *d = t; }
 XFN(PMOVSXBQ)(XMM* d, XMM s) { XMM t; LANES(2) t.q[i] = (uint64_t)(int64_t)(int8_t)s.b[i]; *d = t; }

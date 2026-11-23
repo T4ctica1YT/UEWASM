@@ -2,7 +2,6 @@
 import json
 import os
 import queue
-import sys
 import threading
 import time
 import traceback
@@ -19,8 +18,10 @@ RENDERERS = {"WebGPU (recommended)": "webgpu", "WebGL 2 (works everywhere)": "we
 THREADS = {"Cooperative (no special hosting)": "coop", "Real threads (several cores; WebGPU, https or localhost)": "real"}
 OPTS = {"Balanced (-O2)": "-O2", "Fastest code (-O3, slower build)": "-O3", "Smallest download (-Os)": "-Os"}
 QUALITY = {"Game's own setting": "game", "Low (fastest here)": "low", "Medium": "medium", "High": "high", "Epic": "epic"}
-LIFTERS = {"Python (original)": "python", "Rust (same result, much faster)": "rust"}
 RESOLUTIONS = ["1280x720", "1600x900", "1920x1080", "960x540", "native"]
+EOS = {"Stand-in in the page (offline sign-in, local lobbies)": "standin", "Real EOS SDK (Epic's servers, through WISP)": "real"}
+STEAMS = {"WebWorks server (sign-in, lobbies, multiplayer)": "webworks", "Player's Steam account (real sign-in and tickets)": "account",
+          "Offline (no Steam server)": "offline"}
 BACKENDS = {"None (games play offline as usual)": None, "Epic online services, offline (sign-in, profiles, menus)": "epic"}
 PRIORITIES = {"High (fastest, tuned to this PC)": "high", "Low (keeps the PC usable while it builds)": "low"}
 VIDEOS = {"Keep original videos": (0, "fast"), "Shrink to render height, fast encode": (-1, "fast"),
@@ -134,9 +135,9 @@ class Estimator:
 ASSETS = Path(__file__).resolve().parent / "assets"
 # every optional tool, for the Tools tab: key, name, what needs it
 TOOLS = [("binaryen", "Binaryen", "Shrink code with Binaryen"), ("msvc", "Visual Studio C++ tools", "Native test .exe"),
-         ("rust", "Rust", "Rust recompiler"), ("ffmpeg", "ffmpeg (imageio-ffmpeg)", "Shrinking videos"),
+         ("rust", "Rust", "Recompiling (its tools are built once)"), ("ffmpeg", "ffmpeg (imageio-ffmpeg)", "Shrinking videos"),
          ("crypto", "pycryptodome", "Decrypting AES content")]
-ALL_ON = dict(native=True, lifter="rust", wasm_opt=True, videos=True, aes=True)
+ALL_ON = dict(native=True, wasm_opt=True, videos=True, aes=True)
 
 
 def load_logo():
@@ -312,7 +313,6 @@ class App:
             return v
 
         b = tab("Build")
-        self.lifter = combo(b, "Recompiler", LIFTERS, "lifter", "Python (original)", "Rust translates a big game in seconds instead of minutes")
         self.opt = combo(b, "Optimisation", OPTS, "opt", "Balanced (-O2)")
         self.priority = combo(b, "Build priority", PRIORITIES, "priority", next(iter(PRIORITIES)), "Same result either way; Low uses far less CPU and memory")
         self.game_dlls = check(b, "Recompile the game's own DLLs", "game_dlls", True)
@@ -350,6 +350,21 @@ class App:
         o = tab("Online")
         self.backend = combo(o, "Online services", BACKENDS, "backend", next(iter(BACKENDS)), "Answers the game's online sign-in without a server")
         self.placeholders = check(o, "Stand-in files for what the servers would send", "placeholders", False, "Images and data the game would download")
+        self.steam = combo(o, "Steam", STEAMS, "steam", next(iter(STEAMS)),
+                           "Steam games sign in to a WebWorks server for lobbies and multiplayer; with no server they play offline")
+        self.webworks_url = combo(o, "WebWorks server", ["http://localhost:3000"], "webworks_url", "http://localhost:3000",
+                                  "The server's address (a LAN or tunnel address for other players); ?webworks= in the page address overrides it",
+                                  editable=True)
+        self.relay = check(o, "Built-in relay for online play", "relay", False,
+                           "Lobbies and multiplayer through the relay the app's Play button (and uewasm serve) runs at the game's address")
+        self.wisp = check(o, "Real connections through WISP", "wisp", False,
+                          "The game reaches its real servers through a WISP server: the Play button's own, or the address below")
+        self.wisp_url = combo(o, "WISP server", ["(the game's own address)"], "wisp_url", "(the game's own address)",
+                              "Another WISP server (wss://host/path/); ?wisp= in the page address overrides it", editable=True)
+        self.steam_wisp = check(o, "Steam sign-in through WISP", "steam_wisp", False,
+                                "With the Steam account option and WISP: the sign-in and Steam connection go through the WISP server, so the page never contacts Steam itself")
+        self.eos = combo(o, "Epic Online Services", EOS, "eos", next(iter(EOS)),
+                         "Real: the game's own EOS SDK signs in to Epic and joins real lobbies (needs WISP, which it turns on)")
 
         t = tab("Tools")
         t.columnconfigure(1, minsize=0, weight=1)
@@ -511,10 +526,8 @@ class App:
             else:
                 btn.grid_remove()
         parts = ["Emscripten: found" if st["emsdk"] else "Emscripten: NOT FOUND (see the Tools tab)"]
-        try:
-            import iced_x86  # noqa: F401
-        except ImportError:
-            parts.append("iced-x86 missing")
+        if not st["rust"]:
+            parts.append("Rust tools: NOT BUILT (see the Tools tab)")
         self.toolchain["text"] = " · ".join(parts)
 
     def emsdk_need(self):
@@ -628,8 +641,6 @@ class App:
             self.wasm_opt.set(False)
         elif key == "msvc":
             self.native.set(False)
-        elif key == "rust":
-            self.lifter.set("Python (original)")
         elif key == "ffmpeg":
             self.videos.set("Keep original videos")
         elif key == "crypto":
@@ -638,7 +649,7 @@ class App:
 
     def resolve_needs(self):
         """stop before building when the chosen settings need a tool this PC lacks; True to go ahead"""
-        o = dict(native=self.native.get(), lifter=LIFTERS[self.lifter.get()], wasm_opt=self.wasm_opt.get(),
+        o = dict(native=self.native.get(), wasm_opt=self.wasm_opt.get(),
                  videos=VIDEOS[self.videos.get()][0] != 0, aes=self.aes_on.get())
         for n in deps.missing(o):
             c = self.ask_need(n)
@@ -692,7 +703,9 @@ class App:
                                     "game_dlls": self.game_dlls.get(), "sys_dlls": self.sys_dlls.get(), "native": self.native.get(),
                                     "compress": self.compress.get(), "videos": self.videos.get(), "wasm_opt": self.wasm_opt.get(), "show_fps": self.show_fps.get(), "async_shaders": self.async_shaders.get(), "debug_panel": self.debug_panel.get(), "priority": self.priority.get(),
                                     "backend": self.backend.get(), "placeholders": self.placeholders.get(), "aes_on": self.aes_on.get(),
-                                    "mem_limit": self.mem_limit.get(), "single": self.single.get(), "lifter": self.lifter.get(), "quality": self.quality.get(),
+                                    "steam": self.steam.get(), "webworks_url": self.webworks_url.get().strip(),
+                                    "mem_limit": self.mem_limit.get(), "single": self.single.get(), "relay": self.relay.get(), "wisp": self.wisp.get(), "wisp_url": self.wisp_url.get().strip(),
+                                    "steam_wisp": self.steam_wisp.get(), "eos": self.eos.get(), "quality": self.quality.get(),
                                     "emsdk": self.emsdk.get().strip()})
 
     def start(self):
@@ -728,7 +741,11 @@ class App:
                     part=int(self.part.get()), game_dlls=self.game_dlls.get(), sys_dlls=self.sys_dlls.get(), native=self.native.get(),
                     compress=self.compress.get(), videos=VIDEOS[self.videos.get()], wasm_opt=self.wasm_opt.get(), show_fps=self.show_fps.get(), async_shaders=self.async_shaders.get(), debug_panel=self.debug_panel.get(), priority=PRIORITIES[self.priority.get()],
                     backend=BACKENDS[self.backend.get()], placeholders=self.placeholders.get(), aes=aes, mem_limit=float(self.mem_limit.get()),
-                    threads=THREADS[self.threads.get()], single=self.single.get(), lifter=LIFTERS[self.lifter.get()], quality=QUALITY[self.quality.get()])
+                    steam=STEAMS[self.steam.get()], webworks_url=self.webworks_url.get().strip() or "http://localhost:3000",
+                    threads=THREADS[self.threads.get()], single=self.single.get(), relay=self.relay.get(), quality=QUALITY[self.quality.get()], eos=EOS[self.eos.get()],
+                    wisp=self.wisp.get() or EOS[self.eos.get()] == "real",
+                    wisp_url="" if self.wisp_url.get().strip().startswith("(") else self.wisp_url.get().strip(),
+                    steam_wisp=self.steam_wisp.get())
         self.cancel.clear()
         self.clear_log()
         self.start_btn["state"] = "disabled"
@@ -747,13 +764,12 @@ class App:
 
     def build(self, o):
         from .recomp import build, resources
-        from .recomp.link import game_dlls
         log = lambda m: self.q.put(("log", str(m)))
         try:
             resources.set_mode(o["priority"])
             resources.lower_this_process()
             log(resources.describe())
-            root, found = game_dlls(o["exe"])
+            root, found = build.game_dlls(o["exe"], real_eos=o.get("eos") == "real")
             if o.get("aes"):
                 from .recomp import upak
                 paks = upak.encrypted_paks(root)
@@ -771,7 +787,8 @@ class App:
             if mem64:
                 log(f"{o['mem']} MB of game memory doesn't fit a 32-bit module: building with 64-bit memory")
             r = build.recompile(o["exe"], o["out"], mem_mb=o["mem"], extra=extra, search=sorted({str(d.parent) for d in extra}),
-                                system_dlls=o["sys_dlls"], log=log, progress=self.progress, lifter=o.get("lifter", "python"))
+                                system_dlls=o["sys_dlls"], log=log, progress=self.progress,
+                                real_eos=o.get("eos") == "real")
             log(f"{r['functions']} functions, {r['unsupported_total']} unsupported instructions, {len(r['missing_imports'])} Windows functions not implemented yet")
             (Path(o["out"]) / "options.json").write_text(json.dumps({"renderer": o["renderer"], "threads": o.get("threads", "coop"), "opt": o["opt"],
                                                                       "mem_mb": o["mem"], "mem64": mem64}, indent=2))
@@ -784,6 +801,8 @@ class App:
                                    video_height=render_h if o["videos"][0] < 0 else o["videos"][0], video_mode=o["videos"][1],
                                    wasm_opt=o["wasm_opt"], show_fps=o["show_fps"], async_shaders=o["async_shaders"], debug_panel=o["debug_panel"],
                                    backend=o.get("backend"), placeholders=o.get("placeholders", False), aes_key=o.get("aes"),
+                                   steam=o.get("steam", "webworks"), webworks_url=o.get("webworks_url", "http://localhost:3000"), relay=o.get("relay", False), wisp=o.get("wisp", False), wisp_url=o.get("wisp_url") or None,
+                                   steam_wisp=o.get("steam_wisp", False),
                                    mem_limit_gb=o.get("mem_limit", 8), threads=o.get("threads", "coop"), single_file=o.get("single", False), quality=o.get("quality"),
                                    mem64=mem64)
             self.est.remember()

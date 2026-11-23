@@ -34,6 +34,22 @@ translated on the CPU.
 - **Keep DevTools closed while playing.** An open debugger makes WebAssembly noticeably slower.
 - **Remove the debug panel from release builds** (`--no-debug-panel`). It also removes the debug hooks.
 
+### Low-end devices (Chromebook class)
+
+To see how a build runs on a slow laptop, open DevTools → **Performance** → **CPU: 4× slowdown** (close
+DevTools again afterwards). In Crab Champions' lobby, a desktop at 4× slowdown spends about half the frame in game
+code, 30% in the runtime and 10% in WebGPU calls. What helps the most there:
+
+- **`--threads real`**: about 40% more frames than one shared thread.
+- **`--resolution 960x540`**: an integrated GPU is usually the second limit after the CPU.
+- **`?uploadstats=1`** and **`?bufdebug=1`** log how many buffer bytes are compared and sent each frame. The
+  per-frame `[webgpu]` line shows passes, reopened passes and ring copies. More than about two passes per
+  render target usually means uploads are splitting passes.
+
+Dynamic vertex and index buffers rewritten after a `DISCARD` map are drawn straight from the upload ring rather
+than copied into the buffer, which would end the render pass. In Crab Champions this took the lobby from about
+200 passes a frame to 56.
+
 ## 3. Shader stutter
 
 Each shader is translated and compiled the first time it's drawn. That's why the first visit to a new area
@@ -97,8 +113,6 @@ build says so.
 
 These don't change the result, only how long the build takes:
 
-- **`--lifter rust`** lifts machine code several times faster. It needs a Rust toolchain and is built
-  automatically the first time.
 - **`--priority low`** keeps the PC usable during a build. It's slower but produces the same output.
 - Rebuilding into the same output folder only recompiles lifted files that changed.
 
@@ -115,7 +129,7 @@ These don't change the result, only how long the build takes:
 For a mid-range PC and a UE4 game:
 
 ```
-python uewasm.py recomp "C:\Games\MyGame" --lifter rust --threads real --quality medium --resolution 1280x720 --fps
+python uewasm.py recomp "C:\Games\MyGame" --threads real --quality medium --resolution 1280x720 --fps
 ```
 
 If it's still slow, drop to `--quality low` and `--resolution 960x540`. If it stutters only in new areas, that's

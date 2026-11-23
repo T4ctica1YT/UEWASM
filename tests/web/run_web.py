@@ -30,8 +30,7 @@ def make_game(game):
 
 def run_browser(web, ranges):
     from playwright.sync_api import sync_playwright
-    serve.Handler.ranges = ranges
-    srv = serve.background(web)
+    srv = serve.background(web, ranges=ranges)
     out = []
     try:
         with sync_playwright() as p:
@@ -49,8 +48,6 @@ def run_browser(web, ranges):
             b.close()
     finally:
         srv.shutdown()
-        srv.server_close()
-        serve.Handler.ranges = True
     return out
 
 

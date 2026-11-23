@@ -120,7 +120,7 @@ static void late_zero(CPU* c) { RET(0); }
 static void late_one(CPU* c) { RET(1); }
 static const struct { const char* name; GuestFn fn; } late[] = {
     { "CallNtPowerInformation", late_power_info }, { "GetMessageExtraInfo", late_zero }, { "UnhookWindowsHookEx", late_one },
-    { "GetGeoInfoW", late_zero }, { "CertOpenSystemStoreW", late_zero }, { "DirectSoundEnumerateW", late_zero },
+    { "GetGeoInfoW", late_zero }, { "DirectSoundEnumerateW", late_zero },
     { "DirectSoundEnumerateA", late_zero }, { "DirectSoundCaptureEnumerateW", late_zero }, { "DirectSoundCaptureEnumerateA", late_zero },
 };
 
@@ -154,8 +154,6 @@ GuestFn hle_by_ordinal(const char* dll, const char* name)
 }
 
 /* shell */
-STUB(ShellExecuteW, 2)
-STUB(ShellExecuteExW, 0)
 /* user folders live in the save area; make sure the host side exists */
 static void make_user_dir(const char* p)
 {
@@ -351,20 +349,8 @@ STUB(wglGetCurrentDC, 0)
 STUB(wglGetProcAddress, 0)
 
 /* crypto, devices, compositor, timers */
-STUB(BCryptOpenAlgorithmProvider, 0xC00000BB)
-STUB(BCryptCloseAlgorithmProvider, 0)
-STUB(BCryptGetProperty, 0xC00000BB)
-STUB(BCryptCreateHash, 0xC00000BB)
-STUB(BCryptHashData, 0xC00000BB)
-STUB(BCryptFinishHash, 0xC00000BB)
-STUB(BCryptDestroyHash, 0)
-HLE(BCryptGenRandom) { for (uint64_t i = 0; i < A3; i++) ST8(A2 + i, (uint64_t)(rand() & 0xFF)); RET(0); }
 STUB(CryptProtectMemory, 1)
 STUB(CryptUnprotectMemory, 1)
-STUB(CertCreateCertificateContext, 0)
-STUB(CertFreeCertificateContext, 1)
-STUB(CertGetCertificateChain, 0)
-STUB(CertFreeCertificateChain, 0)
 void hle_set_error(uint32_t e);
 STUB(SetupDiGetClassDevsExW, 0xFFFFFFFFFFFFFFFFull)
 STUB(SetupDiGetClassDevsW, 0xFFFFFFFFFFFFFFFFull)
@@ -587,8 +573,8 @@ HLE(XInputGetBatteryInformation) { if (A3) { ST8(A3, 1); ST8(A3 + 1, 3); } RET(0
 STUB(XInputEnable, 0)
 
 /* calls older (32-bit, UE3-era) games make */
-HLE(GetWindowsDirectoryA) { const char* w = "C:\Windows"; size_t n = strlen(w); if (A1 && A2 > n) memcpy(G2H(A1), w, n + 1); RET(A2 > n ? n : n + 1); }
-HLE(GetSystemWindowsDirectoryW) { RET(utf8_to_wstr("C:\Windows", A1, (size_t)A2)); }
+HLE(GetWindowsDirectoryA) { const char* w = "C:\\Windows"; size_t n = strlen(w); if (A1 && A2 > n) memcpy(G2H(A1), w, n + 1); RET(A2 > n ? n : n + 1); }
+HLE(GetSystemWindowsDirectoryW) { RET(utf8_to_wstr("C:\\Windows", A1, (size_t)A2)); }
 HLE(GetDiskFreeSpaceA) { if (A2) ST32(A2, 8); if (A3) ST32(A3, 512); if (A4) ST32(A4, 0x1000000); if (ARG(5)) ST32(ARG(5), 0x2000000); RET(1); }
 STUB(GetCursorInfo, 0)
 STUB(LoadKeyboardLayoutW, 0x04090409)

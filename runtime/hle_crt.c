@@ -59,6 +59,22 @@ void hle_missing(CPU* c, const Thunk* e)
     dll[n] = 0;
     for (int i = 0; com_dlls[i]; i++) if (strstr(dll, com_dlls[i])) { RET(0x80004001); return; }
     if (strstr(dll, "xinput")) { RET(1167); return; }   /* ERROR_DEVICE_NOT_CONNECTED */
+    /* libraries that return a status code, where 0 means success: their own "not supported" instead */
+    static const struct { const char *dll, *prefix; uint32_t v; } codes[] = {
+        { "ntdll", "Nt", 0xC0000002 }, { "ntdll", "Zw", 0xC0000002 },   /* STATUS_NOT_IMPLEMENTED */
+        { "bcrypt", "BCrypt", 0xC00000BB }, { "ncrypt", "NCrypt", 0x80090029 },   /* STATUS_NOT_SUPPORTED, NTE_NOT_SUPPORTED */
+        { "secur32", "", 0x80090302 }, { "sspicli", "", 0x80090302 },   /* SEC_E_UNSUPPORTED_FUNCTION */
+        { "iphlpapi", "", 50 }, { "powrprof", "", 50 }, { "wlanapi", "Wlan", 50 }, { "netapi32", "Net", 50 },
+        { "advapi32", "Reg", 50 }, { "kernelbase", "Reg", 50 },   /* ERROR_NOT_SUPPORTED */
+        { "cfgmgr32", "CM_", 0x13 },   /* CR_FAILURE */
+        { "dwmapi", "", 0x80004001 }, { "shcore", "", 0x80004001 }, { "gameinput", "", 0x80004001 }, { "xgameruntime", "", 0x80004001 },
+        { "winmm", "wave", 6 }, { "winmm", "midi", 6 }, { "winmm", "mixer", 6 }, { "winmm", "aux", 6 },   /* MMSYSERR_NODRIVER */
+        { "winmm", "joy", 167 },   /* JOYERR_UNPLUGGED */
+    };
+    for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
+        if (strstr(dll, codes[i].dll) && !strncmp(e->name, codes[i].prefix, strlen(codes[i].prefix))) { RET(codes[i].v); return; }
+    /* device enumeration fails with an invalid handle, not a null one callers would take as a device list */
+    if (strstr(dll, "setupapi") && !strncmp(e->name, "SetupDiGetClassDevs", 19)) { hle_set_error(120); RET(RT_G32 ? 0xFFFFFFFFull : ~0ull); return; }
     hle_set_error(120);   /* ERROR_CALL_NOT_IMPLEMENTED */
     RET(0);
 }

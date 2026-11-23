@@ -319,7 +319,6 @@ HLE(SendMessageW) { RET(call_wndproc(c, wnd(A1), (uint32_t)A2, A3, A4)); }
 HLE(PostQuitMessage) { quit_posted = 1; RET(0); }
 HLE(PostThreadMessageW) { post_to((unsigned)A1, 0, (uint32_t)A2, A3, A4); sched_notify(); RET(1); }
 STUB(WaitMessage, 1)
-STUB(MsgWaitForMultipleObjects, 0x102)
 STUB(GetQueueStatus, 0)
 
 static void rect(uint64_t p, int l, int t, int r, int b) { ST32(p, (uint32_t)l); ST32(p + 4, (uint32_t)t); ST32(p + 8, (uint32_t)r); ST32(p + 12, (uint32_t)b); }

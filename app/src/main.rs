@@ -18,7 +18,9 @@ const RENDERERS: &[(&str, &str)] = &[("WebGPU (recommended)", "webgpu"), ("WebGL
 const THREADS: &[(&str, &str)] = &[("Cooperative (no special hosting)", "coop"), ("Real threads (several cores; WebGPU, https or localhost)", "real")];
 const OPTS: &[(&str, &str)] = &[("Balanced (-O2)", "-O2"), ("Fastest code (-O3, slower build)", "-O3"), ("Smallest download (-Os)", "-Os")];
 const QUALITY: &[(&str, &str)] = &[("Game's own setting", "game"), ("Low (fastest here)", "low"), ("Medium", "medium"), ("High", "high"), ("Epic", "epic")];
-const LIFTERS: &[(&str, &str)] = &[("Python (original)", "python"), ("Rust (same result, much faster; needs Rust installed)", "rust")];
+const EOS: &[(&str, &str)] = &[("Stand-in in the page (offline sign-in, local lobbies)", "standin"), ("Real EOS SDK (Epic's servers, through WISP)", "real")];
+const STEAMS: &[(&str, &str)] = &[("WebWorks server (sign-in, lobbies, multiplayer)", "webworks"),
+                                   ("Player's Steam account (real sign-in and tickets)", "account"), ("Offline (no Steam server)", "offline")];
 const PRIORITIES: &[(&str, &str)] = &[("High (fastest, tuned to this PC)", "high"), ("Low (keeps the PC usable while it builds)", "low")];
 const BACKENDS: &[(&str, &str)] = &[("None (games play offline as usual)", ""), ("Epic online services, offline (sign-in, profiles, menus)", "epic")];
 /// video choice: (label, height (0 keep, -1 render height), mode)
@@ -144,12 +146,19 @@ impl App {
         let out = if self.s.out.trim().is_empty() { PathBuf::from("UEWASM Builds").join(exe.file_stem().unwrap_or_default()) } else { PathBuf::from(self.s.out.trim()) };
         let mut args: Vec<String> = vec!["recomp".into(), exe.to_string_lossy().into(), "-o".into(), out.to_string_lossy().into(), "-y".into(), "--progress".into(),
             "--renderer".into(), pick(RENDERERS, &self.s.renderer).into(), "--threads".into(), threads.into(), "--opt".into(), pick(OPTS, &self.s.opt).into(),
-            "--lifter".into(), pick(LIFTERS, &self.s.lifter).into(), "--priority".into(), pick(PRIORITIES, &self.s.priority).into(), "--quality".into(), pick(QUALITY, &self.s.quality).into(),
+            "--steam".into(), pick(STEAMS, &self.s.steam).into(), "--priority".into(), pick(PRIORITIES, &self.s.priority).into(), "--quality".into(), pick(QUALITY, &self.s.quality).into(),
             "--mem-mb".into(), self.s.mem.to_string(), "--mem-limit-gb".into(), self.s.mem_limit.to_string(), "--resolution".into(), res_arg,
             "--part-mb".into(), self.s.part.to_string(), "--game-dlls".into(), if self.s.game_dlls { "auto".into() } else { "none".into() }];
         let video_h = if video.1 < 0 { h as i32 } else { video.1 };
         if video_h > 0 {
             args.extend(["--video-height".into(), video_h.to_string(), "--video-mode".into(), video.2.into()]);
+        }
+        args.extend(["--eos".into(), pick(EOS, &self.s.eos).into()]);
+        if self.s.wisp && !self.s.wisp_url.trim().is_empty() {
+            args.extend(["--wisp-url".into(), self.s.wisp_url.trim().to_string()]);
+        }
+        if self.s.wisp && pick(STEAMS, &self.s.steam) == "account" {
+            args.push(if self.s.steam_wisp { "--steam-wisp" } else { "--no-steam-wisp" }.into());
         }
         let backend = pick(BACKENDS, &self.s.backend);
         if !backend.is_empty() {
@@ -157,7 +166,7 @@ impl App {
             if self.s.placeholders { args.push("--placeholders".into()); }
         }
         for (on, flag) in [(!self.s.sys_dlls, "--no-system-dlls"), (self.s.native, "--native"), (self.s.compress, "--compress"), (self.s.wasm_opt, "--wasm-opt"),
-                           (self.s.show_fps, "--fps"), (!self.s.async_shaders, "--sync-shaders"), (!self.s.debug_panel, "--no-debug-panel"), (self.s.single, "--single-file")] {
+                           (self.s.show_fps, "--fps"), (!self.s.async_shaders, "--sync-shaders"), (!self.s.debug_panel, "--no-debug-panel"), (self.s.single, "--single-file"), (self.s.relay, "--relay"), (self.s.wisp && self.s.wisp_url.trim().is_empty(), "--wisp")] {
             if on { args.push(flag.into()); }
         }
         if self.s.aes_on {
@@ -301,7 +310,7 @@ impl eframe::App for App {
                     ui.label("Optimisation"); combo(ui, "opt", &mut self.s.opt, &labels(OPTS));
                     ui.label("Largest file (MB)"); ui.add(egui::DragValue::new(&mut self.s.part).range(4..=24));
                     ui.end_row();
-                    ui.label("Recompiler"); combo(ui, "lifter", &mut self.s.lifter, &labels(LIFTERS));
+                    ui.label("Steam"); combo(ui, "steam", &mut self.s.steam, &labels(STEAMS));
                     ui.label("Memory limit when run (GB)"); ui.add(egui::DragValue::new(&mut self.s.mem_limit).range(4..=32));
                     ui.end_row();
                     ui.label("Graphics (Unreal)"); combo(ui, "quality", &mut self.s.quality, &labels(QUALITY));
@@ -314,6 +323,20 @@ impl eframe::App for App {
                     ui.end_row();
                     ui.label("Online services"); combo(ui, "backend", &mut self.s.backend, &labels(BACKENDS));
                     ui.checkbox(&mut self.s.placeholders, "Stand-in files for what servers would send"); ui.label("");
+                    ui.end_row();
+                    ui.label("Online play"); ui.checkbox(&mut self.s.relay, "Built-in relay (Play in browser runs it at the game's address)");
+                    ui.label(""); ui.label("");
+                    ui.end_row();
+                    ui.label("Real connections"); ui.checkbox(&mut self.s.wisp, "Through WISP (the game reaches its own servers)");
+                    ui.label("WISP server"); ui.add(egui::TextEdit::singleline(&mut self.s.wisp_url).hint_text("blank: the game's own address"));
+                    ui.end_row();
+                    if self.s.wisp && pick(STEAMS, &self.s.steam) == "account" {
+                        ui.label("Steam sign-in"); ui.checkbox(&mut self.s.steam_wisp, "Through WISP too (the page never contacts Steam itself)");
+                        ui.label(""); ui.label("");
+                        ui.end_row();
+                    }
+                    ui.label("Epic Online Services"); combo(ui, "eos", &mut self.s.eos, &labels(EOS));
+                    ui.label(""); ui.label("");
                     ui.end_row();
                 });
                 ui.horizontal_wrapped(|ui| {

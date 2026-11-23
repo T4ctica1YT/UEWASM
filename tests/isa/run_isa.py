@@ -126,7 +126,13 @@ def forms():
             ("blsmsk", ["blsmsk rax, rbx"], SF | CF), ("bzhi", ["bzhi rax, rbx, rcx"], ZF | SF | CF), ("pdep", ["pdep rax, rbx, rcx"], 0),
             ("pext", ["pext rax, rbx, rcx"], 0), ("mulx", ["mulx rax, rbx, rcx"], 0),
             ("stc", ["stc"], CF), ("clc", ["clc"], CF), ("cmc", ["cmc"], CF), ("lahf", ["lahf"], 0), ("sahf", ["sahf"], ALL & ~OF),
-            ("movbe", ["movbe eax, dword ptr [r14+4]"], 0)]
+            ("movbe", ["movbe eax, dword ptr [r14+4]"], 0),
+            # rcx-counted branches (the count is kept to 1-8 so the loops end)
+            ("loop", ["and ecx, 7", "inc ecx", "@@:", "add rax, rbx", "loop @B"], 0),
+            ("loope", ["and ecx, 7", "inc ecx", "@@:", "inc rax", "test al, 3", "loope @B"], 0),
+            ("loopne", ["and ecx, 7", "inc ecx", "@@:", "inc rax", "test al, 3", "loopne @B"], 0),
+            ("jrcxz", ["and ecx, 1", "jrcxz @F", "add rax, 5", "@@:"], 0),
+            ("jecxz", ["and ecx, 1", "jecxz @F", "add rax, 5", "@@:"], 0)]
     ss = ["addss", "subss", "mulss", "divss", "minss", "maxss", "sqrtss", "addsd", "subsd", "mulsd", "divsd", "minsd", "maxsd", "sqrtsd",
           "addps", "subps", "mulps", "divps", "minps", "maxps", "sqrtps", "addpd", "subpd", "mulpd", "divpd", "minpd", "maxpd", "sqrtpd",
           "andps", "andnps", "orps", "xorps", "unpcklps", "unpckhps", "unpcklpd", "unpckhpd", "movss", "movsd", "movhlps", "movlhps",
@@ -137,7 +143,7 @@ def forms():
           "pand", "pandn", "por", "pxor", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpeqq", "pcmpgtb", "pcmpgtw", "pcmpgtd", "pcmpgtq",
           "punpcklbw", "punpcklwd", "punpckldq", "punpcklqdq", "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
           "packsswb", "packssdw", "packuswb", "packusdw", "psadbw", "pshufb", "pabsb", "pabsw", "pabsd", "psignb", "psignw", "psignd",
-          "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "phaddw", "phaddd", "pmaddubsw", "pmulhrsw",
+          "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "phaddw", "phaddd", "phaddsw", "phsubsw", "phminposuw", "pmaddubsw", "pmulhrsw",
           "cvtps2pd", "cvtpd2ps", "cvtdq2ps", "cvtps2dq", "cvttps2dq", "cvtdq2pd", "cvtpd2dq", "cvttpd2dq", "cvtss2sd", "cvtsd2ss",
           "pmovzxbw", "pmovzxbd", "pmovzxwd", "pmovzxdq", "pmovsxbw", "pmovsxbd", "pmovsxwd", "pmovsxdq", "pmovzxbq", "pmovsxwq",
           "movshdup", "movsldup", "movddup", "pminsd", "ptest_dummy"]
@@ -149,7 +155,7 @@ def forms():
             out.append((f"x_{op}_m", [f"{op} xmm0, {msize(op)} ptr [r14+16]"], 0))
     for op, imm in (("shufps", 0x1B), ("shufps", 0xE4), ("shufpd", 1), ("pshufd", 0x4E), ("pshuflw", 0x1B), ("pshufhw", 0xB1),
                     ("cmpps", 1), ("cmpps", 4), ("cmpss", 2), ("cmppd", 3), ("cmpsd", 0), ("roundps", 1), ("roundss", 0), ("roundsd", 3),
-                    ("roundpd", 2), ("blendps", 5), ("pblendw", 0x5A), ("insertps", 0x1D), ("dpps", 0xF1), ("palignr", 5),
+                    ("roundpd", 2), ("blendps", 5), ("pblendw", 0x5A), ("insertps", 0x1D), ("dpps", 0xF1), ("dppd", 0x31), ("dppd", 0xF2), ("palignr", 5),
                     ("pinsrd", 1), ("pinsrq", 1), ("pinsrw", 3), ("pinsrb", 9), ("mpsadbw", 0)):
         if op in ("pinsrd", "pinsrw", "pinsrb"):
             out.append((f"x_{op}_{imm}", [f"{op} xmm0, ebx, {imm}"], 0))

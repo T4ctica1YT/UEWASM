@@ -31,17 +31,23 @@ Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 ga
 
 ## How it works
 
-1. **Loader and linker** (`uewasm/recomp/pe.py`, `link.py`): parses the exe and every DLL it needs, relocates
-   them into one guest address space and resolves imports the way Windows does. Microsoft's CRT DLLs and the
+1. **Loader and linker** (`uewrecomp`, `rustlift/src/bin/uewrecomp/`): parses the exe and every DLL it needs,
+   relocates them into one guest address space and resolves imports the way Windows does. Microsoft's CRT DLLs and the
    game's own DLLs are recompiled too, so only the operating-system layer has to be reimplemented. SteamStub-wrapped
-   executables are unwrapped (`steamstub.py`).
+   executables are unwrapped, 32-bit C++/SEH exception frames are found, and 32-bit system calls get their stdcall
+   argument sizes from Windows' own DLLs (cached in `uewasm/recomp/stdcall32.json`).
 2. **Discovery**: functions come from `.pdata` (including chained chunks), entry points, exports, relocated code
    pointers and call targets; switch tables are recovered per function family.
-3. **Lifter** (`lift.py`, `sse.py`, `x87.py`): each x86-64 (or 32-bit x86) function becomes a C function. Registers
+3. **Lifter** (`uewlift`, `rustlift/src/`): each x86-64 (or 32-bit x86) function becomes a C function. Registers
    live in locals and flags are lazy, so a compare and branch compile to a single comparison; indirect calls go
-   through per-site inline caches; SSE (up to SSE4.2) maps to WebAssembly SIMD. 32-bit games get the x87 FPU and
-   stdcall/cdecl calling conventions on top.
-4. **Runtime** (`runtime/`):
+   through per-site inline caches; SSE (up to SSE4.2), BMI1/BMI2 and MOVBE are covered, SSE mapping to WebAssembly
+   SIMD. 32-bit games get the x87 FPU and stdcall/cdecl calling conventions on top.
+4. **Web build** (`uewbuild`, `uewpack`): compiles the C and the runtime with Emscripten and links them, cuts the game's
+   files into parts for static hosts, and writes the page. `uewserve` serves a build (and the online relay).
+
+The tools in `rustlift/` are Rust and are built with cargo the first time they're needed (the release `UEWASM.exe`
+ships them). The Python package (`uewasm/`) is the command line and the Tkinter app that drive them.
+5. **Runtime** (`runtime/`):
    - guest heap, files (game data fetched on demand; a separate save folder), Win32/USER32 windowing and input;
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
      condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI, or spread over
@@ -80,7 +86,8 @@ more than 3584 MB builds with 64-bit memory (`--mem64`; Rocket League needs abou
 - Only for some settings (the app checks before building, and offers to install what it can or to turn the setting
   off; `uewasm doctor` lists them all):
   - Visual Studio Build Tools with C++ (MSVC): native verification builds (`--native`);
-  - Rust: the Rust recompiler when running from source (`UEWASM.exe` bundles it);
+  - Rust: building the recompiler's tools when running from source (`UEWASM.exe` bundles them; without them nothing
+    can be recompiled);
   - Binaryen (part of Emscripten): `--wasm-opt`.
 
 ## UEWASM Status and Support
@@ -94,11 +101,12 @@ Here are the games used for Testing and some screenshots of the tool working
 | Hello Neighbor | ✅ Works | 30-60 FPS Depending on the Area| UE 4.20.3 | PR 0.1.1 |
 | Dispatch | ✅ Perfect | >60 FPS | UE 4.27 | PR 0.1.0 |
 | Hello Neighbor: Renovated | ✅ Works (MANY Visual Bugs) | 30-40 FPS | UE 4.? | PR 0.1.2 |
-| Crab Champions | ✅ Works (Lobby and gameplay) | 25-30 FPS | UE 4.27 | PR 0.1.2 |
+| Crab Champions | ✅ Works (Lobby and gameplay) | 35-45 FPS | UE 4.27 | Unreleased (after 0.1.4) |
 | Grandpa High on Retro | ✅ Works (Menu, intro and gameplay) | 30-55 FPS | UE 5 | PR 0.1.2 |
 | Dead as Disco | ➖ Gets in game (Tutorial, Crashes mid way through) | 30-50 FPS | UE 5.7.4 | PR 0.1.3 |
-| Rocket League | ✅ Works (menus and offline matches, with readable UI text; needs about 7 GB of game memory, `--mem64`) | - | UE 3 (64-bit, D3D11) | PR #2 |
-| Dishonored | ➖ Reaches the title screen and main menu with keyboard input (`--threads real`, offline Steam); gameplay not reached yet | - | UE 3 (32-bit, D3D9) | PR #1 |
+| Rocket League | ✅ Works (menus and offline matches, with readable UI text; needs about 7 GB of game memory, `--mem64`) | - | UE 3 (64-bit, D3D11) | PR 0.1.4 |
+| Meccha Chameleon | ✅ Works (menus, cloud save, hosting a lobby and playing in it; EOS and Steam stand-ins) | ~35 FPS | UE 5 | Unreleased (after 0.1.4) |
+| Dishonored | ➖ Reaches the title screen and main menu with keyboard input (`--threads real`, offline Steam); gameplay not reached yet | - | UE 3 (32-bit, D3D9) | PR 0.1.4 |
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -124,7 +132,6 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--threads` | `coop` (default), `real` | `coop`: game threads take turns on one browser thread; runs on any host. `real`: game threads run on several cores (Web Workers), with the render and audio threads on the page's own thread. Needs WebGPU and https or localhost; hosts that can't send the cross-origin isolation headers get them from a small service worker included in the build. |
 | `--opt` | `-O2`, `-O3`, `-Os` | Speed vs. download size. |
 | `--emsdk` | folder | Where the Emscripten SDK is, if not in `%USERPROFILE%\emsdk` or `EMSDK` (the desktop app's choice is used otherwise). |
-| `--lifter` | `python` (default), `rust` | Which recompiler turns the machine code into C. `rust` (`rustlift/`) produces the same output several times faster; it needs a Rust toolchain and is built automatically the first time. |
 | `--mem-mb` | number (default `3072`) | Guest memory. A normal build holds up to 3584 MB (the whole module gets 4 GB); more than that turns on `--mem64`, which allows up to 15360 MB. |
 | `--mem64` |N/A| Build with 64-bit WebAssembly memory (wasm64), for games that need more than ~3.5 GB. Browsers give such a module up to 16 GB. A little slower (64-bit addresses and bounds checks), so it is only used when asked for or when `--mem-mb` is over 3584. Needs a browser with WebAssembly memory64 (current Chrome, Edge or Brave); in others the page says so instead of starting. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md#more-than-35-gb-of-game-memory---mem64). |
 | `--mem-limit-gb` | number (default `8`) | How much memory the built game may use when run, split between game memory, the download cache and video memory. |
@@ -147,6 +154,14 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--native` |N/A| Also build a native Windows binary of the recompiled code, for verification. |
 | `--backend` | `none` (default), `epic` | Serve the game's online services from the page itself: `epic` answers Epic account, entitlement and content requests offline so games that require a login can start. |
 | `--placeholders` |N/A| With `--backend`, answer requests for downloadable content the build lacks with empty stand-in files. |
+| `--steam` | `webworks` (default), `account`, `offline` | `webworks`: Steam games sign in to a [WebWorks](https://github.com/Stratus-Games/Webworks) server for their Steam features (see below), and play with the offline Steam when no server answers. `account`: the player signs in to their own Steam account in the page, so the game gets the real SteamID, name and tickets its online services check with Valve (see [Official servers](#official-servers)). `offline`: no Steam server, as before. |
+| `--webworks-url` | URL (default `http://localhost:3000`) | The WebWorks server the page signs in to. `?webworks=URL` in the page address overrides it, `?steam=offline` turns it off. |
+| `--relay` |N/A| Online games: `uewasm serve` (and the apps' *Play in browser*) also runs the built-in relay at the game's own address, so everyone who opens the page can use lobbies and P2P together with no other server. |
+| `--relay-url` | URL | Online games: use a relay run elsewhere (`uewasm relay --port 3000`) at this address. |
+| `--wisp` |N/A| Real network connections: the game reaches its own servers through the WISP server `uewasm serve` runs at the game's address (see [Official servers](#official-servers)). |
+| `--wisp-url` | URL | The same through a WISP server elsewhere (`wss://host/path/`; any WISP v1 server works). `?wisp=URL` in the page address overrides it, `?wisp=0` turns it off. |
+| `--steam-wisp` / `--no-steam-wisp` |N/A| With `--steam account` and WISP: sign in to Steam through the WISP server too, so the page never contacts Steam itself. Asked at build time when neither is given. |
+| `--eos` | `standin` (default), `real` | Games with Epic Online Services: `standin` answers the EOS SDK in the page (below); `real` recompiles the game's own EOS SDK, which signs in to Epic and joins real lobbies through WISP (it turns `--wisp` on). |
 
 ## In the game
 
@@ -160,9 +175,9 @@ When building a game with UEWASM, the tool give you many choices on how the game
 - Builds made with `--no-debug-panel` (or with the desktop app's *UEWASM debug toggle* unticked) contain none of
   this: the panel script, the console enabler and the debug hooks are not compiled in.
 
-Steam: games that use Steam's classic interfaces (`SteamUser()`, `SteamFriends()`…, most Unreal Engine 3 games) run
-under an offline Steam: it starts, with a user who is logged off, subscribed to the game and its DLC, with no cloud
-files, stats or friends. Newer games (Unreal Engine 4/5) run as if Steam weren't there, as before.
+Steam: see [Steam multiplayer](#steam-multiplayer-webworks). With `--steam offline`, games that use Steam's classic
+interfaces (`SteamUser()`, `SteamFriends()`…, most Unreal Engine 3 games) run under an offline Steam: it starts, with a
+user who is logged off, subscribed to the game and its DLC, with no cloud files, stats or friends.
 
 Page parameters: `?arg=-foo` adds launch arguments; `?filetrace=1`, `?netdebug=1` and `?tracering=1` log file access, network traffic and the last engine calls before a crash; `?gpuprof=1` logs the slowest GPU passes.
 
@@ -191,6 +206,88 @@ If the graphics driver resets mid-game (Windows does this when a slow or integra
 of work), the page says so and restarts itself once to get a working GPU again, instead of playing on with a blank
 screen. GPU work is sent in smaller batches on integrated GPUs to make that rarer.
 
+## Steam multiplayer (WebWorks)
+
+With `--steam webworks` (the default, also on the desktop app's *Online* tab) the runtime's `steam_api` runs Steam
+on a [WebWorks](https://github.com/Stratus-Games/Webworks) server, a self-hosted backend for Steam-style features. It
+works at the Steam API level, so the game is unchanged and UE3, UE4 and UE5 games (and other engines that use Steam)
+all get it:
+
+- **Sign-in**: each browser signs in as a guest with its own lasting Steam ID and name; `?name=` picks the name.
+- **Lobbies**: create, search with filters, join, leave, lobby and member data, owner, member limit, visibility,
+  lobby chat, invites (`ISteamMatchmaking`), with the callbacks and call results Steam sends.
+- **P2P networking**: `ISteamNetworking` packets travel over the server's realtime connection, so Steam P2P
+  multiplayer (Unreal's Steam net driver) connects players in different browsers.
+- **Also**: rich presence, persona names, auth tickets, and stats and achievements kept for the session.
+- **SteamSockets** (`ISteamNetworkingSockets`, used by UE's SteamSockets net driver): signs in and hosts listen
+  servers, so games that wait for it start up. Connections to other players don't go through it yet.
+
+Every interface version from the Steamworks SDK is laid out the way the game expects (`runtime/steam_ifaces.h`,
+generated by `cargo run --release --manifest-path rustlift/Cargo.toml --bin gen_steam_ifaces -- <SDK headers>`), on 64-bit and 32-bit games. Run a server with `cd Server; npm install;
+npm start` from the WebWorks repository; players on other machines need its LAN or tunnel address in
+`--webworks-url` or `?webworks=`. Pages served over https need the server on https too.
+
+### Built-in relay
+
+For a game with no WebWorks server to hand, build with `--relay`: `uewasm serve` then answers the same calls itself
+(guest sign-in, lobbies with data, members and chat, P2P packets over a WebSocket) at the game's own address, so
+players who open the page play together. `uewasm serve --host 0.0.0.0` lets other machines on the network join.
+`uewasm relay` runs the relay on its own, for builds hosted elsewhere and made with `--relay-url`.
+
+## Epic Online Services
+
+Games that ship the EOS SDK (Unreal's EOS subsystems, Redpoint's EOS plugin) load `EOSSDK-Win64-Shipping.dll` and look
+its functions up by name. The build leaves that DLL out and the runtime stands in for all 640 functions of the EOS C
+API (`runtime/hle_eos.c`; the table `runtime/eos_api.h` is generated from the SDK headers by
+`cargo run --release --manifest-path rustlift/Cargo.toml --bin gen_eos_api -- <EOS SDK>/SDK/Include`):
+
+- **Sign-in**: Connect and Auth logins succeed at once with a lasting identity per browser; Steam app and web-API
+  tickets are issued for games that sign in to EOS through Steam. The player's name and linked account (`UserInfo`,
+  Connect external accounts) come from the WebWorks / Steam session.
+- **Cloud saves**: player data storage keeps its files in the save folder (`EOSPlayerData/<user>/`), with listing,
+  metadata (size, MD5), chunked reads and writes, copies and deletes.
+- **Lobbies**: created and kept in the page, with attributes, member attributes, permissions and member limits, read
+  back through `LobbyDetails`, with the lobby notifications games register for. A lobby-based game can play solo.
+- **Everything else** answers the way an empty account does: queries succeed with nothing found, title storage holds
+  no files, callbacks arrive on `EOS_Platform_Tick` as with the real SDK.
+
+With `--steam webworks` and no server reachable, Steam games get a local signed-in session (a lasting Steam ID, auth
+tickets, no online services) instead of a logged-off Steam, so games that sign in to a backend through Steam start.
+
+## Official servers
+
+A build can talk to a game's real servers, with nothing to install for the player:
+
+- **Real connections (WISP)**: with `--wisp` (or `--wisp-url`), the runtime's Winsock carries every connection the game
+  makes, TCP and UDP, by host name or address, over one WebSocket to a [WISP](https://github.com/MercuryWorkshop/wisp-protocol)
+  server (`uewasm serve` has one at `/wisp/`; `uewasm serve --host 0.0.0.0` lets other machines use it). The server
+  refuses private and loopback addresses, so a public one isn't a way into its own network; `--wisp-allow
+  "*.epicgames.dev,*.example.com"` narrows it to a list.
+- **TLS stays the game's**: games encrypt with their own OpenSSL, or with Windows' Schannel, which the runtime provides
+  with a [BearSSL](https://bearssl.org/) client (`runtime/hle_schannel.c`), checking servers against Mozilla's root
+  certificates (`runtime/ca_roots.h`, from `cargo run --release --manifest-path rustlift/Cargo.toml --bin gen_ca_roots --
+  cacert.pem runtime/ca_roots.h`). The WISP server only ever sees encrypted bytes. Windows' hashing (CryptoAPI, CNG) and
+  random numbers are real too (`runtime/hle_crypto.c`).
+- **Steam account (`--steam account`)**: a minimal Steam client in the page (`runtime/web/uew_steamcm.js`) connects to
+  Steam's own servers directly (pages may open their WebSocket endpoints) and signs the player in: account name and
+  password go only to Steam, RSA-encrypted with Steam's key; Steam Guard codes and approval in the Steam Mobile App work. As in the Steam client, the dialog also shows a QR code to scan with the Steam Mobile App instead (it refreshes when Steam rotates it).
+  Only Steam's refresh token is kept, in that browser (`?steamlogout=1` forgets it). The game then gets the real SteamID
+  and persona name, session and web-API tickets registered with Steam, and encrypted app tickets, which is what online
+  services built on Steam sign-in (EOS Connect, PlayFab, a game's own backend) check. Lobbies and P2P still go through
+  WebWorks or the relay. "Play without Steam" carries on with a local session.
+- **Steam sign-in through WISP (`--steam-wisp`)**: with `--steam account` and WISP, the Steam client uses Steam's TCP
+  protocol carried over the WISP server instead of opening Steam's WebSocket servers itself, so the page contacts
+  only its own server. That channel has Steam's own encryption (an AES-256 session key sent RSA-encrypted to Valve's
+  published key), so the WISP server only relays ciphertext. The build asks about this when WISP and a Steam account are
+  both on (the desktop app shows it as a checkbox); `?steamwisp=1` or `?steamwisp=0` in the page address overrides it.
+- **Real EOS (`--eos real`)**: the game's own EOS SDK is recompiled instead of the stand-in and signs in to Epic through
+  WISP: with a game that signs in through Steam, `--steam account` provides the real ticket Epic checks. Games that sign
+  in with an Epic account open Epic's sign-in page; the runtime opens it in a new tab (or offers a button, where the
+  browser blocks tabs that weren't opened by a click), so the player signs in on epicgames.com itself.
+
+Signing in to real servers from a recompiled client may go against a game's terms, and games with server-side
+anti-cheat (Easy Anti-Cheat, BattlEye) won't accept it; builds have to match the live game version.
+
 ## Testing
 
 ```
@@ -202,8 +299,11 @@ python tests/gfx/run_gfx.py webgpu srgb  # the same on an sRGB swap chain (must 
 python tests/gfx/run_gfx.py webgpu d3d9  # the Direct3D 9 version (32-bit, Shader Model 3)
 python tests/shaders/extract_d3d9.py "C:/Games/SomeUE3Game" tests/bin/shaders9   # a UE3 game's D3D9 shaders, for wgsl_dump/wgsl_check
 python tests/isa/run_isa.py --wasm # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
+cargo test --release --manifest-path rustlift/Cargo.toml --bin uewrecomp   # the SteamStub AES against FIPS-197
 python tests/web/run_web.py        # game files over HTTP (raw and deflated, with and without Range) and saved progress
+python tests/net/run_net.py        # real TCP, UDP and HTTPS (Schannel, libcurl-style checks) and hashing through WISP vs native
 python tests/sse/gen_test.py       # SIMD versions of the SSE helpers against their scalar references
+python tests/steam/run_pair.py <web build of tests/steam/steamtest.cpp>   # two players: lobby, chat, P2P (WebWorks server, or the relay with --relay)
 ```
 
 The browser tests need Playwright (`pip install playwright`, then `playwright install msedge` or use an installed
@@ -223,8 +323,9 @@ so there is no separate mode to pick. What differs:
   at start need more than the 3.5 GB a normal build holds: give them `--mem-mb 7168` (this turns on `--mem64`, 64-bit
   WebAssembly memory, which needs current Chrome, Edge or Brave). A running copy then takes about 10 GB of RAM, so
   run one at a time.
-- **Steam**: the classic interfaces (`SteamUser()`, `SteamFriends()`…) answer as an offline Steam session, so games
-  that insist on Steam start, without online features.
+- **Steam**: with a WebWorks server the classic interfaces (`SteamUser()`, `SteamFriends()`…) get lobbies and P2P like
+  newer games (their versions are read from the game's own `steam_api.dll`). Without one they answer as an offline
+  Steam session, so games that insist on Steam still start.
 - **Settings**: `--quality` only applies to UE4/5 games. UE3 games keep their own settings, so change graphics in the
   game's options menu.
 - **Shaders**: `tests/shaders/extract_d3d9.py` pulls every D3D9 shader out of a UE3 game's caches, to check the
@@ -246,6 +347,12 @@ so there is no separate mode to pick. What differs:
   than UE4 titles and the first visit to each area stutters while shaders compile.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.
 - Only the APIs the tested games use are implemented in depth; other games may stop at an unimplemented call.
+
+## Third-party code
+
+- [BearSSL](https://bearssl.org/) by Thomas Pornin (MIT; `runtime/third_party/bearssl/LICENSE.txt`): TLS for the runtime's Schannel.
+- Mozilla's root certificate list (MPL 2.0, as curl publishes it): `runtime/ca_roots.h`.
+- Steam and EOS interface tables are generated from the published SDK headers (`rustlift/src/bin/gen_*.rs`).
 
 ## Extra Credits
 

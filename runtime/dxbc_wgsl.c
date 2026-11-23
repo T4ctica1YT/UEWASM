@@ -1072,6 +1072,8 @@ const char* dxbc_wgsl_helpers(void)
            "fn uew_umulhi(a: u32, b: u32) -> u32 { let al = a & 0xFFFFu; let ah = a >> 16u; let bl = b & 0xFFFFu; let bh = b >> 16u;"
            " let lo = al * bl; let m1 = ah * bl; let m2 = al * bh; let mid = (lo >> 16u) + (m1 & 0xFFFFu) + (m2 & 0xFFFFu);"
            " return ah * bh + (m1 >> 16u) + (m2 >> 16u) + (mid >> 16u); }\n"
+           "fn uew_carry(a: u32, b: u32) -> u32 { return select(0u, 1u, a + b < a); }\n"
+           "fn uew_borrow(a: u32, b: u32) -> u32 { return select(0u, 1u, a < b); }\n"
            "fn uew_imulhi(a: i32, b: i32) -> i32 { var h = bitcast<i32>(uew_umulhi(bitcast<u32>(a), bitcast<u32>(b))); if (a < 0) { h -= b; } if (b < 0) { h -= a; } return h; }\n");
     helpers_txt = g;
     return g.p;
@@ -1301,6 +1303,19 @@ int dxbc_to_wgsl_ex(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxW
                 assign(tr, o[0], K_F, sat, e.p);
                 break;
             }
+            /* EvaluateAttributeSnapped / AtSample / AtCentroid: the value interpolated at the pixel (one sample per pixel) */
+            case 203: case 204: case 205:
+                src(tr, &e, o[1], m, 0, K_F);
+                assign(tr, o[0], K_F, sat, e.p);
+                break;
+            /* add with carry, subtract with borrow (64-bit integer maths in UE5 shaders) */
+            case 132: case 133:
+                defer_begin(tr);
+                if (o[1]->type != T_NULL) { Op* t[3] = { o[1], o[2], o[3] }; per_comp(tr, t, opc == 132 ? "uew_carry" : "uew_borrow", KUU, 2, K_U, NULL); }
+                if (o[0]->type != T_NULL) { Op* t[3] = { o[0], o[2], o[3] }; bin(tr, t, 0, K_U, opc == 132 ? "+" : "-", 0); }
+                defer_end(tr);
+                break;
+            case 207: case 208: break;   /* abort, debug break */
             case 54: {
                 int k = o[1]->type == T_IMM32 && !sat ? K_U : K_F;
                 src(tr, &e, o[1], m, 0, k);

@@ -18,20 +18,21 @@ def main():
     shutil.rmtree(rt, ignore_errors=True)
     shutil.copytree(HERE / "runtime", rt, ignore=shutil.ignore_patterns("*.o", "*.obj", "__pycache__"))
     sep = ";" if sys.platform == "win32" else ":"
-    # the Rust recompiler, built here, so the exe offers it on PCs without a Rust toolchain
+    # the Rust tools (recompiler, server), built here, so the exe offers them on PCs without a Rust toolchain
     rl = HERE / "rustlift"
     lift = rl / "target" / "release" / ("uewlift.exe" if sys.platform == "win32" else "uewlift")
     cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / "cargo")
     subprocess.run([cargo, "build", "--release", "--manifest-path", str(rl / "Cargo.toml")], check=True)
     rust = ["--add-data", f"{rl / 'src'}{sep}rustlift/src", "--add-data", f"{rl / 'Cargo.toml'}{sep}rustlift",
-            "--add-data", f"{lift}{sep}rustlift/target/release"]
+            *[x for t in ("uewlift", "uewrecomp", "uewbuild", "uewpack", "uewserve")
+              for x in ("--add-data", f"{lift.with_name(lift.name.replace('uewlift', t))}{sep}rustlift/target/release")]]
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--name", NAME, *rust,
            "--icon", str(ico), "--add-data", f"{rt}{sep}runtime", "--add-data", f"{HERE / 'uewasm' / 'assets'}{sep}uewasm/assets",
            # what 32-bit games' system calls pop on return (Unreal Engine 3 games are often 32-bit): read from SysWOW64
            # and cached in this file, which isn't a module, so PyInstaller would leave it out
            "--add-data", f"{HERE / 'uewasm' / 'recomp' / 'stdcall32.json'}{sep}uewasm/recomp",
            "--exclude-module", "playwright", "--exclude-module", "numpy", "--exclude-module", "greenlet",
-           "--collect-all", "iced_x86", "--hidden-import", "psutil",
+           "--hidden-import", "psutil",
            # video re-encoding and Unreal pak handling
            "--collect-all", "imageio_ffmpeg", "--hidden-import", "ooz", "--collect-submodules", "Crypto",
            # what emsdk.py imports, for installing Emscripten with the app's own Python (--run-py)

@@ -349,6 +349,13 @@ void rt_hle_tick(CPU* c) { rt_hle_budget = 1024; sched_tick(c); }
 static uint16_t dyn_pops[DYN_MAX];
 #define POPS_SITE 0xFFFFu
 
+/* games lifted before the lifter wrote these still link: no call-site counts, no Steam app id */
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((weak)) const uint32_t rt_call_args[2] = { 0, 0 };
+__attribute__((weak)) const size_t rt_call_arg_count = 0;
+__attribute__((weak)) const uint32_t rt_steam_appid = 0;
+#endif
+
 /* what the call site at this return address pushed (rt_call_args is sorted by return address); 0 if it isn't known */
 static unsigned site_pops(uint32_t ret)
 {

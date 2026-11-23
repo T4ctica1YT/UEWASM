@@ -3,443 +3,121 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
-from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from . import pe as pemod
 from . import resources
-from .lift import SETJMP, Func, Program
-from .link import THUNK_BASE, Linker
 
 RUNTIME = Path(__file__).resolve().parents[2] / "runtime"
-CHUNK = 400
-
-
-
-XFL_DECL = """#ifdef _MSC_VER
-extern __declspec(thread) uint64_t rt_xfl;
-#else
-extern _Thread_local uint64_t rt_xfl;
-#endif"""
-
-
-def write_if_changed(path, text):
-    path = Path(path)
-    try:
-        if path.read_text(encoding="utf-8") == text:
-            return
-    except OSError:
-        pass
-    path.write_text(text, encoding="utf-8")
-
-def implemented_hle():
-    names = set()
-    for f in RUNTIME.glob("*.c"):
-        text = "\n".join(l for l in f.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#define"))
-        names.update(re.findall(r"\b(?:HLE|MATH1F?|MATH2F?|STUB)\((\w+)", text))
-    return names
-
-
-def refresh_thunks(gen):
-    """binds imports to HLE functions added to the runtime since the lift, so a relink picks them up without lifting again"""
-    meta = gen / "meta.c"
-    if not meta.exists():
-        return 0
-    text = meta.read_text(encoding="utf-8")
-    hle = implemented_hle()
-    have = set(re.findall(r"^void hle_(\w+)\(CPU\*\);", text, re.M))
-    listed = set(re.findall(r'^    \{\w+, "([^"]+)", "[^"]*", \w+\},', text, re.M))
-    new = sorted({n for n in re.findall(r'^    \{NULL, "(\w+)", "[^"]*", NULL\},', text, re.M) if n in hle} - have)
-    extra = sorted(hle - listed - have)
-    if "RT_G32" not in text:
-        text += "const int RT_G32 = 0;\nconst unsigned short rt_thunk_pops[] = {0};\n"
-        if not new and not extra:
-            write_if_changed(meta, text)
-    if not new and not extra:
-        return 0
-    text = re.sub(r'^    \{NULL, "(\w+)", ("[^"]*"), NULL\},',
-                  lambda m: f'    {{hle_{m[1]}, "{m[1]}", {m[2]}, T_{m[1]}}},' if m[1] in new else m[0], text, flags=re.M)
-    # functions nothing imports, for GetProcAddress
-    if extra:
-        j = text.index("};", text.index("const Thunk rt_thunks[] = {"))
-        text = text[:j] + "".join(f'    {{hle_{n}, "{n}", "hle", T_{n}}},\n' for n in extra) + text[j:]
-        text = re.sub(r"const size_t rt_thunk_count = (\d+);", lambda m: f"const size_t rt_thunk_count = {int(m[1]) + len(extra)};", text)
-        if "const int RT_G32 = 1;" in text:
-            from . import stdcall
-            add = ", ".join(str(stdcall.pops("", n) or 0) for n in extra)
-            text = re.sub(r"(const unsigned short rt_thunk_pops\[\] = \{[^}]*)\};", lambda m: m[1] + ", " + add + "};", text)
-    new = sorted(set(new) | set(extra))
-    decl = "".join(f"void hle_{n}(CPU*);\n" for n in new)
-    decl += "".join(f"static void T_{n}(CPU* c) {{ if (rt_trace_on > 0) rt_trace_call(c, \"{n}\"); hle_{n}(c); c->r[4] += 8; "
-                    f"if (--rt_hle_budget < 0) rt_hle_tick(c); }}\n" for n in new)
-    i = text.index("const Thunk rt_thunks[] = {")
-    write_if_changed(meta, text[:i] + decl + text[i:])
-    return len(new)
-
-
-# lifted files with host setjmps: guest setjmp sites and functions that can catch C++ exceptions
-SJ_DECL = ("#include <setjmp.h>\njmp_buf* rt_sj_slot(CPU* c, uint64_t jb, uint64_t frame, uint64_t rip);\n"
-           "jmp_buf* rt_sj_slot32(CPU* c, uint64_t jb, uint64_t rip);\n"
-           "jmp_buf* rt_eh_slot32(CPU* c, uint64_t frame, uint64_t fn);\nvoid rt_eh_land(CPU* c);")
-
-
-def eh_entry(fn, off):
-    """first line of a 32-bit function with a try block: its frame (ebp = entry esp - off) can take a catch's
-    continuation, which the runtime resumes here with a longjmp (rt_eh_slot32)"""
-    return f"    if (setjmp(*rt_eh_slot32(c, (uint32_t)R(4) - {off}, 0x{fn:x}ull))) {{ rt_eh_land(c); return; }}"
-
-
-def steam_appid(exe):
-    """the game's Steam app id (offline Steam reports it): steam_appid.txt beside the exe, or the Steam library manifest
-    whose install folder holds the game; 0 when neither says"""
-    exe = Path(exe)
-    for d in [exe.parent, *list(exe.parents)[:4]]:
-        f = d / "steam_appid.txt"
-        if f.is_file():
-            m = re.match(r"\s*(\d+)", f.read_text(errors="replace"))
-            if m:
-                return int(m[1])
-    parts = [p.lower() for p in exe.parts]
-    if "common" in parts and "steamapps" in parts:
-        i = parts.index("common")
-        if i + 1 < len(parts):
-            apps = Path(*exe.parts[:i])
-            for mf in apps.glob("appmanifest_*.acf"):
-                try:
-                    t = mf.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                m = re.search(r'"installdir"\s*"([^"]*)"', t)
-                a = re.search(r'"appid"\s*"(\d+)"', t)
-                if m and a and m[1].lower() == parts[i + 1]:
-                    return int(a[1])
-    return 0
-
-
-def thunk_pops(thunks, bits):
-    """rt_thunk_pops[]: argument bytes each import's callee pops (32-bit stdcall); unknown ones are listed"""
-    if bits != 32:
-        return "const unsigned short rt_thunk_pops[] = {0};"
-    from . import stdcall
-    vals, unknown = [], []
-    for name, dll in thunks:
-        v = stdcall.pops(dll if dll != "hle" else "", name)
-        if v is None:
-            if dll != "hle":
-                unknown.append(name)
-            v = 0
-        vals.append(v)
-    stdcall.save()
-    if unknown:
-        print(f"  stack argument size unknown for {len(unknown)} imports (taken as 0): {', '.join(unknown[:12])}")
-    return "const unsigned short rt_thunk_pops[] = {" + ", ".join(map(str, vals)) + "};"
-
-
-_W = {}
-
-# Win64: a call may change these (rax rcx rdx r8-r11); rsp comes back moved by the callee's ret
-VOLATILE = {0, 1, 2, 4, 8, 9, 10, 11}
-_WRITE = re.compile(r"\bR\((\d+)\)\s*(?:[-+&|^]|<<|>>)?=(?!=)")
-
-
-_XREF = re.compile(r"c->x\[(\d+)\]")
-_XWRITE = re.compile(r"&c->x\[(\d+)\]|c->x\[(\d+)\](?:\.\w+\[\d+\])?\s*(?:[-+*/&|^]|<<|>>)?=(?!=)")
-XVOLATILE = set(range(6))   # Win64: xmm6-15 survive calls
-
-
-def regs_local(body, bits=64):
-    """expands SPILL/FILL/FILLV for one lifted function: spill only registers it writes, reload only ones it reads
-    (after a guest call, only those the callee may have changed; 32-bit code has no fixed convention to lean on).
-    XMM registers live in locals too (x<n>_), so SSE code stays in wasm registers instead of the CPU struct; functions
-    that hand the whole register file to the runtime (FXSAVE, setjmp) keep them in memory"""
-    text = "\n".join(body)
-    used = sorted({int(n) for n in re.findall(r"\bR\((\d+)\)", text)})
-    wrote = sorted({int(n) for n in _WRITE.findall(text)})
-    spill = "".join(f"c->r[{n}] = r{n}_; " for n in wrote) or ""
-    fill = "".join(f"r{n}_ = c->r[{n}]; " for n in used)
-    fillv = "".join(f"r{n}_ = c->r[{n}]; " for n in used if n in VOLATILE or bits == 32)
-    xused = []
-    if "rt_fxsave(" not in text and "rt_fxrstor(" not in text and "setjmp(" not in text:
-        xused = sorted({int(n) for n in _XREF.findall(text)})
-        xwrote = sorted({int(x or y) for x, y in _XWRITE.findall(text)})
-        spill += "".join(f"c->x[{n}] = x{n}_; " for n in xwrote)
-        fill += "".join(f"x{n}_ = c->x[{n}]; " for n in xused)
-        fillv += "".join(f"x{n}_ = c->x[{n}]; " for n in xused if n in XVOLATILE or bits == 32)
-        body = [_XREF.sub(lambda m: f"x{m.group(1)}_", l) for l in body]
-    out = [l.replace("SPILL(); ", spill).replace("FILLV();", fillv).replace("FILL();", fill) for l in body]
-    return out, xused
-
-
-def _init_worker(all_roots, comments, mode="high"):
-    resources.set_mode(mode)
-    resources.lower_this_process()
-    _W["roots"] = all_roots
-    _W["comments"] = comments
-    _W["progs"] = {}
-
-
-def _lift_chunk(args):
-    path, base, roots, blocks, ends, out_path, jt, flag_ret = args
-    prog = _W["progs"].get(path)
-    if prog is None:
-        prog = Program(pemod.load(path), base)
-        prog.roots = _W["roots"]
-        prog.comments = _W["comments"]
-        _W["progs"][path] = prog
-    prog.blocks = blocks
-    prog.ends = ends
-    prog.jt = jt
-    prog.flag_ret = flag_ret
-    prog.unsupported.clear()
-    prog.unsupported_at.clear()
-    out = ['#define LIFTED 1', '#include "rt.h"', '#include "funcs.h"', ""]
-    bad = 0
-    for r in roots:
-        fn = Func(prog, r)
-        bad += fn.lift()
-        if r in getattr(prog, "eh_starts", {}):
-            fn.out.insert(0, eh_entry(r, prog.eh_starts[r]))
-        out.append(f"void F_{r:x}(CPU* __restrict c) {{")
-        entry = "2" if prog.func_start(r) or not prog.flags_live(r) else "rt_xfl"
-        body, xused = regs_local(fn.out, prog.bits)
-        used = sorted({int(n) for l in body for n in re.findall(r"\bR\((\d+)\)", l)})
-        decl = (" uint64_t " + ", ".join(f"r{n}_ = c->r[{n}]" for n in used) + ";") if used else ""
-        if xused:
-            decl += " XMM " + ", ".join(f"x{n}_ = c->x[{n}]" for n in xused) + ";"
-        out.append(f"    uint8_t* const mem_ = MEM; Flags F = {{0}}; F.fop = F_RAW; F.rawfl = {entry}; F.fsz = 64;{decl}")
-        if any("setjmp(" in l for l in body):
-            # a frame that holds a host setjmp can't be replaced by a tail call
-            body = [l.replace("TAIL ", "") for l in body]
-        out.extend(body)
-        out.append("}")
-        out.append("")
-    prog.cache.clear()
-    text = "\n".join(out)
-    if "rt_sj_slot(" in text or "rt_sj_slot32(" in text or "rt_eh_slot32(" in text:
-        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + SJ_DECL, 1)
-    if "rt_xfl" in text:
-        text = text.replace('#include "funcs.h"', '#include "funcs.h"\n' + XFL_DECL, 1)
-    # declare only the functions this file calls: funcs.h names every function in the game (tens of MB on big
-    # titles), and parsing it was over a third of each file's compile time
-
-    called = sorted(set(_FREF.findall(text)))
-    text = text.replace('#include "funcs.h"', "".join(f"void F_{n}(CPU* __restrict);\n" for n in called).rstrip("\n"), 1)
-    write_if_changed(out_path, text)
-    return dict(prog.unsupported), {k: [hex(a) for a in v] for k, v in prog.unsupported_at.items()}, bad
-
-
-_FREF = re.compile(r"\bF_([0-9a-f]+)\b")
-
-
-def _lifted(ex, tasks, progress):
-    for n, r in enumerate(ex.map(_lift_chunk, tasks, chunksize=4)):
-        progress("lift", n + 1, len(tasks))
-        yield r
-
-
-def c_str(s):
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+STDCALL_CACHE = Path(__file__).with_name("stdcall32.json")
 
 
 def nop_progress(stage, done, total):
     pass
 
 
-def _lift_python(link, gen, comments, jobs, log, progress, t0):
-    progs = []
-    all_roots = set()
-    sizes = [m.pe.image_size for m in link.order]
-    for k, m in enumerate(link.order):
-        progress("analyze", sum(sizes[:k]), sum(sizes))
-        prog = Program(m.pe, m.base)
-        prog.discover()
-        progs.append((m, prog))
-        all_roots.update(prog.blocks)
-        log(f"  {m.name}: {len(prog.blocks)} functions at 0x{m.base:x}")
-    roots = sorted(all_roots)
-    log(f"{len(link.order)} modules, {len(roots)} functions ({time.time() - t0:.1f}s)")
-    write_if_changed(gen / "funcs.h", '#pragma once\n#include "rt.h"\n' + "".join(f"void F_{r:x}(CPU* __restrict);\n" for r in roots))
+STEAM_VERSION = re.compile(rb"(Steam[A-Za-z]+\d{3}|STEAM[A-Z]+_INTERFACE_VERSION\d{3}|STEAM[A-Z]+_INTERFACE_V\d{3})\x00")
 
-    tasks = []
-    for m, prog in progs:
-        mroots = sorted(prog.blocks)
-        for i in range(0, len(mroots), CHUNK):
-            ch = mroots[i:i + CHUNK]
-            jt = {k: v for k, v in prog.jt.items() if m.base <= k < m.base + m.pe.image_size}
-            tasks.append((str(m.path), m.base, ch, {r: prog.blocks[r] for r in ch}, {r: prog.ends.get(r) for r in ch},
-                          str(gen / f"funcs_{len(tasks):04d}.c"), {k: v for k, v in jt.items() if ch[0] <= k < max(prog.ends.get(r) or r + 0x100000 for r in ch)},
-                          prog.flag_ret))
-    unsupported = Counter()
-    where = {}
-    bad = 0
-    call_args = {}
-    for _, prog in progs:
-        call_args.update(prog.call_args)
-        prog.cache.clear()
-    workers = jobs or resources.plan()["lift_workers"]
-    progress("analyze", 1, 1)
-    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(all_roots, comments, resources.mode())) as ex:
+
+def steam_versions(game_root):
+    """the Steam interface versions a game's own steam_api was built with: games that use the classic accessors
+    (SteamUser()...) never name one, and WebWorks Steam lays each interface out by its version"""
+    found = set()
+    for f in Path(game_root).rglob("steam_api*.dll"):
         try:
-            results = list(_lifted(ex, tasks, progress))
-        except BaseException:
-            ex.shutdown(wait=False, cancel_futures=True)
-            raise
-        for u, at, b in results:
-            unsupported.update(u)
-            for k, v in at.items():
-                where.setdefault(k, v)
-            bad += b
-    return roots, len(tasks), unsupported, where, bad, call_args
+            found.update(m.decode() for m in STEAM_VERSION.findall(f.read_bytes()))
+        except OSError:
+            pass
+    return sorted(found)
 
 
 RUST_DIR = Path(__file__).resolve().parents[2] / "rustlift"
 
 
-def rust_lifter(log=print):
-    """the Rust lifter's executable, built with cargo the first time it is wanted; None without a Rust toolchain"""
-    exe = RUST_DIR / "target" / "release" / ("uewlift.exe" if os.name == "nt" else "uewlift")
-    srcs = list((RUST_DIR / "src").glob("*.rs")) + [RUST_DIR / "Cargo.toml"]
-    # the packaged app ships the lifter with its sources (unpacking doesn't keep file times)
-    if exe.exists() and (getattr(__import__("sys"), "frozen", False) or exe.stat().st_mtime >= max(p.stat().st_mtime for p in srcs)):
+def rust_tool(name, log=print):
+    """one of the Rust tools' executables (rustlift/: uewlift, uewserve, ...), built with cargo when its sources are
+    newer; None without a Rust toolchain"""
+    exe = RUST_DIR / "target" / "release" / (name + (".exe" if os.name == "nt" else ""))
+    srcs = list((RUST_DIR / "src").rglob("*")) + [RUST_DIR / "Cargo.toml"]
+    # the packaged app ships the tools with their sources (unpacking doesn't keep file times)
+    if exe.exists() and (getattr(__import__("sys"), "frozen", False) or exe.stat().st_mtime >= max(p.stat().st_mtime for p in srcs if p.is_file())):
         return exe
     cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo"))
     if not Path(cargo).exists():
-        return None
-    log("building the Rust lifter (first use)")
+        return exe if exe.exists() else None
+    log(f"building the Rust tools ({name})")
     r = resources.run([cargo, "build", "--release", "--manifest-path", str(RUST_DIR / "Cargo.toml")], capture_output=True, text=True)
     if r.returncode or not exe.exists():
-        raise RuntimeError("could not build the Rust lifter:\n" + r.stderr[-2000:])
+        raise RuntimeError(f"could not build {name}:\n" + r.stderr[-2000:])
+    # cargo leaves a tool it didn't need to relink untouched: mark them all current
+    for t in (RUST_DIR / "target" / "release").glob("uew*" + (".exe" if os.name == "nt" else "")):
+        os.utime(t)
     return exe
 
 
-def _lift_rust(link, out, gen, lo, log, progress, t0):
-    """discovery and lifting in uewlift (rustlift/): the same C as the Python lifter, far faster"""
-    exe = rust_lifter(log)
+def run_tool(name, args, log=print, progress=nop_progress):
+    """runs one of the Rust tools; its "@@progress stage done total" lines go to progress, "@@result <json>" is returned,
+    everything else it prints goes to log"""
+    exe = rust_tool(name, log)
     if exe is None:
-        raise RuntimeError("the Rust lifter needs a Rust toolchain (https://rustup.rs); or use the Python lifter")
-    mods = []
-    for m in link.order:
-        pe = m.pe
-        exports = [v for v in list(pe.exports.values()) + list(pe.exports_ord.values()) if isinstance(v, int)]
-        sj = [m.base + i.iat_rva for i in pe.imports if i.name in SETJMP] if pe.bits == 64 else []
-        eh_starts, eh_conts = {}, set()
-        if pe.bits == 32:
-            from . import eh32
-            eh_starts, eh_conts = eh32.analyze(pe.image(m.base), m.base, [(s.rva, s.vsize, s.executable) for s in pe.sections])
-        mods.append({"eh_starts": sorted([a, o] for a, o in eh_starts.items()), "eh_conts": sorted(eh_conts),"base": m.base, "bits": pe.bits, "image_size": pe.image_size, "entry_rva": pe.entry_rva,
-                     "sections": [[s.rva, s.vsize, s.executable] for s in pe.sections], "functions": [list(f) for f in pe.functions],
-                     "unwind": list(pe.unwind), "family": [[b, r] for b, r in pe.family.items()], "exports": exports,
-                     "tls_callbacks": list(pe.tls_callbacks), "relocs": list(pe.relocs), "sj_slots": sj})
-    job = out / "lift_job.json"
-    job.write_text(json.dumps({"image": str(out / "image.bin"), "lo": lo, "gen": str(gen), "runtime": str(RUNTIME), "chunk": CHUNK,
-                               "modules": mods}), encoding="utf-8")
-    progress("analyze", 0, 0)
-    r = resources.run([str(exe), str(job)], capture_output=True, text=True)
-    job.unlink()
-    if r.returncode:
-        raise RuntimeError("the Rust lifter failed:\n" + (r.stderr or r.stdout)[-3000:])
-    res = json.loads(r.stdout)
-    all_roots = set()
-    call_args = {}
-    for m, mr in zip(link.order, res["modules"]):
-        all_roots.update(mr["roots"])
-        call_args.update((a, n) for a, n in mr.get("call_args", []))
-        log(f"  {m.name}: {len(mr['roots'])} functions at 0x{m.base:x}")
-    roots = sorted(all_roots)
-    log(f"{len(link.order)} modules, {len(roots)} functions ({time.time() - t0:.1f}s; Rust lifter: discovery {res['seconds'][0]:.1f}s, "
-        f"lifting {res['seconds'][1]:.1f}s)")
-    write_if_changed(gen / "funcs.h", '#pragma once\n#include "rt.h"\n' + "".join(f"void F_{r:x}(CPU* __restrict);\n" for r in roots))
-    unsupported, where, bad = Counter(), {}, 0
-    for ch in res["chunks"]:
-        unsupported.update(ch["u"])
-        for k, v in ch["at"].items():
-            where.setdefault(k, v)
-        bad += ch["bad"]
-    progress("lift", 1, 1)
-    return roots, res["files"], unsupported, where, bad, call_args
+        raise RuntimeError(f"{name} isn't built and there's no Rust toolchain to build it (https://rustup.rs)")
+    p = subprocess.Popen([str(exe), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                         errors="replace", **resources.proc_flags())
+    err = []
+    t = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+    t.start()
+    result = None
+    for line in p.stdout:
+        if line.startswith("@@progress "):
+            _, stage, done, total = line.split()
+            progress(stage.replace("_", " "), int(done), int(total))
+        elif line.startswith("@@result "):
+            result = json.loads(line[9:])
+        elif line.strip():
+            log(line.rstrip())
+    t.join()
+    if p.wait():
+        raise RuntimeError("".join(err).strip()[-4000:] or f"{name} {args[0]} failed")
+    return result
 
 
-def recompile(exe, out, mem_mb=1024, comments=False, jobs=None, log=print, search=(), extra=(), system_dlls=True, progress=nop_progress,
-              lifter="python"):
-    """progress(stage, done, total) is called as work completes; total 0 means the stage has no measurable size.
-    lifter: "python" (default) or "rust" (rustlift/, built with cargo on first use; far faster on big games)"""
+def run_job(name, cmd, job, log=print, progress=nop_progress):
+    """a Rust tool given its work as a JSON job file"""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(job, f)
+    try:
+        return run_tool(name, [cmd, f.name], log, progress) or {}
+    finally:
+        os.unlink(f.name)
+
+
+def refresh_thunks(gen):
+    """binds imports to runtime functions added since the lift, so a relink picks them up without lifting again"""
+    if not (Path(gen) / "meta.c").exists():
+        return 0
+    return run_tool("uewrecomp", ["refresh", gen, RUNTIME, STDCALL_CACHE]) or 0
+
+
+def game_dlls(exe, real_eos=False):
+    """DLLs shipped with the game that it may load at runtime (PhysX, codecs, middleware): (install root, [paths]);
+    real_eos keeps the game's EOS SDK among them"""
+    r = json.loads(resources.run([str(rust_tool("uewrecomp")), "game-dlls", str(exe)] + (["--real-eos"] if real_eos else []),
+                                 capture_output=True, text=True, check=True).stdout)
+    return Path(r["root"]), [Path(d) for d in r["dlls"]]
+
+
+def recompile(exe, out, mem_mb=1024, log=print, search=(), extra=(), system_dlls=True, progress=nop_progress, real_eos=False):
+    """links the exe with its DLLs into image.bin, lifts every function to C in gen/ and writes gen/meta.c and
+    coverage.json (uewrecomp and uewlift, rustlift/). progress(stage, done, total): total 0 means no measurable size.
+    real_eos: recompile the game's own EOS SDK (it reaches Epic through WISP) instead of the runtime's stand-in.
+    Returns the coverage report."""
     out = Path(out)
-    gen = out / "gen"
-    gen.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    hle = implemented_hle()
-    link = Linker(exe, search=search, hle_names=hle, recompile_system=system_dlls, extra=extra)
-    images = link.images()
-
-    lo = link.order[0].base
-    span = bytearray(link.end - lo)
-    for m, img in images:
-        span[m.base - lo:m.base - lo + len(img)] = img
-    (out / "image.bin").write_bytes(bytes(span))
-    del span
-    if lifter == "rust" and not comments:
-        roots, ntasks, unsupported, where, bad, call_args = _lift_rust(link, out, gen, lo, log, progress, t0)
-    else:
-        roots, ntasks, unsupported, where, bad, call_args = _lift_python(link, gen, comments, jobs, log, progress, t0)
-    log(f"lifted into {ntasks} C files ({time.time() - t0:.1f}s), {bad} instructions unsupported")
-
-    lines = ['#include "host.h"', '#include "funcs.h"', ""]
-    lines.append(f"const uint64_t IMAGE_LO = 0x{lo:x}ull, IMAGE_HI = 0x{link.end:x}ull, GUEST_MEM_MB = {mem_mb}ull;")
-    lines.append(f"const int RT_G32 = {int(link.bits == 32)};")
-    cbs = []
-    lines.append("const ModuleInfo rt_modules[] = {")
-    for m in link.init_order:
-        t = m.pe.tls
-        first = len(cbs)
-        cbs += [m.base + x for x in m.pe.tls_callbacks]
-        tls = (m.base + t["start"], m.base + t["end"], m.base + t["index"], t["zero"]) if t else (0, 0, 0, 0)
-        lines.append(f"    {{{c_str(m.name)}, 0x{m.base:x}ull, 0x{m.pe.image_size:x}ull, 0x{m.pe.entry_rva:x}ull, {int(m.is_dll)}, "
-                     f"0x{tls[0]:x}ull, 0x{tls[1]:x}ull, 0x{tls[2]:x}ull, {tls[3]}ull, {first}, {len(cbs) - first}}},")
-    lines.append("};")
-    lines.append(f"const size_t rt_module_count = {len(link.init_order)};")
-    lines.append("const uint64_t rt_tls_callbacks[] = {" + ", ".join(f"0x{x:x}ull" for x in cbs + [0]) + "};")
-    # every implemented HLE function gets a thunk, so GetProcAddress and delay-loads find ones nothing imports
-    imported = {n for n, _ in link.thunks}
-    thunks = list(link.thunks) + [(n, "hle") for n in sorted(hle - imported)]
-    impl = sorted({n for n, _ in thunks if n in hle})
-    lines += [f"void hle_{n}(CPU*);" for n in impl]
-    lines += [f"static void T_{n}(CPU* c) {{ if (rt_trace_on > 0) rt_trace_call(c, {c_str(n)}); hle_{n}(c); c->r[4] += 8; "
-              f"if (--rt_hle_budget < 0) rt_hle_tick(c); }}" for n in impl]
-    lines.append("const Thunk rt_thunks[] = {")
-    for name, dll in thunks:
-        fn, call = (f"hle_{name}", f"T_{name}") if name in hle else ("NULL", "NULL")
-        lines.append(f"    {{{fn}, {c_str(name)}, {c_str(dll)}, {call}}},")
-    lines.append("};")
-    lines.append(f"const size_t rt_thunk_count = {len(thunks)};")
-    lines.append(thunk_pops(thunks, link.bits))
-    lines.append("const FnEntry rt_fn_table[] = {")
-    lines += [f"    {{0x{r:x}ull, F_{r:x}}}," for r in roots]
-    lines.append("    {0, NULL}};")
-    lines.append(f"const size_t rt_fn_count = {len(roots)};")
-    # 32-bit: bytes pushed for each indirect call, by return address, for runtime stand-ins called through vtables
-    # whose argument counts aren't known (offline Steam interfaces)
-    sites = sorted(call_args.items())
-    lines.append("const uint32_t rt_call_args[] = {" + (", ".join(f"0x{a:x}, {n}" for a, n in sites) or "0, 0") + "};")
-    lines.append(f"const size_t rt_call_arg_count = {len(sites)};")
-    lines.append(f"const uint32_t rt_steam_appid = {steam_appid(exe)};")
-    write_if_changed(gen / "meta.c", "\n".join(lines) + "\n")
-    keep = {f"funcs_{i:04d}.c" for i in range(ntasks)} | {"meta.c", "funcs.h"}
-    for f in gen.iterdir():
-        if f.name not in keep:
-            f.unlink()
-
-    report = {
-        "exe": str(exe), "modules": {m.name: str(m.path) for m in link.order}, "functions": len(roots),
-        "imports": sum(len(m.pe.imports) for m in link.order),
-        "unsupported_total": bad, "unsupported": dict(unsupported.most_common()),
-        "unsupported_examples": where, "missing_imports": link.missing,
-        "seconds": round(time.time() - t0, 1),
-    }
-    (out / "coverage.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return report
-
+    out.mkdir(parents=True, exist_ok=True)
+    return run_job("uewrecomp", "recompile", {"exe": str(exe), "out": str(out), "mem_mb": mem_mb, "search": [str(x) for x in search],
+                                              "extra": [str(x) for x in extra], "system_dlls": system_dlls, "real_eos": real_eos, "runtime": str(RUNTIME),
+                                              "stdcall_cache": str(STDCALL_CACHE)}, log, progress)
 
 
 def emsdk_env():
@@ -466,141 +144,6 @@ def jspi_flag(node):
     """newer Node ships JSPI enabled and rejects the old flag"""
     r = resources.run([node, "-e", "process.exit(typeof WebAssembly.Suspending == 'function' ? 0 : 1)"])
     return [] if r.returncode == 0 else ["--experimental-wasm-jspi"]
-
-
-SHELL = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__</title>
-<link rel="icon" href="__ICON__">
-<style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  canvas { position: absolute; inset: 0; margin: auto; max-width: 100%; max-height: 100%; aspect-ratio: __W__ / __H__;
-           width: 100%; height: auto; outline: none; }
-  @media (min-aspect-ratio: __W__ / __H__) { canvas { width: auto; height: 100%; } }
-  #status { position: fixed; left: 16px; bottom: 12px; font: 13px system-ui, sans-serif; color: #9a9a9a; pointer-events: none; }
-  #fps { position: fixed; left: 8px; top: 6px; font: 600 13px ui-monospace, Consolas, monospace; color: #e8e8e8; background: #000a;
-         padding: 2px 6px; border-radius: 4px; pointer-events: none; display: none; }
-</style>
-</head>
-<body>
-<canvas id="canvas" width="__W__" height="__H__" tabindex="0"></canvas>
-<script>
-  // render size, read once by the game at start: "native" (--resolution native, or ?res=native) draws at the window's own
-  // pixel count instead of a fixed size the page scales up, so text and UI stay sharp; ?res=WxH picks a size
-  (() => {
-    const c = document.getElementById("canvas");
-    const want = new URLSearchParams(location.search).get("res") || "__RES__";
-    let w = 0, h = 0;
-    if (want === "native") {
-      const d = Math.min(window.devicePixelRatio || 1, 3);
-      // a page loading in a hidden or not yet laid out view reads a 0x0 window: the screen stands in
-      w = (innerWidth || screen.availWidth || 1280) * d; h = (innerHeight || screen.availHeight || 720) * d;
-      const s = Math.min(1, 3840 / w, 2160 / h);
-      w = Math.round(w * s); h = Math.round(h * s);
-    } else {
-      const m = /^(\\d{3,5})x(\\d{3,5})$/.exec(want);
-      if (m) { w = +m[1]; h = +m[2]; }
-    }
-    if (w >= 320 && h >= 200) {
-      // multiples of 8: Unreal Engine 3 rounds its depth buffer up to 8 pixels, and D3D11 draws to a smaller back
-      // buffer with it while WebGPU wants attachments of one size (at 1600x900 every frame failed: depth 1600x904)
-      w &= ~7; h &= ~7;
-      c.width = w; c.height = h; c.style.aspectRatio = `${w} / ${h}`;
-      // Unreal Engine 3 takes its render size from its settings files (Rocket League: 1280x720) unless the command line
-      // gives one
-      window.uewResArgs = [`-ResX=${w}`, `-ResY=${h}`];
-    }
-  })();
-</script>
-<div id="status">Loading…</div>
-<div id="fps"></div>
-<script>
-  // frame counter: Ctrl+Shift+F toggles it (remembered), ?fps=1 or ?fps=0 in the address overrides
-  (() => {
-    const el = document.getElementById("fps");
-    let on = __FPS__;
-    try { const v = localStorage.getItem("uewFps"); if (v !== null) on = v === "1"; } catch (e) {}
-    const q = new URLSearchParams(location.search).get("fps");
-    if (q !== null) on = q !== "0";
-    const show = () => { el.style.display = on ? "block" : "none"; };
-    show();
-    addEventListener("keydown", e => {
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyF") {
-        on = !on; show();
-        try { localStorage.setItem("uewFps", on ? "1" : "0"); } catch (err) {}
-        e.preventDefault(); e.stopImmediatePropagation();
-      }
-    }, true);
-    let last = performance.now(), frames = 0, worst = 0, prev = 0, prevT = last;
-    const tick = now => {
-      const n = (window.Module && Module.uewPresents) || 0;
-      if (n !== prev) { worst = Math.max(worst, now - prevT); prev = n; prevT = now; }
-      if (now - last >= 500) {
-        const fps = (n - frames) * 1000 / (now - last);
-        if (on) el.textContent = `${fps.toFixed(0)} FPS  ${fps ? (1000 / fps).toFixed(1) : "-"} ms  worst ${worst.toFixed(0)} ms`;
-        frames = n; last = now; worst = 0;
-      }
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  })();
-</script>
-<script>
-  const status = document.getElementById("status");
-  const parts = __PARTS__;
-  var Module = {
-    canvas: document.getElementById("canvas"),
-    arguments: __ARGS__.concat(window.uewResArgs || [], new URLSearchParams(location.search).getAll("arg")),
-    uewSave: __SAVE__,
-    uewSeed: __SEED__,
-    uewAsyncShaders: __ASYNC__,
-    uewDebugPanel: __DEBUG__,
-    uewNetPlaceholders: __PLACEHOLDERS__,
-    uewCacheMB: __CACHEMB__,
-    uewGpuMB: __GPUMB__,
-    print: t => console.log(t),
-    printErr: t => console.log(t),
-    setStatus: t => { if (t) status.textContent = t; },
-    onRuntimeInitialized: () => { status.textContent = ""; },
-  };
-  if (parts.length) {
-    // the parts download together and are fed in order to a streaming compile, which runs while they arrive
-    Module.instantiateWasm = (imports, done) => {
-      let got = 0;
-      const res = parts.map(u => fetch(u));
-      const body = new ReadableStream({
-        async start(ctl) {
-          for (let i = 0; i < res.length; i++) {
-            const r = await res[i];
-            if (!r.ok) throw new Error(`HTTP ${r.status} for ${parts[i]}`);
-            const rd = r.body.getReader();
-            for (;;) {
-              const { done: end, value } = await rd.read();
-              if (end) break;
-              got += value.length;
-              status.textContent = `Loading code ${Math.round(got / 1048576)} MB`;
-              ctl.enqueue(value);
-            }
-          }
-          status.textContent = "Compiling…";
-          ctl.close();
-        }
-      });
-      WebAssembly.instantiateStreaming(new Response(body, { headers: { "Content-Type": "application/wasm" } }), imports)
-        .then(r => done(r.instance, r.module))
-        .catch(e => { status.textContent = "Failed to load: " + e.message; });
-      return {};
-    };
-  }
-</script>
-<script src="game.js"></script>
-</body>
-</html>
-"""
 
 
 def _epic_args(exe_rel):
@@ -676,165 +219,34 @@ def memory_split(limit_gb, guest_mb):
     return cache, gpu
 
 
-COI_SW = """// Real-thread builds need cross-origin isolation (SharedArrayBuffer). Hosts that can't send the headers get them from
-// this service worker, which adds them to every response of the page.
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", e => e.waitUntil(self.clients.claim()));
-self.addEventListener("fetch", e => {
-  const r = e.request;
-  if (r.cache === "only-if-cached" && r.mode !== "same-origin") return;
-  e.respondWith(fetch(r).then(res => {
-    if (res.status === 0) return res;
-    const h = new Headers(res.headers);
-    h.set("Cross-Origin-Embedder-Policy", "require-corp");
-    h.set("Cross-Origin-Opener-Policy", "same-origin");
-    h.set("Cross-Origin-Resource-Policy", "cross-origin");
-    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
-  }));
-});
-"""
-
-# 64-bit memory builds: a module whose one memory has the memory64 flag validates only where memory64 is supported
-MEM64_CHECK = """<script>
-  window.uewMem64Ok = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 5, 3, 1, 4, 0]));
-  if (!uewMem64Ok) status.textContent = "This game needs 64-bit WebAssembly memory (memory64): use a current Chrome, Edge or Brave.";
-</script>
-"""
-
-COI_LOAD = """<script>
-  // real threads: start once the page is cross-origin isolated (headers from the host, or coi-sw.js)
-  if (self.crossOriginIsolated) document.write('<script src="game.js"><\\/script>');
-  else if (navigator.serviceWorker && window.isSecureContext) {
-    status.textContent = "Setting up threads…";
-    navigator.serviceWorker.register("coi-sw.js").then(() => navigator.serviceWorker.ready).then(() => {
-      if (sessionStorage.getItem("uewCoi") === location.href) status.textContent = "This host blocks the isolation real threads need; rebuild with cooperative threads.";
-      else { sessionStorage.setItem("uewCoi", location.href); location.reload(); }
-    });
-  } else status.textContent = "Real threads need https (or localhost) to run.";
-</script>
-"""
+def _uewbuild(cmd, job, log=print, progress=nop_progress):
+    return run_job("uewbuild", cmd, job, log, progress)
 
 
 def write_shell(web, args, title="Game", size=(1280, 720), save="", part_mb=24, show_fps=False, async_shaders=True, exe=None, debug_panel=True,
-                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop", seed=None, mem64=False):
+                placeholders=False, cache_mb=640, gpu_mb=2048, threads="coop", seed=None, mem64=False, steam=None, wisp=None):
     """index.html for a web build; game.wasm is cut into parts when it is too big for static hosts. mem64: the page
     checks for WebAssembly memory64 first and says so instead of failing to compile"""
-    import json
-    wasm = web / "game.wasm"
-    for old in web.glob("game.wasm.*"):
-        old.unlink()
-    parts = []
-    if wasm.stat().st_size > part_mb << 20:
-        data = wasm.read_bytes()
-        step = part_mb << 20
-        for i in range(0, len(data), step):
-            (web / f"game.wasm.{i // step}").write_bytes(data[i:i + step])
-            parts.append(f"game.wasm.{i // step}")
-        wasm.unlink()
-    from .icon import write_favicon
-    icon = write_favicon(web, exe) or "data:,"
     # size "native": the page sizes the canvas to the window's pixels at start (1280x720 until then, and as the fallback)
-    res = "native" if size == "native" else ""
-    if size == "native":
-        size = (1280, 720)
-    html = (SHELL.replace("__ICON__", icon).replace("__TITLE__", title).replace("__W__", str(size[0])).replace("__H__", str(size[1]))
-            .replace("__RES__", res)
-            .replace("__PARTS__", json.dumps(parts)).replace("__ARGS__", json.dumps(args)).replace("__SAVE__", json.dumps(save)).replace("__SEED__", json.dumps(seed or {}))
-            .replace("__FPS__", "true" if show_fps else "false")
-            .replace("__ASYNC__", "true" if async_shaders else "false")
-            .replace("__DEBUG__", "true" if debug_panel else "false").replace("__PLACEHOLDERS__", "true" if placeholders else "false")
-            .replace("__CACHEMB__", str(int(cache_mb))).replace("__GPUMB__", str(int(gpu_mb))))
-    if threads == "real":
-        load = COI_LOAD.replace("  if (self.crossOriginIsolated)", "  if (!window.uewMem64Ok) {}\n  else if (self.crossOriginIsolated)") if mem64 else COI_LOAD
-        html = html.replace('<script src="game.js"></script>\n', (MEM64_CHECK if mem64 else "") + load)
-        (web / "coi-sw.js").write_text(COI_SW, encoding="utf-8")
-    else:
-        if mem64:
-            html = html.replace('<script src="game.js"></script>\n',
-                                MEM64_CHECK + """<script>if (window.uewMem64Ok) document.write('<script src="game.js"><\\/script>');</script>\n""")
-        if (web / "coi-sw.js").exists():
-            (web / "coi-sw.js").unlink()
-    (web / "index.html").write_text(html, encoding="utf-8")
-    # Cloudflare Pages reads this; other hosts ignore it
-    (web / "_headers").write_text("\n".join([
-        "/*", "  Cross-Origin-Opener-Policy: same-origin", "  Cross-Origin-Embedder-Policy: require-corp", "",
-        "/game.wasm*", "  Content-Type: application/wasm", "",
-        "/data/*", "  Content-Type: application/octet-stream", "  Cache-Control: public, max-age=3600, must-revalidate", ""]),
-        encoding="utf-8")
-
-
-EMBED_JS = """<script>
-  // single-file build: the code and game files are in this page; each piece becomes a Blob (kept outside the script heap)
-  (() => {
-    const dec = s => Uint8Array.fromBase64 ? Uint8Array.fromBase64(s) : Uint8Array.from(atob(s), ch => ch.charCodeAt(0));
-    const parts = new Map(), wasm = [];
-    let index = "";
-    for (const el of [...document.querySelectorAll('script[type="application/x-uew"]')]) {
-      const n = el.dataset.n, t = el.textContent;
-      el.remove();
-      if (n == "index") index = t;
-      else if (n.startsWith("wasm.")) wasm[+n.slice(5)] = new Blob([dec(t)]);
-      else parts.set(n, new Blob([dec(t)]));
-    }
-    Module.uewEmbed = { index, part: n => parts.get(n) };
-    Module.instantiateWasm = (imports, done) => {
-      status.textContent = "Compiling…";
-      const code = new Response(new Blob(wasm).stream().pipeThrough(new DecompressionStream("gzip")), { headers: { "Content-Type": "application/wasm" } });
-      WebAssembly.instantiateStreaming(code, imports).then(r => { wasm.length = 0; done(r.instance, r.module); })
-        .catch(e => { status.textContent = "Failed to load: " + e.message; });
-      return {};
-    };
-  })();
-</script>
-"""
+    native = size == "native"
+    w, h = (1280, 720) if native else size
+    _uewbuild("shell", {"web": str(web), "args": args, "title": title, "width": w, "height": h, "native": native, "save": save,
+                        "part_mb": part_mb, "show_fps": show_fps, "async_shaders": async_shaders, "debug_panel": debug_panel,
+                        "exe": str(exe or ""), "fallback_icon": str(Path(__file__).resolve().parents[1] / "assets" / "uewasm.ico"),
+                        "placeholders": placeholders, "cache_mb": int(cache_mb), "gpu_mb": int(gpu_mb), "threads": threads,
+                        "seed": seed or {}, "mem64": mem64, "steam": steam or {"mode": "offline"}, "wisp": wisp or {}})
 
 
 def write_single_file(web, dest, log=print, chunk_mb=16):
     """one .html holding the whole web build (code and game files), for opening straight from disk with no server.
     Only for cooperative-thread builds: real threads need cross-origin isolation, which a file:// page can't have."""
-    import base64
-    import gzip
-    web, dest = Path(web), Path(dest)
-    html = (web / "index.html").read_text(encoding="utf-8")
-    if "game.js" not in html:
-        raise RuntimeError("not a web build: " + str(web))
-    ico = web / "favicon.ico"
-    if ico.exists():
-        html = html.replace('href="favicon.ico"', 'href="data:image/x-icon;base64,' + base64.b64encode(ico.read_bytes()).decode() + '"')
-    parts = sorted(web.glob("game.wasm.*"), key=lambda p: int(p.suffix[1:]))
-    code = b"".join(p.read_bytes() for p in parts) if parts else (web / "game.wasm").read_bytes()
-    data = web / "data"
-    js = (web / "game.js").read_text(encoding="utf-8").replace("</script", "<\\/script")
-    i = html.index('<script src="game.js"></script>')
-    tmp = dest.with_suffix(".tmp")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tmp.open("w", encoding="utf-8", newline="\n") as f:
-        f.write(html[:i])
-
-        def put(name, b):
-            f.write(f'<script type="application/x-uew" data-n="{name}">')
-            f.write(base64.b64encode(b).decode("ascii"))
-            f.write("</script>\n")
-        z = gzip.compress(code, 6)
-        step = chunk_mb << 20
-        for k in range(0, len(z), step):
-            put(f"wasm.{k // step}", z[k:k + step])
-        if (data / "index.txt").exists():
-            # script text isn't entity-decoded; only "</script" would end it early
-            f.write('<script type="application/x-uew" data-n="index">' + (data / "index.txt").read_text(encoding="utf-8")
-                    .replace("</script", "<\\/script") + "</script>\n")
-            for p in sorted(data.iterdir()):
-                if p.name != "index.txt":
-                    put(p.name, p.read_bytes())
-        f.write(EMBED_JS)
-        f.write("<script>\n" + js + "\n</script>\n")
-        f.write(html[i + len('<script src="game.js"></script>'):])
-    tmp.replace(dest)
-    mb = dest.stat().st_size / 1048576
-    log(f"single file: {dest} ({mb:.0f} MB; code {len(code) / 1048576:.0f} MB, {len(z) / 1048576:.0f} MB compressed)")
-    if mb > 1500:
-        log("note: browsers may not open a page this big; single-file builds suit smaller games")
-    return dest
+    exe = rust_tool("uewbuild", log)
+    r = resources.run([str(exe), "single", str(web), str(dest), str(chunk_mb)], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip()[-2000:])
+    for line in r.stdout.splitlines():
+        log(line)
+    return Path(dest)
 
 
 def mem_budget_mb():
@@ -891,14 +303,20 @@ PORTS = ["-sUSE_OGG=1", "-sUSE_VORBIS=1"]
 def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False, threads="coop", renderer="webgpu",
                game_root=None, exe_rel=None, title=None, size=(1280, 720), part_mb=16, compress=False, names=False, progress=nop_progress, video_height=0, video_mode="fast",
                wasm_opt=False, game_args=None, quality=None, simd=True, show_fps=False, async_shaders=True, debug_panel=True, backend=None,
-               placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web", mem64=False):
+               placeholders=False, aes_key=None, mem_limit_gb=8, single_file=False, web_name="web", mem64=False,
+               steam="webworks", webworks_url="http://localhost:3000", relay=False, wisp=False, wisp_url=None,
+               steam_wisp=False):
     """mem64: build a wasm64 module (64-bit memory), so guest memory can be larger than the 4 GB a wasm32 module can
     address (games that need more than ~3 GB). Needs a browser with WebAssembly memory64 (Chrome/Edge/Brave 133+); 64-bit
     addressing costs some speed, so it is only used when asked for.
     aes_key: the game's pak key (32 bytes); encrypted paks are checked against it (a wrong key fails the build) and
     older-format ones are packaged decrypted, so they compress.
     wasm_opt: also run Binaryen over the linked module. It trims ~10% off the size but needs roughly 20x the
-    module size in RAM (11 GB for a 550 MB game), so it is off unless asked for."""
+    module size in RAM (11 GB for a 550 MB game), so it is off unless asked for.
+    relay: online play through the built-in relay that `uewasm serve` runs at the game's own address.
+    wisp / wisp_url: real network connections (the game's own servers, the real EOS SDK) through a WISP server: wisp
+    uses the one `uewasm serve` runs at the game's address, wisp_url one elsewhere.
+    steam_wisp: with steam="account" and WISP, the Steam sign-in and connection go through the WISP server too."""
     if renderer not in ("webgpu", "webgl2"):
         raise ValueError("renderer must be webgpu or webgl2")
     if threads not in ("coop", "real"):
@@ -910,108 +328,25 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
     if single_file:
         compress = True
     out = Path(out)
-    mt = threads == "real"
-    # real threads compile every file differently (shared memory, atomics), so their objects are kept apart
-    # developer hook: UEW_LTO=thin builds with ThinLTO (small lifted functions inlined across files) into its own objects
-    lto = os.environ.get("UEW_LTO") == "thin"
-    obj = out / (("wobj_mt" if mt else "wobj") + ("_m64" if mem64 else "") + ("_lto" if lto else ""))
-    obj.mkdir(exist_ok=True)
     env, emcc, _ = emsdk_env()
-    # simd: wasm SIMD (every current browser) lets clang turn the emulated SSE lanes into real vector ops
-    cflags = [opt, "-w", "-mtail-call", *(["-msimd128"] if simd else []), "-sSUPPORT_LONGJMP=wasm", "-DUEW_WEB_GPU", f"-I{RUNTIME}", f"-I{out / 'gen'}", "-D_CRT_SECURE_NO_WARNINGS", "-fno-strict-aliasing"]
-    # developer hook: extra compiler flags for every file (e.g. -DUEW_STORE_CHECK for a store-checking debug build)
-    cflags += os.environ.get("UEW_EXTRA_CFLAGS", "").split()
-    if renderer == "webgpu":
-        cflags.append("-DUEW_WEBGPU")
-    if mt:
-        cflags += ["-pthread", "-DUEW_THREADS"]
-    if mem64:
-        cflags += ["-sMEMORY64=1", *(f"-D{d}" for d in mem64_defines(out))]
-    if lto:
-        cflags.append("-flto=thin")
-    # generated code only depends on rt.h/sse.h and the opt level; the runtime is always rebuilt (it is small)
-    stamp = obj / "flags.txt"
-    key = " ".join(cflags)
-    if not stamp.exists() or stamp.read_text() != key:
-        for o in obj.glob("*.o"):
-            o.unlink()
-        stamp.write_text(key)
-    newest_h = max((RUNTIME / n).stat().st_mtime for n in ("rt.h", "sse.h"))
     bound = refresh_thunks(out / "gen")
     if bound:
         log(f"{bound} imports bound to runtime functions added since the lift")
-    gen = sorted((out / "gen").glob("*.c"))
-    for o in obj.glob("*.o"):
-        if not (out / "gen" / (o.stem + ".c")).exists() and not (RUNTIME / (o.stem + ".c")).exists():
-            o.unlink()
-
-    def stale(p):
-        o = obj / (p.stem + ".o")
-        return not o.exists() or o.stat().st_mtime < max(p.stat().st_mtime, newest_h)
-    gen_srcs = [p for p in gen if stale(p)]
-    srcs = gen_srcs + sorted(RUNTIME.glob("*.c"))
-    t0 = time.time()
-    # generated files go straight to clang with emcc's own flags, skipping emcc's per-file startup
-    clang = Path(emcc).parents[1] / "bin" / ("clang.exe" if os.name == "nt" else "clang")
-    import shlex
-    em = shlex.split(resources.run([emcc, "--cflags", *cflags], env=env, capture_output=True, text=True).stdout)
-    direct = clang.exists() and em
-    # the debug panel and what it drives (UE console enabler, game speed, call tracing) are only built in when wanted, so
-    # a build without them carries none of that code (nothing for a game's anti-cheat to find)
-    debug_defs = ["-DUEW_DEBUG_TOOLS"] if debug_panel else []
-    exports = ["_main", "_uew_ctx_start", "_uew_threads"] + (["_uew_set_trace", "_uew_set_speed", "_uew_ue_console", "_uew_d3d9_trace"] if debug_panel else [])
-    jobs = []
-    for src in srcs:
-        o = str(obj / (src.stem + ".o"))
-        # peak clang memory measured on generated files: ~175 MB plus ~60 MB per MB of source
-        mb = 190 + 62 * src.stat().st_size / 1048576
-        if direct and src in gen_srcs:
-            jobs.append((src.name, [str(clang), *em, *(f for f in cflags if not f.startswith("-s")), "-c", str(src), "-o", o], env, mb))
-        else:
-            jobs.append((src.name, [emcc, *cflags, *PORTS, *debug_defs, "-c", str(src), "-o", o], env, mb + 200))
-    run_jobs(jobs, "wasm compile", progress)
-    progress("link", 0, 0)
+    plan = resources.plan()
+    if not game_root:
+        backend = None
+    res = _uewbuild("compile", {
+        "out": str(out), "runtime": str(RUNTIME), "emcc": emcc, "opt": opt, "simd": simd, "renderer": renderer, "threads": threads,
+        "env": {k: env[k] for k in ("EMSDK", "EM_CONFIG", "EMSDK_PYTHON", "PATH") if k in env},
+        "mem64": mem64, "mem64_defines": mem64_defines(out) if mem64 else [],
+        # developer hooks: UEW_LTO=thin (ThinLTO into its own objects), UEW_EXTRA_CFLAGS (e.g. -DUEW_STORE_CHECK), UEW_TIMES=<file>
+        "lto": os.environ.get("UEW_LTO") == "thin", "extra_cflags": os.environ.get("UEW_EXTRA_CFLAGS", "").split(),
+        "times_file": os.environ.get("UEW_TIMES", ""), "debug_panel": debug_panel, "names": names, "wasm_opt": wasm_opt,
+        "web_name": web_name, "game_files": bool(game_root), "backend_script": BACKENDS[backend]["script"] if backend else "",
+        "node_fs": node_fs, "embed": embed and not game_root, "compile_jobs": plan["compile_jobs"], "budget_mb": plan["budget_mb"]},
+        log, progress)
     web = out / web_name
-    web.mkdir(exist_ok=True)
-    orsp = out / "emlink.rsp"
-    orsp.write_text("\n".join(f'"{p.as_posix()}"' for p in obj.glob("*.o")), encoding="utf-8")
-    link = [emcc, opt if wasm_opt else "-O1", *(["-flto=thin", "-Wl,--lto-O2", f"-Wl,--thinlto-jobs={resources.plan()['compile_jobs']}"] if lto else []), "-mtail-call", *(["-msimd128"] if simd else []), f"@{orsp}", "-o", str(web / "game.js"),
-            "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=64MB", f"-sMAXIMUM_MEMORY={'16GB' if mem64 else '4GB'}", *(["-sMEMORY64=1"] if mem64 else []), "-sSTACK_SIZE=16MB", "-sENVIRONMENT=web,node",
-            "-sEXIT_RUNTIME=1", "-sMODULARIZE=0", "-sINVOKE_RUN=1", *PORTS,
-            "-sMIN_WEBGL_VERSION=2", "-sMAX_WEBGL_VERSION=2", "-sSUPPORT_LONGJMP=wasm", "-sJSPI", "-sJSPI_EXPORTS=['uew_ctx_start']", "-sEXPORTED_FUNCTIONS=" + ",".join(exports)]
-    link += ["--js-library", str(RUNTIME / "web" / "uew_host.js")]
-    if renderer == "webgpu":
-        link += ["--js-library", str(RUNTIME / "web" / "uew_webgpu.js")]
-    if mt:
-        # one worker per core is started with the page (the scheduler's carriers), so none has to load mid-game
-        link += ["-pthread", "-sPTHREAD_POOL_SIZE=Math.min(4,(globalThis.navigator&&navigator.hardwareConcurrency)||4)",
-                 "-sPTHREAD_POOL_SIZE_STRICT=0"]
-        link[link.index("-sENVIRONMENT=web,node")] = "-sENVIRONMENT=web,worker,node"
-    if names:
-        link.append("--profiling-funcs")
-    if game_root:
-        embed = False
-        link += ["--pre-js", str(RUNTIME / "web" / "uew_files.js"), "--pre-js", str(RUNTIME / "web" / "uew_save.js"), *(["--pre-js", str(RUNTIME / "web" / "uew_debug.js")] if debug_panel else []), "-lidbfs.js",
-                 "-sFORCE_FILESYSTEM=1"]
-        if backend:
-            link += ["--pre-js", str(RUNTIME / "web" / "backends" / BACKENDS[backend]["script"])]
-    if node_fs:
-        link = [x for x in link if not x.startswith("-sENVIRONMENT=")] + ["-sNODERAWFS=1", "-sENVIRONMENT=node"]
-    elif embed:
-        link += ["--embed-file", f"{out / 'image.bin'}@image.bin"]
-    r = resources.run(link, env=env, capture_output=True, text=True)
-    progress("link", 1, 1)
-    if r.returncode:
-        errs = [l for l in r.stderr.splitlines() if "error" in l.lower() and len(l) < 600]
-        raise RuntimeError("emcc link failed:\n" + "\n".join(errs[:20] or [r.stderr[-3000:]]))
-    wasm_mb = (web / "game.wasm").stat().st_size / 1e6
-    # browsers refuse modules over 1 GiB (V8's limit)
-    wasm_bytes = (web / "game.wasm").stat().st_size
-    if wasm_bytes > 1 << 30:
-        log(f"warning: the code is {wasm_bytes / 1048576:.0f} MiB, over the 1024 MiB browsers accept; rebuild with --opt -Os "
-            "(and --wasm-opt if there is enough memory) to make it smaller")
-    elif wasm_bytes > 900 << 20:
-        log(f"note: the code is {wasm_bytes / 1048576:.0f} MiB, close to the 1024 MiB browsers accept")
+    wasm_mb = res.get("wasm_mb", 0)
     if game_root:
         from .package import package
         replace = {}
@@ -1034,11 +369,19 @@ def build_wasm(out, log=print, opt="-O2", mem_mb=None, embed=True, node_fs=False
         log(f"memory limit {mem_limit_gb} GB: {guest} MB game memory, {cache_mb} MB download cache, {gpu_mb} MB video memory")
         write_shell(web, args, title or Path(exe_rel).stem, size, save, show_fps=show_fps, async_shaders=async_shaders,
                     exe=Path(game_root) / exe_rel, debug_panel=debug_panel, placeholders=placeholders, cache_mb=cache_mb, gpu_mb=gpu_mb,
-                    threads=threads, seed=quality_files(exe_rel, quality), mem64=mem64)
+                    threads=threads, seed=quality_files(exe_rel, quality), mem64=mem64,
+                    steam={"mode": steam, "url": webworks_url, "relay": bool(relay), "versions": steam_versions(game_root)},
+                    wisp={**({"url": wisp_url} if wisp_url else {"url": "origin"}), "steam": bool(steam_wisp and steam == "account")}
+                    if wisp_url or wisp else {})
+        for mark, on, what in (("uew-relay", relay, "the relay"), ("uew-wisp", wisp and not wisp_url, "the WISP server")):
+            if on:
+                (web / mark).write_text(f"this build goes online through {what} `uewasm serve` runs\n")
+            elif (web / mark).exists():
+                (web / mark).unlink()
         if single_file:
             name = re.sub(r'[<>:"/\\|?*]', "", title or Path(exe_rel).stem).strip() or "game"
             write_single_file(web, out / "single" / f"{name}.html", log=log)
-    log(f"wasm build: {web} ({renderer}{', 64-bit memory' if mem64 else ''}, {len(srcs)} files compiled, {time.time() - t0:.1f}s, {wasm_mb:.1f} MB wasm)")
+    log(f"wasm build: {web} ({renderer}{', 64-bit memory' if mem64 else ''}, {res.get('files', 0)} files compiled, {res.get('seconds', 0):.1f}s, {wasm_mb:.1f} MB wasm)")
     return web
 
 
@@ -1097,11 +440,20 @@ def build_native(out, log=print, debug=False, progress=nop_progress, mem64=False
         flags += [f"/D{d}" for d in mem64_defines(out)]
     t0 = time.time()
     cl = tool(env, "cl")
-    run_jobs([(p.name, [cl, *flags, str(p)], env, 80 + 40 * p.stat().st_size / 1048576) for p in srcs], "native compile", progress)
+    # BearSSL (Schannel's TLS): its own object folder, compiled when missing or older than its source
+    bssl, bobj = RUNTIME / "third_party" / "bearssl", obj / "bssl"
+    bobj.mkdir(exist_ok=True)
+    inc = [f"/I{bssl / 'inc'}", f"/I{bssl / 'src'}"]
+    flags += [f"/I{bssl / 'inc'}"]
+    lib = [p for p in sorted((bssl / "src").rglob("*.c"))
+           if not (bobj / (p.stem + ".obj")).exists() or (bobj / (p.stem + ".obj")).stat().st_mtime < p.stat().st_mtime]
+    jobs = [(p.name, [cl, *flags, str(p)], env, 80 + 40 * p.stat().st_size / 1048576) for p in srcs]
+    jobs += [(p.name, [cl, *[f for f in flags if not f.startswith("/Fo")], *inc, f"/Fo{bobj}\\", str(p)], env, 80) for p in lib]
+    run_jobs(jobs, "native compile", progress)
     progress("native link", 0, 0)
     exe = out / "native.exe"
     lrsp = out / "link.rsp"
-    lrsp.write_text("\n".join(f'"{p}"' for p in obj.glob("*.obj")), encoding="utf-8")
+    lrsp.write_text("\n".join(f'"{p}"' for p in [*obj.glob("*.obj"), *bobj.glob("*.obj")]), encoding="utf-8")
     r = resources.run([tool(env, "link"), "/nologo", f"/OUT:{exe}", "/STACK:268435456", f"/MAP:{out / 'native.map'}", f"@{lrsp}"],
                        env=env, capture_output=True, text=True)
     progress("native link", 1, 1)

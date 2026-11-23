@@ -15,8 +15,10 @@ from uewasm.serve import background  # noqa: E402
 FXC = next(Path(r"C:\Program Files (x86)\Windows Kits\10\bin").glob("*/x64/fxc.exe"))
 # "d3d9": the Direct3D 9 version (triangle9.cpp, Shader Model 3, built 32-bit like most D3D9 games)
 D3D9 = "d3d9" in sys.argv[1:]
-OUT = ROOT / "tests" / "bin" / ("gfx9" if D3D9 else "gfx")
-NAME = "triangle9" if D3D9 else "triangle"
+# "volume": a 3D texture filled by one instanced layered draw (geometry shader picks the slice), as Unreal builds LUTs
+VOLUME = "volume" in sys.argv[1:]
+OUT = ROOT / "tests" / "bin" / ("gfx9" if D3D9 else "gfxvol" if VOLUME else "gfx")
+NAME = "triangle9" if D3D9 else "volume" if VOLUME else "triangle"
 # "mem64": a wasm64 build (64-bit memory) with 5 GB of guest memory, so guest addresses pass 4 GB (the native build too)
 MEM64 = "mem64" in sys.argv[1:]
 
@@ -58,7 +60,10 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     env = build.msvc_env("x86" if D3D9 else "x64")
     sm = "3_0" if D3D9 else "5_0"
-    for entry, prof, name in (("VSMain", "vs_" + sm, NAME + "_vs.h"), ("PSMain", "ps_" + sm, NAME + "_ps.h")):
+    entries = [("VSMain", "vs_" + sm, NAME + "_vs.h"), ("PSMain", "ps_" + sm, NAME + "_ps.h")]
+    if VOLUME:
+        entries += [("GSMain", "gs_5_0", "volume_gs.h"), ("VSShow", "vs_5_0", "volume_showvs.h"), ("PSShow", "ps_5_0", "volume_showps.h")]
+    for entry, prof, name in entries:
         subprocess.run([str(FXC), "/nologo", f"/T{prof}", f"/E{entry}", f"/Vn", f"g_{entry}", f"/Fh{OUT / name}", str(HERE / (NAME + ".hlsl"))],
                        check=True, capture_output=True)
     exe = OUT / (NAME + ".exe")
@@ -103,6 +108,14 @@ def main():
     center, corner = px(320, 200), px(10, 10)
     print("browser log:", " | ".join(l for l in logs if l.strip())[:900 if "debug" not in sys.argv else 20000])
     # clear colour (0.05, 0.1, 0.3): stored as is, or sRGB-encoded on an sRGB back buffer
+    if VOLUME:
+        # the middle of the volume: red and green about half, blue the slice (16 of 32)
+        print("center pixel", center, "(expect about (128, 128, 131): uv and slice of the volume's middle)")
+        ok = all(abs(a - b) < 24 for a, b in zip(center, (128, 128, 131)))
+        print("RENDER", "PASS" if ok else "FAIL")
+        if not ok:
+            sys.exit(1)
+        return
     want = (63, 89, 149) if srgb else (13, 25, 76)
     print("corner pixel", corner, f"(expect about {want} clear colour)")
     print("center pixel", center, "(expect a mix of red/green/blue from the triangle)")

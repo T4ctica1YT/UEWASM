@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +41,6 @@ def find_exe(path):
 
 def cmd_recomp(a):
     from .recomp import build
-    from .recomp.link import game_dlls
     # --progress: machine-readable lines for front ends (the desktop app): @@progress stage done total, @@error, @@done
     prog = build.nop_progress
     if a.progress:
@@ -61,7 +59,15 @@ def cmd_recomp(a):
             setattr(a, k, ask(k, getattr(a, k)))
     out = Path(a.output or Path.cwd() / "builds" / exe.stem)
     extra, search = [], []
-    root, found = game_dlls(exe)
+    if a.eos == "real" and not (a.wisp or a.wisp_url):
+        print("--eos real reaches Epic's servers through WISP: turning on --wisp (the WISP server `uewasm serve` runs)")
+        a.wisp = True
+    if a.steam_wisp and not (a.wisp or a.wisp_url):
+        sys.exit("--steam-wisp needs --wisp or --wisp-url")
+    if a.steam == "account" and (a.wisp or a.wisp_url) and a.steam_wisp is None:
+        a.steam_wisp = (not a.yes and sys.stdin.isatty()
+                        and input("Send the Steam sign-in through the WISP server too (the page never contacts Steam itself)? [y/N] ").strip().lower().startswith("y"))
+    root, found = build.game_dlls(exe, real_eos=a.eos == "real")
     if a.game_dlls == "auto":
         extra = found
         search = sorted({str(d.parent) for d in extra})
@@ -84,8 +90,8 @@ def cmd_recomp(a):
     print(resources.describe())
     print(f"{exe.name}: {len(extra)} game DLLs, {(exe.stat().st_size + sum(p.stat().st_size for p in extra)) / 1048576:.0f} MB "
           "of machine code to translate")
-    r = build.recompile(exe, out, mem_mb=a.mem_mb, comments=a.comments, extra=extra, search=search, system_dlls=not a.no_system_dlls,
-                        lifter=a.lifter, progress=prog)
+    r = build.recompile(exe, out, mem_mb=a.mem_mb, extra=extra, search=search, system_dlls=not a.no_system_dlls, progress=prog,
+                        real_eos=a.eos == "real")
     print(f"{r['functions']} functions in {len(r['modules'])} modules, {r['unsupported_total']} unsupported instructions, "
           f"{len(r['missing_imports'])} imports not implemented yet (details in {out / 'coverage.json'})")
     (out / "options.json").write_text(json.dumps({k: getattr(a, k) for k in ("renderer", "threads", "opt", "mem_mb", "mem64")}, indent=2))
@@ -99,6 +105,8 @@ def cmd_recomp(a):
                                size=size, part_mb=a.part_mb, compress=a.compress, video_height=a.video_height, video_mode=a.video_mode,
                                wasm_opt=a.wasm_opt, show_fps=a.fps, async_shaders=not a.sync_shaders, debug_panel=not a.no_debug_panel,
                                backend=a.backend, placeholders=a.placeholders, aes_key=aes, mem_limit_gb=a.mem_limit_gb,
+                               steam=a.steam, webworks_url=a.relay_url or a.webworks_url, relay=a.relay, wisp=a.wisp, wisp_url=a.wisp_url,
+                               steam_wisp=bool(a.steam_wisp),
                                single_file=a.single_file, progress=prog, quality=a.quality, names=a.names, mem64=a.mem64,
                                game_args=[*build.default_args(root / exe_rel), *a.game_arg] if a.game_arg else None)
         print(f"web build ready in {web} (upload the whole folder; test it with: uewasm test {web})")
@@ -121,16 +129,11 @@ def cmd_coverage(a):
 def cmd_doctor(a):
     from .deps import status
     print(f"UEWASM python {sys.version.split()[0]}")
-    try:
-        import iced_x86  # noqa: F401
-        print("  iced-x86: ok")
-    except ImportError:
-        print("  iced-x86: missing (pip install iced-x86)")
     st = status()
     print(f"  emscripten (web builds): {st['emsdk'] or 'not found (uewasm install-emsdk, or --emsdk PATH)'}")
     print(f"  binaryen (--wasm-opt): {'ok' if st['binaryen'] else 'not found'}")
     print(f"  MSVC (--native test builds): {st['msvc'] or 'not found'}")
-    print(f"  Rust (--lifter rust): {st['rust'] or 'not found (https://rustup.rs)'}")
+    print(f"  Rust (the recompiler's tools): {st['rust'] or 'not found (https://rustup.rs)'}")
     print(f"  imageio-ffmpeg (--videos): {'ok' if st['ffmpeg'] else 'missing (pip install imageio-ffmpeg)'}")
     print(f"  pycryptodome (--aes-key): {'ok' if st['crypto'] else 'missing (pip install pycryptodome)'}")
 
@@ -151,8 +154,6 @@ def main(argv=None):
     r.add_argument("--threads", choices=list(CHOICES["threads"]), default="coop")
     r.add_argument("--emsdk", help="where the Emscripten SDK is (default: the app's choice, EMSDK, or %%USERPROFILE%%\\emsdk)")
     r.add_argument("--opt", choices=list(CHOICES["opt"]), default="-O2")
-    r.add_argument("--lifter", choices=["python", "rust"], default="python",
-                   help="python: the original lifter; rust: the same output many times faster (needs a Rust toolchain, built on first use)")
     r.add_argument("--mem-mb", type=int, default=3072, help="guest memory (up to ~3584 for a normal build; more turns on --mem64)")
     r.add_argument("--mem64", action="store_true",
                    help="64-bit WebAssembly memory, for games that need more than ~3.5 GB (up to ~15 GB); a little slower, needs a browser with memory64")
@@ -175,6 +176,28 @@ def main(argv=None):
                    help="offline stand-in for a game's online services (epic: Epic accounts, profiles and menus)")
     r.add_argument("--aes-key", help="the game's AES-256 pak key (hex or base64): checked against its encrypted paks, which are packaged decrypted")
     r.add_argument("--placeholders", action="store_true", help="with --backend: stand-in images and data for files the servers would send")
+    r.add_argument("--steam", choices=["webworks", "account", "offline"], default="webworks",
+                   help="webworks: Steam features (sign-in, lobbies, P2P multiplayer, rich presence) run on a WebWorks server "
+                        "(github.com/Stratus-Games/Webworks), with the offline Steam when none answers; account: the player signs "
+                        "in to their own Steam account in the page (real SteamID, name and tickets for the game's online "
+                        "services; lobbies and P2P as with webworks); offline: no Steam server")
+    r.add_argument("--webworks-url", default="http://localhost:3000",
+                   help="the WebWorks server the page signs in to (?webworks=URL in the page address overrides it)")
+    r.add_argument("--relay", action="store_true",
+                   help="online games: `uewasm serve` also runs the built-in relay at the game's own address, so everyone "
+                        "who opens it can play together (lobbies, P2P) with no other server")
+    r.add_argument("--relay-url", help="online games: use a relay run elsewhere (`uewasm relay`) at this address")
+    r.add_argument("--wisp", action="store_true",
+                   help="real network connections (the game's own servers, the real EOS SDK) through the WISP server "
+                        "`uewasm serve` runs at the game's address")
+    r.add_argument("--wisp-url", help="real network connections through a WISP server elsewhere (wss://host/path/)")
+    r.add_argument("--steam-wisp", action=argparse.BooleanOptionalAction, default=None,
+                   help="with --steam account and WISP: sign in to Steam through the WISP server too, so the page never "
+                        "contacts Steam itself (asked at build time when not given)")
+    r.add_argument("--eos", choices=["standin", "real"], default="standin",
+                   help="games with Epic Online Services: standin answers the EOS SDK in the page (offline sign-in, local "
+                        "lobbies); real recompiles the game's own EOS SDK, which signs in to Epic and joins real lobbies "
+                        "through WISP (turns on --wisp)")
     r.add_argument("--no-debug-panel", action="store_true", help="leave out the UEWASM debug panel toggle (\\ or Insert in game)")
     r.add_argument("--wasm-opt", action="store_true", help="run Binaryen on the linked module: ~10%% smaller, needs ~20x its size in RAM")
     r.add_argument("--video-height", type=int, default=0, help="re-encode game videos taller than this (e.g. 720); 0 keeps them")
@@ -185,7 +208,6 @@ def main(argv=None):
     r.add_argument("--native-only", action="store_true", help="skip the web build")
     r.add_argument("--run", action="store_true", help="run the native build afterwards")
     r.add_argument("--debug", action="store_true")
-    r.add_argument("--comments", action="store_true", help="annotate generated C with the original instructions")
     r.add_argument("-y", "--yes", action="store_true", help="don't ask, use the given or default options")
     r.add_argument("--progress", action="store_true", help="print machine-readable progress lines (for front ends)")
     c = sub.add_parser("coverage", help="show what's still missing for a build")
@@ -195,6 +217,17 @@ def main(argv=None):
     s.add_argument("build")
     s.add_argument("--port", type=int, default=8080)
     s.add_argument("--log", help="write the page's console log to this file as the game runs")
+    s.add_argument("--host", default="127.0.0.1", help="the address to listen on (0.0.0.0 lets other machines join)")
+    s.add_argument("--relay", action=argparse.BooleanOptionalAction, default=None,
+                   help="run the built-in relay for online games (default: when the build was made with --relay)")
+    s.add_argument("--wisp", action=argparse.BooleanOptionalAction, default=None,
+                   help="run the WISP server for real connections (default: when the build was made with --wisp)")
+    s.add_argument("--wisp-allow", help="hosts the WISP server may reach, comma-separated (*.example.com); default any public host")
+    rl = sub.add_parser("relay", help="run the built-in relay (and WISP server) alone, for builds made with --relay-url or --wisp-url")
+    rl.add_argument("--host", default="0.0.0.0")
+    rl.add_argument("--port", type=int, default=3000)
+    rl.add_argument("--wisp", action="store_true", help="also run the WISP server")
+    rl.add_argument("--wisp-allow", help="hosts the WISP server may reach, comma-separated")
     t = sub.add_parser("test", help="run a web build in a headless browser")
     t.add_argument("build")
     t.add_argument("--seconds", type=int, default=90)
@@ -219,7 +252,10 @@ def main(argv=None):
         cmd_coverage(a)
     elif a.cmd == "serve":
         from .serve import serve
-        serve(a.build, a.port, a.log)
+        serve(a.build, a.port, a.log, host=a.host, relay=a.relay, wisp=a.wisp, wisp_allow=a.wisp_allow)
+    elif a.cmd == "relay":
+        from .serve import relay
+        relay(a.host, a.port, wisp=a.wisp, wisp_allow=a.wisp_allow)
     elif a.cmd == "test":
         from . import webtest
         res = webtest.run(a.build, a.seconds, a.report)

@@ -1,0 +1,11 @@
+<script>
+  // real threads: start once the page is cross-origin isolated (headers from the host, or coi-sw.js)
+  if (self.crossOriginIsolated) document.write('<script src="game.js"><\/script>');
+  else if (navigator.serviceWorker && window.isSecureContext) {
+    status.textContent = "Setting up threads…";
+    navigator.serviceWorker.register("coi-sw.js").then(() => navigator.serviceWorker.ready).then(() => {
+      if (sessionStorage.getItem("uewCoi") === location.href) status.textContent = "This host blocks the isolation real threads need; rebuild with cooperative threads.";
+      else { sessionStorage.setItem("uewCoi", location.href); location.reload(); }
+    });
+  } else status.textContent = "Real threads need https (or localhost) to run.";
+</script>

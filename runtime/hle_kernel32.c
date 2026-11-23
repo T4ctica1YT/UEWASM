@@ -310,7 +310,7 @@ static const char* hle_modules[] = { "kernel32.dll", "kernelbase.dll", "ntdll.dl
     "xinput9_1_0.dll", "d3d11.dll", "dxgi.dll", "d3d9.dll", "dsound.dll", "xaudio2_7.dll", "xaudio2_9.dll", "dbghelp.dll",
     "version.dll", "imm32.dll", "dwmapi.dll", "setupapi.dll", "iphlpapi.dll", "winhttp.dll", "wininet.dll", "crypt32.dll",
     "bcrypt.dll", "d3dcompiler_47.dll", "dinput8.dll", "hid.dll", "psapi.dll", "powrprof.dll", "secur32.dll", "normaliz.dll",
-    "steam_api64.dll", "xaudio2_9redist.dll", "x3daudio1_7.dll", NULL };
+    "steam_api64.dll", "xaudio2_9redist.dll", "x3daudio1_7.dll", "eossdk-win64-shipping.dll", "eossdk-win32-shipping.dll", NULL };
 #define HLE_MOD_BASE 0x7FF00000ull
 #define SKIP_MOD_BASE 0x7FE00000ull
 void hle_set_error(uint32_t e);
@@ -404,6 +404,8 @@ HLE(GetProcAddress)
     }
     if (h >= HLE_MOD_BASE) {
         uint64_t t = rt_thunk_by_name(name);
+        uint64_t eos_proc(const char* name);
+        if (!t && !strncmp(name, "EOS_", 4)) t = eos_proc(name);
         static int said;
         if (!t && said++ < 40) host_log("[load] GetProcAddress(%s, %s) not implemented", (h - HLE_MOD_BASE) / 0x10000 >= 1 ? hle_modules[(h - HLE_MOD_BASE) / 0x10000 - 1] : "system", name);
         RET(t);

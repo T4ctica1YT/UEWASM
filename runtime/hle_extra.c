@@ -123,17 +123,8 @@ HLE(SHCreateDirectoryExW)
     RET((uint32_t)R(0) ? 0 : 183);
 }
 
-/* ---- crypto: randomness is real; keys and certificates aren't available ---- */
-static void fill_random(uint64_t p, uint64_t n) { for (uint64_t i = 0; i < n; i++) ST8(p + i, (uint64_t)((rand() ^ (rand() >> 7)) & 0xFF)); }
-HLE(CryptAcquireContextW) { if (A1) ST64(A1, 0x7C000001); RET(1); }
-HLE(CryptAcquireContextA) { if (A1) ST64(A1, 0x7C000001); RET(1); }
-HLE(CryptReleaseContext) { RET(1); }
-HLE(CryptGenRandom) { fill_random(A3, (uint32_t)A2); RET(1); }
-HLE(CryptCreateHash) { hle_set_error(0x80090008); RET(0); }
-HLE(CryptHashData) { RET(0); }
-HLE(CryptGetHashParam) { RET(0); }
+/* ---- crypto keys aren't available (random numbers and hashes: hle_crypto.c) ---- */
 HLE(CryptSetHashParam) { RET(0); }
-HLE(CryptDestroyHash) { RET(1); }
 HLE(CryptDestroyKey) { RET(1); }
 HLE(CryptDecrypt) { RET(0); }
 HLE(CryptExportKey) { RET(0); }
@@ -141,18 +132,6 @@ HLE(CryptGetUserKey) { hle_set_error(0x8009000D); RET(0); }
 HLE(CryptGetProvParam) { RET(0); }
 HLE(CryptSignHashW) { RET(0); }
 HLE(CryptEnumProvidersW) { hle_set_error(259); RET(0); }
-HLE(CertOpenStore) { RET(0); }
-HLE(CertCloseStore) { RET(1); }
-HLE(CertEnumCertificatesInStore) { RET(0); }
-HLE(CertFindCertificateInStore) { RET(0); }
-HLE(CertDuplicateCertificateContext) { RET(A1); }
-HLE(CertAddCertificateContextToStore) { RET(0); }
-HLE(CertGetCertificateContextProperty) { RET(0); }
-HLE(CertGetNameStringW) { if (ARG(5) && ARG(6)) ST16(ARG(5), 0); RET(1); }
-HLE(CertGetNameStringA) { if (ARG(5) && ARG(6)) ST8(ARG(5), 0); RET(1); }
-HLE(CertCreateCertificateChainEngine) { RET(0); }
-HLE(CertFreeCertificateChainEngine) { RET(0); }
-HLE(CryptQueryObject) { RET(0); }
 HLE(WinVerifyTrust) { RET(0x800B0100); }
 
 /* ---- processes, security, power ---- */
