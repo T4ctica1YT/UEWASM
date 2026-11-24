@@ -89,6 +89,8 @@ sometimes does.
 | `?tracering=1` | the last calls into the runtime, dumped when something fails |
 | `?watch=<hex>`, `?watchval=<hex>` | who writes a guest address |
 | `?filetrace=1` | every file opened or checked |
+| `?envdebug=1` | every environment variable read or set |
+| `?inputdebug=1` | windows, raw input registrations, and where each key goes |
 | `?httpdebug=1`, `?tlsdebug=1`, `?netdebug=1` | HTTPS answers, TLS handshakes, socket calls |
 | `?steamdebug=1`, `?eosdebug=1` | Steam and EOS calls |
 

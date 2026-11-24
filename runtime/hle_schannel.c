@@ -141,6 +141,8 @@ static void load_anchors(void)
         nanchors++;
     }
 }
+/* the root store, for the runtime's own HTTPS (hle_epic.c) */
+size_t tls_anchors(const br_x509_trust_anchor** out) { load_anchors(); *out = anchors; return nanchors; }
 
 /* ---- credentials and contexts ---- */
 

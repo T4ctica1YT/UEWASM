@@ -128,6 +128,13 @@ uewasm-cli recomp "…\MyGame.exe" -o builds/MyGame -y --names --threads real
   to see the last system calls before it. With real threads the thread dump still works, and with `?tracering=1` it
   prints those last calls too.
 
+## Input that does nothing
+
+`?inputdebug=1` logs the game's windows, which one is active, the raw input devices it registers, and every key:
+which window it's sent to and whether the game takes it from the queue and dispatches it. If a key is dispatched and
+the game still doesn't react, the game is ignoring it, not missing it. `uewasm-cli test --press` sends keys from a
+headless run.
+
 ## Exceptions (32-bit games)
 
 C++ `throw` and SEH `__try` work in 32-bit games: `RaiseException` walks the thread's handler chain (`fs:[0]`) as
@@ -161,6 +168,15 @@ HTTP/1.1, so the traffic stays readable.
 before the game starts, for example a download cache an online SDK keeps trusting:
 `?clearsave=Users/Player/AppData/Local/<Game>/Saved/PersistentDownloadDir/EOSCache`. `?filetrace=1` shows the paths
 the game uses.
+
+`?envdebug=1` logs every environment variable the game reads or sets. SDKs pass flags this way: the EOS SDK sets
+`EOS_LAUNCHED_BY_EPIC` when it sees `-EpicPortal` and checks it again later, and a game that quits with "failed to
+init LauncherCheck module" was started without what the Epic launcher passes (builds of games the Epic launcher
+installed add it themselves).
+
+The Epic sign-in (`--epic account`) logs `[epic]` lines: whether a remembered sign-in was used, what Epic answered when
+it refused (Epic's message, with the code or token it quotes left out), and the account name once signed in. "no network
+route to Epic" means the page has no WISP connection for it.
 
 ## Steam
 

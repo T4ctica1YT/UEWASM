@@ -58,6 +58,7 @@ static void di_create_device(CPU* c)
     uint64_t o = com_new(&K_Dev, NULL, D_SIZE);
     memset(G2H(DEV(o)), 0, D_SIZE);
     ST32(DEV(o) + D_KIND, (uint32_t)kind);
+    if (host_query_flag("inputdebug")) host_log("[input] DirectInput %s device made", kind == 1 ? "keyboard" : "mouse");
     STP(A3, o);
     RET(0);
 }

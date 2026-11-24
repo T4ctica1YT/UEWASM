@@ -26,25 +26,52 @@ const PROBE: &str = r#"
 
 const FATAL: &[&str] = &["abort(", "out of memory", "runtimeerror", "uncaught", "failed to compile", "webgl context lost", "exception thrown"];
 
-pub fn run(build_dir: &Path, seconds: u64, report_dir: Option<&Path>) -> Res<Value> {
+pub fn run(build_dir: &Path, seconds: u64, report_dir: Option<&Path>, query: &str, press: &str, init: &str) -> Res<Value> {
+    let mut keys = vec![];
+    for p in press.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (t, k) = p.split_once(':').ok_or(format!("--press: {p} is not seconds:key"))?;
+        keys.push((t.parse::<f64>().map_err(|_| format!("--press: bad time {t}"))?, key_info(k)?));
+    }
+    keys.sort_by(|a, b| b.0.total_cmp(&a.0));
     let build_dir = std::fs::canonicalize(build_dir).map_err(|e| format!("{}: {e}", build_dir.display()))?;
     let read = |p: &Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
     // a build folder's web/ beside the options it was built with (renderer: WebGPU needs its browser flags)
     let info = read(&build_dir.join("uewasm.json")).or_else(|| build_dir.parent().and_then(|p| read(&p.join("options.json")))).unwrap_or(json!({}));
     let srv = cdp::Server::start(&rust_tool("uewserve", &mut |l| println!("{l}"))?, &build_dir, &[])?;
-    let url = format!("http://localhost:{}/index.html", srv.port);
+    let q = query.trim_start_matches('?');
+    let url = format!("http://localhost:{}/index.html{}{q}", srv.port, if q.is_empty() { "" } else { "?" });
     let mut result = json!({"url": url, "build": info.get("build"), "passed": false});
     let mut b = Browser::launch(&cdp::default_args(info["renderer"].as_str() == Some("webgpu")))?;
     let r = (|| -> Res<()> {
         let mut page = b.new_page(1280, 720)?;
         page.add_init_script(&mut b, PROBE)?;
+        if !init.is_empty() {
+            page.add_init_script(&mut b, init)?;
+        }
         let t0 = Instant::now();
         page.goto(&mut b, &url, Duration::from_secs(120))?;
         let (mut fatal, mut last, mut fps) = (None::<String>, (0f64, Instant::now()), vec![]);
+        let mut stalled = 0f64;
         last.1 = t0;
         while t0.elapsed().as_secs() < seconds {
             page.wait(&mut b, Duration::from_secs(2))?;
-            let frames = page.eval(&mut b, "window.__uewasm ? window.__uewasm.frames : 0")?.as_f64().unwrap_or(0.0);
+            while keys.last().is_some_and(|k| t0.elapsed().as_secs_f64() >= k.0) {
+                let (t, (key, code, vk)) = keys.pop().unwrap();
+                if let Some(rd) = report_dir {
+                    let _ = std::fs::create_dir_all(rd);
+                    if let Ok(s) = page.screenshot(&mut b) {
+                        let _ = std::fs::write(rd.join(format!("before-{t}s-{key}.png")), s);
+                    }
+                }
+                page.key(&mut b, key, code, vk)?;
+                page.console.push(format!("[test] pressed {key} at {:.1} s", t0.elapsed().as_secs_f64()));
+            }
+            let ts = Instant::now();
+            let Ok(frames) = page.eval_for(&mut b, "window.__uewasm ? window.__uewasm.frames : 0", Duration::from_secs(15)) else {
+                stalled += ts.elapsed().as_secs_f64();
+                continue;
+            };
+            let frames = frames.as_f64().unwrap_or(0.0);
             let now = Instant::now();
             fps.push((frames - last.0) / now.duration_since(last.1).as_secs_f64().max(1e-3));
             last = (frames, now);
@@ -53,9 +80,10 @@ pub fn run(build_dir: &Path, seconds: u64, report_dir: Option<&Path>) -> Res<Val
                 break;
             }
         }
-        let state = page.eval(&mut b, "window.__uewasm || {}")?;
-        let shot = page.screenshot(&mut b)?;
-        let variance = cdp::png_variance(&shot);
+        let state = page.eval_for(&mut b, "window.__uewasm || {}", Duration::from_secs(30)).unwrap_or(json!({}));
+        let shot = page.screenshot(&mut b).unwrap_or_default();
+        let variance = if shot.is_empty() { 0.0 } else { cdp::png_variance(&shot) };
+        result["stalled_seconds"] = json!(stalled.round());
         let tail: Vec<f64> = fps.iter().rev().take(10).copied().collect();
         let contexts = state["contexts"].clone();
         result["seconds"] = json!((t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
@@ -83,11 +111,28 @@ pub fn run(build_dir: &Path, seconds: u64, report_dir: Option<&Path>) -> Res<Val
     Ok(result)
 }
 
+fn key_info(k: &str) -> Res<(&'static str, &'static str, u32)> {
+    Ok(match k.to_ascii_lowercase().as_str() {
+        "enter" => ("Enter", "Enter", 13),
+        "space" => (" ", "Space", 32),
+        "escape" | "esc" => ("Escape", "Escape", 27),
+        "up" => ("ArrowUp", "ArrowUp", 38),
+        "down" => ("ArrowDown", "ArrowDown", 40),
+        "left" => ("ArrowLeft", "ArrowLeft", 37),
+        "right" => ("ArrowRight", "ArrowRight", 39),
+        "tab" => ("Tab", "Tab", 9),
+        _ => return Err(format!("--press: unknown key {k} (enter, space, escape, tab, up, down, left, right)")),
+    })
+}
+
 pub fn summary(r: &Value) -> String {
     let ctx = r["contexts"].as_array().filter(|a| !a.is_empty()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or("none".into());
     let mut lines = vec![format!("Headless test: {}", if r["passed"].as_bool() == Some(true) { "PASS" } else { "FAIL" }),
         format!("  graphics contexts: {ctx}"), format!("  frame rate (browser rAF): {}", r["fps_avg"]),
         format!("  screen variance: {} (near 0 means a blank screen)", r["screen_variance"])];
+    if r["stalled_seconds"].as_f64().unwrap_or(0.0) > 0.0 {
+        lines.push(format!("  page unresponsive: {} s", r["stalled_seconds"]));
+    }
     let cut = |s: &str| s.chars().take(300).collect::<String>();
     if let Some(f) = r["fatal"].as_str() {
         lines.push(format!("  fatal: {}", cut(f)));

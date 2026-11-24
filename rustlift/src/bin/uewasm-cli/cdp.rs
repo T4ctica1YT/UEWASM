@@ -369,7 +369,13 @@ impl Page {
     }
 
     pub fn eval(&mut self, b: &mut Browser, expr: &str) -> Res<Value> {
-        let r = b.call(Some(&self.sid), "Runtime.evaluate", json!({"expression": expr, "returnByValue": true, "awaitPromise": true}))?;
+        self.eval_for(b, expr, Duration::from_secs(120))
+    }
+
+    pub fn eval_for(&mut self, b: &mut Browser, expr: &str, timeout: Duration) -> Res<Value> {
+        let r = b.call_wait(Some(&self.sid), "Runtime.evaluate", json!({"expression": expr, "returnByValue": true, "awaitPromise": true}), timeout);
+        self.absorb(b);
+        let r = r?;
         self.absorb(b);
         if let Some(e) = r.get("exceptionDetails") {
             return Err(e["exception"]["description"].as_str().or(e["text"].as_str()).unwrap_or("error").to_string());
@@ -398,10 +404,13 @@ impl Page {
         Ok(())
     }
 
+    /// presses a key, held long enough for a game that polls the keyboard once a frame
     pub fn key(&mut self, b: &mut Browser, key: &str, code: &str, vk: u32) -> Res<()> {
-        for t in ["rawKeyDown", "keyUp"] {
-            b.call(Some(&self.sid), "Input.dispatchKeyEvent", json!({"type": t, "key": key, "code": code, "windowsVirtualKeyCode": vk}))?;
-        }
+        let ev = |t: &str| json!({"type": t, "key": key, "code": code, "windowsVirtualKeyCode": vk});
+        b.call(Some(&self.sid), "Input.dispatchKeyEvent", ev("rawKeyDown"))?;
+        b.pump(Duration::from_millis(250))?;
+        b.call(Some(&self.sid), "Input.dispatchKeyEvent", ev("keyUp"))?;
+        self.absorb(b);
         Ok(())
     }
 }

@@ -161,7 +161,6 @@ HLE(ChangeWindowMessageFilterEx) { RET(1); }
 HLE(SetWindowCompositionAttribute) { RET(1); }
 HLE(UpdateLayeredWindow) { RET(1); }
 HLE(IsImmersiveProcess) { hle_set_error(0); RET(0); }
-HLE(GetRegisteredRawInputDevices) { if (A2) ST32(A2, 0); RET(0); }
 HLE(RegisterPowerSettingNotification) { RET(0x5EED0001); }
 HLE(UnregisterPowerSettingNotification) { RET(1); }
 HLE(GetPointerInfo) { hle_set_error(87); RET(0); }

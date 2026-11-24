@@ -370,6 +370,7 @@ fn compile(j: &Value) {
     link.extend(lib("uew_host.js"));
     link.extend(lib("uew_webworks.js"));
     link.extend(lib("uew_steamcm.js"));
+    link.extend(lib("uew_epic.js"));
     if st(j, "renderer") == "webgpu" {
         link.extend(lib("uew_webgpu.js"));
     }
@@ -428,12 +429,24 @@ fn shell(j: &Value) {
     let web = PathBuf::from(st(j, "web"));
     let part_mb = int(j, "part_mb", 24);
     let wasm = web.join("game.wasm");
-    for old in fs::read_dir(&web).into_iter().flatten().flatten() {
-        if old.file_name().to_string_lossy().starts_with("game.wasm.") {
-            let _ = fs::remove_file(old.path());
+    let old: Vec<PathBuf> = fs::read_dir(&web).into_iter().flatten().flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("game.wasm.")).map(|e| e.path()).collect();
+    if wasm.is_file() {
+        for p in &old {
+            let _ = fs::remove_file(p);
         }
+    } else if old.is_empty() {
+        die(&format!("{}: no game.wasm (the link step didn't write one)", web.display()));
     }
     let mut parts = Vec::new();
+    if !wasm.is_file() {
+        let mut kept: Vec<(usize, String)> = old.iter().filter_map(|p| {
+            let n = p.file_name()?.to_string_lossy().to_string();
+            Some((n.strip_prefix("game.wasm.")?.parse().ok()?, n))
+        }).collect();
+        kept.sort();
+        parts = kept.into_iter().map(|k| k.1).collect();
+    }
     let step = (part_mb << 20) as usize;
     if fs::metadata(&wasm).map(|m| m.len()).unwrap_or(0) > step as u64 {
         let data = fs::read(&wasm).unwrap_or_else(|e| die(&format!("{}: {e}", wasm.display())));
@@ -464,6 +477,7 @@ fn shell(j: &Value) {
         .replace("__CACHEMB__", &int(j, "cache_mb", 640).to_string())
         .replace("__GPUMB__", &int(j, "gpu_mb", 2048).to_string())
         .replace("__STEAM__", &js("steam", json!({ "mode": "offline" })))
+        .replace("__EPIC__", &js("epic", json!({ "mode": "off" })))
         .replace("__WISP__", &js("wisp", json!({})));
     let mem64 = flag(j, "mem64");
     let tag = format!("{GAME_JS_TAG}\n");

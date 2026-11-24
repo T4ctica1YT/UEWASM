@@ -41,6 +41,7 @@ pub struct Settings {
     pub wisp_url: String,
     pub steam_wisp: bool,
     pub eos: String,
+    pub epic: String,
     /// the Emscripten SDK folder (blank: found automatically), kept in settings.json where the command line reads it
     pub emsdk: String,
 }
@@ -61,6 +62,7 @@ impl Settings {
             wasm_opt: b("wasm_opt", false), single: b("single", false), show_fps: b("show_fps", false), async_shaders: b("async_shaders", true),
             debug_panel: b("debug_panel", true), placeholders: b("placeholders", false), aes_on: b("aes_on", false), aes_key: String::new(), relay: b("relay", false), wisp: b("wisp", false), wisp_url: s("wisp_url", ""), steam_wisp: b("steam_wisp", false),
             eos: s("eos", "Stand-in in the page (offline sign-in, local lobbies)"),
+            epic: s("epic", "Automatic (Epic launcher installs with the real EOS SDK)"),
             emsdk: std::fs::read_to_string(settings_dir().join("settings.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
                 .and_then(|v| v["emsdk"].as_str().map(String::from)).unwrap_or_default(),
         }
@@ -69,7 +71,7 @@ impl Settings {
     /// the key itself is never written to disk
     pub fn save(&self) {
         let v = json!({
-            "game": self.game, "out": self.out, "renderer": self.renderer, "threads": self.threads, "opt": self.opt, "steam": self.steam, "relay": self.relay, "wisp": self.wisp, "wisp_url": self.wisp_url, "steam_wisp": self.steam_wisp, "eos": self.eos, "quality": self.quality,
+            "game": self.game, "out": self.out, "renderer": self.renderer, "threads": self.threads, "opt": self.opt, "steam": self.steam, "relay": self.relay, "wisp": self.wisp, "wisp_url": self.wisp_url, "steam_wisp": self.steam_wisp, "eos": self.eos, "epic": self.epic, "quality": self.quality,
             "videos": self.videos, "priority": self.priority, "backend": self.backend, "resolution": self.resolution, "mem": self.mem,
             "part": self.part, "mem_limit": self.mem_limit, "game_dlls": self.game_dlls, "sys_dlls": self.sys_dlls, "native": self.native,
             "compress": self.compress, "wasm_opt": self.wasm_opt, "single": self.single, "show_fps": self.show_fps,

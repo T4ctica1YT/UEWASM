@@ -79,6 +79,15 @@ enum Cmd {
         seconds: u64,
         #[arg(long)]
         report: Option<PathBuf>,
+        /// page switches, e.g. "eosdebug=1&netdebug=1"
+        #[arg(long, default_value = "")]
+        query: String,
+        /// keys to press, as seconds:key pairs, e.g. "190:Enter,200:Space"; a screenshot is saved just before each
+        #[arg(long, default_value = "")]
+        press: String,
+        /// JavaScript run in the page before it loads (seed storage, stub an API)
+        #[arg(long, default_value = "")]
+        init: String,
     },
     /// check the toolchain
     Doctor {
@@ -149,6 +158,8 @@ enum Threads { Coop, Real }
 enum Steam { Webworks, Account, Offline }
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum Eos { Standin, Real }
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum Epic { Auto, Account, Off }
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum Quality { Game, Low, Medium, High, Epic }
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -259,6 +270,10 @@ struct Recomp {
     /// recompiles the game's own EOS SDK, which signs in to Epic and joins real lobbies through WISP (turns on --wisp)
     #[arg(long, value_enum, default_value = "standin")]
     eos: Eos,
+    /// Epic Games sign-in in the page (the player signs in on epicgames.com; the game gets the launcher's one-time code,
+    /// through WISP): auto turns it on for games the Epic launcher installed, built with --eos real
+    #[arg(long, value_enum, default_value = "auto")]
+    epic: Epic,
     /// leave out the UEWASM debug panel toggle (\ or Insert in game)
     #[arg(long)]
     no_debug_panel: bool,
@@ -386,6 +401,10 @@ fn recomp(mut a: Recomp) {
         a.opt = opts[i].into();
     }
     let out = a.output.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("builds").join(exe.file_stem().unwrap_or_default()));
+    if a.epic == Epic::Account && !(a.wisp || a.wisp_url.is_some()) {
+        println!("--epic account signs in to Epic through WISP: turning on --wisp (the WISP server `uewasm-cli serve` runs)");
+        a.wisp = true;
+    }
     if a.eos == Eos::Real && !(a.wisp || a.wisp_url.is_some()) {
         println!("--eos real reaches Epic's servers through WISP: turning on --wisp (the WISP server `uewasm-cli serve` runs)");
         a.wisp = true;
@@ -463,7 +482,7 @@ fn recomp(mut a: Recomp) {
             show_fps: a.fps, async_shaders: !a.sync_shaders, debug_panel: !a.no_debug_panel, backend: a.backend.map(name), placeholders: a.placeholders,
             aes_key: aes, mem_limit_gb: a.mem_limit_gb, steam: name(a.steam), webworks_url: a.relay_url.clone().unwrap_or(a.webworks_url.clone()),
             relay: a.relay, wisp: a.wisp, wisp_url: a.wisp_url.clone(), steam_wisp, single_file: a.single_file, quality: name(a.quality),
-            names: a.names, mem64: a.mem64, game_args, ..Default::default()
+            names: a.names, mem64: a.mem64, game_args, epic: name(a.epic), eos_real: a.eos == Eos::Real, ..Default::default()
         };
         let web = build::build_wasm(&out, &o, &mut log, &mut prog).unwrap_or_else(|e| die(e));
         println!("web build ready in {} (upload the whole folder; test it with: uewasm-cli test {})", web.display(), web.display());
@@ -555,8 +574,8 @@ fn main() {
             }
             run_child(c)
         }
-        Cmd::Test { build, seconds, report } => {
-            let r = webtest::run(&build, seconds, report.as_deref()).unwrap_or_else(|e| die(e));
+        Cmd::Test { build, seconds, report, query, press, init } => {
+            let r = webtest::run(&build, seconds, report.as_deref(), &query, &press, &init).unwrap_or_else(|e| die(e));
             println!("{}", webtest::summary(&r));
             std::process::exit(if r["passed"].as_bool() == Some(true) { 0 } else { 1 });
         }

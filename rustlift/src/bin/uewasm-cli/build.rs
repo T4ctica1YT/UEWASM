@@ -146,7 +146,50 @@ pub fn engine_of(exe: &Path) -> Option<&'static str> {
 pub fn default_args(exe: &Path) -> Vec<String> {
     let Ok(d) = std::fs::read(exe) else { return vec![] };
     let has = |n: &[u8]| d.windows(n.len()).any(|w| w == n);
-    if has(b"D3D11RHI") && has(b"D3D12RHI") { vec![s("-dx11")] } else { vec![] }
+    let mut args = if has(b"D3D11RHI") && has(b"D3D12RHI") { vec![s("-dx11")] } else { vec![] };
+    // the EOS SDK restarts a game through the launcher unless it was started with what the launcher passes
+    if let Some(app) = epic_install(exe) {
+        args.push(s("-EpicPortal"));
+        if let Some(a) = app {
+            args.push(format!("-epicapp={a}"));
+        }
+        args.extend([s("-epicenv=Prod"), s("-epiclocale=en-US")]);
+    }
+    args
+}
+
+/// a game the Epic launcher installed: Some(its launcher app name, when the launcher's install list has it)
+pub fn epic_install(exe: &Path) -> Option<Option<String>> {
+    epic_manifest(exe).map(|m| m["AppName"].as_str().map(String::from))
+}
+
+/// the page's Epic sign-in: on (account) for games the Epic launcher installed when they run the real EOS SDK, with
+/// the game's catalog namespace (the launcher passes it as -epicsandboxid)
+fn epic_config(exe: &Path, o: &Wasm) -> Value {
+    let m = epic_manifest(exe);
+    let on = match o.epic.as_str() { "account" => true, "off" => false, _ => o.eos_real && m.is_some() };
+    let m = m.unwrap_or_else(|| json!({}));
+    json!({"mode": if on { "account" } else { "off" }, "app": m["AppName"], "namespace": m["CatalogNamespace"]})
+}
+
+/// the Epic launcher's record of the game's install (AppName, CatalogNamespace, ...), or an empty object when only its
+/// .egstore folder shows the launcher installed it; None for other games
+pub fn epic_manifest(exe: &Path) -> Option<Value> {
+    let root = exe.ancestors().skip(1).take(6).find(|d| d.join(".egstore").is_dir())?;
+    let same = |p: &str| std::fs::canonicalize(p).ok() == std::fs::canonicalize(root).ok();
+    let data = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    for e in std::fs::read_dir(data.join(r"Epic\EpicGamesLauncher\Data\Manifests")).into_iter().flatten().flatten() {
+        if e.path().extension().map_or(false, |x| x == "item") {
+            let j: Value = std::fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()).unwrap_or(Value::Null);
+            if j["InstallLocation"].as_str().map_or(false, same) {
+                return Some(j);
+            }
+        }
+    }
+    let list: Value = std::fs::read_to_string(data.join(r"Epic\UnrealEngineLauncher\LauncherInstalled.dat")).ok()
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()).unwrap_or(Value::Null);
+    let app = list["InstallationList"].as_array().into_iter().flatten().find(|i| i["InstallLocation"].as_str().map_or(false, same)).cloned();
+    Some(app.unwrap_or_else(|| json!({})))
 }
 
 const SCALABILITY: &[&str] = &["ShadowQuality", "PostProcessQuality", "EffectsQuality", "FoliageQuality", "ViewDistanceQuality", "AntiAliasingQuality",
@@ -245,6 +288,9 @@ pub struct Wasm {
     pub wisp: bool,
     pub wisp_url: Option<String>,
     pub steam_wisp: bool,
+    /// auto (account for Epic launcher installs with the real EOS SDK), account or off
+    pub epic: String,
+    pub eos_real: bool,
 }
 
 impl Default for Wasm {
@@ -253,7 +299,7 @@ impl Default for Wasm {
             title: None, size: Some((1280, 720)), part_mb: 16, compress: false, names: false, video_height: 0, video_mode: s("fast"), wasm_opt: false,
             game_args: None, quality: s("game"), simd: true, show_fps: false, async_shaders: true, debug_panel: true, backend: None, placeholders: false,
             aes_key: None, mem_limit_gb: 8.0, single_file: false, web_name: s("web"), mem64: false, steam: s("webworks"),
-            webworks_url: s("http://localhost:3000"), relay: false, wisp: false, wisp_url: None, steam_wisp: false }
+            webworks_url: s("http://localhost:3000"), relay: false, wisp: false, wisp_url: None, steam_wisp: false, epic: s("auto"), eos_real: false }
     }
 }
 
@@ -335,7 +381,8 @@ pub fn build_wasm(out: &Path, o: &Wasm, log: Log, progress: Progress) -> Res<Pat
             "save": save, "part_mb": 24, "show_fps": o.show_fps, "async_shaders": o.async_shaders, "debug_panel": o.debug_panel,
             "exe": ps(&root.join(exe_rel)), "fallback_icon": ps(&assets_dir().join("uewasm.ico")), "placeholders": o.placeholders,
             "cache_mb": cache_mb, "gpu_mb": gpu_mb, "threads": o.threads, "seed": quality_files(exe_rel, &o.quality), "mem64": o.mem64,
-            "steam": {"mode": o.steam, "url": o.webworks_url, "relay": o.relay, "versions": steam_versions(root)}, "wisp": wisp}), log, progress)?;
+            "steam": {"mode": o.steam, "url": o.webworks_url, "relay": o.relay, "versions": steam_versions(root)}, "wisp": wisp,
+            "epic": epic_config(&root.join(exe_rel), o)}), log, progress)?;
         for (mark, on, what) in [("uew-relay", o.relay, "the relay"), ("uew-wisp", o.wisp && o.wisp_url.is_none(), "the WISP server")] {
             let p = web.join(mark);
             if on {

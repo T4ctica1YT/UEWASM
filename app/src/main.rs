@@ -19,6 +19,7 @@ const THREADS: &[(&str, &str)] = &[("Cooperative (no special hosting)", "coop"),
 const OPTS: &[(&str, &str)] = &[("Balanced (-O2)", "-O2"), ("Fastest code (-O3, slower build)", "-O3"), ("Smallest download (-Os)", "-Os")];
 const QUALITY: &[(&str, &str)] = &[("Game's own setting", "game"), ("Low (fastest here)", "low"), ("Medium", "medium"), ("High", "high"), ("Epic", "epic")];
 const EOS: &[(&str, &str)] = &[("Stand-in in the page (offline sign-in, local lobbies)", "standin"), ("Real EOS SDK (Epic's servers, through WISP)", "real")];
+const EPICS: &[(&str, &str)] = &[("Automatic (Epic launcher installs with the real EOS SDK)", "auto"), ("Player's Epic account (sign in on epicgames.com)", "account"), ("Off", "off")];
 const STEAMS: &[(&str, &str)] = &[("WebWorks server (sign-in, lobbies, multiplayer)", "webworks"),
                                    ("Player's Steam account (real sign-in and tickets)", "account"), ("Offline (no Steam server)", "offline")];
 const PRIORITIES: &[(&str, &str)] = &[("High (fastest, tuned to this PC)", "high"), ("Low (keeps the PC usable while it builds)", "low")];
@@ -228,6 +229,7 @@ impl App {
             args.extend(["--video-height".into(), video_h.to_string(), "--video-mode".into(), video.2.into()]);
         }
         args.extend(["--eos".into(), pick(EOS, &self.s.eos).into()]);
+        args.extend(["--epic".into(), pick(EPICS, &self.s.epic).into()]);
         if self.s.wisp && !self.s.wisp_url.trim().is_empty() {
             args.extend(["--wisp-url".into(), self.s.wisp_url.trim().to_string()]);
         }
@@ -433,6 +435,9 @@ impl eframe::App for App {
                     }
                     ui.label("Epic Online Services"); combo(ui, "eos", &mut self.s.eos, &labels(EOS));
                     ui.label(""); ui.label("");
+                    ui.end_row();
+                    ui.label("Epic sign-in"); combo(ui, "epic", &mut self.s.epic, &labels(EPICS));
+                    ui.label(egui::RichText::new("Through WISP: the page never contacts Epic itself").weak()); ui.label("");
                     ui.end_row();
                 });
                 ui.horizontal_wrapped(|ui| {

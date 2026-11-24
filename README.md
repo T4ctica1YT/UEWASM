@@ -74,6 +74,9 @@ From the command line:
 uewasm-cli recomp "C:\Games\MyGame" -o builds\MyGame -y      # recompile for the web (options below)
 uewasm-cli serve builds\MyGame\web                           # play it at http://localhost:8080
 uewasm-cli test builds\MyGame\web                            # run it in a headless browser and check it renders
+uewasm-cli test builds\MyGame\web --query "netdebug=1" --report out   # with page switches; log and screenshot in out\
+uewasm-cli test builds\MyGame\web --press "60:Enter,70:Escape" --report out   # keys pressed at those seconds
+uewasm-cli test builds\MyGame\web --init "localStorage.clear()"         # JavaScript run before the page loads
 uewasm-cli doctor                                            # what's installed, what's missing
 ```
 
@@ -172,6 +175,7 @@ When building a game with UEWASM, the tool give you many choices on how the game
 | `--wisp-url` | URL | The same through a WISP server elsewhere (`wss://host/path/`; any WISP v1 server works). `?wisp=URL` in the page address overrides it, `?wisp=0` turns it off. |
 | `--steam-wisp` / `--no-steam-wisp` |N/A| With `--steam account` and WISP: sign in to Steam through the WISP server too, so the page never contacts Steam itself. Asked at build time when neither is given. |
 | `--eos` | `standin` (default), `real` | Games with Epic Online Services: `standin` answers the EOS SDK in the page (below); `real` recompiles the game's own EOS SDK, which signs in to Epic and joins real lobbies through WISP (it turns `--wisp` on). |
+| `--epic` | `auto` (default), `account`, `off` | Epic Games sign-in in the page for games the Epic launcher installed: the player signs in on epicgames.com and the game gets the launcher's one-time code, through WISP (see [Epic account](#official-servers) below). `auto` turns it on with `--eos real`; `account` also turns `--wisp` on. `?epic=off` in the page address skips it. |
 
 ## In the game
 
@@ -294,6 +298,15 @@ A build can talk to a game's real servers, with nothing to install for the playe
   WISP: with a game that signs in through Steam, `--steam account` provides the real ticket Epic checks. Games that sign
   in with an Epic account open Epic's sign-in page; the runtime opens it in a new tab (or offers a button, where the
   browser blocks tabs that weren't opened by a click), so the player signs in on epicgames.com itself.
+- **Epic account (`--epic account`, on by default for Epic launcher installs with `--eos real`)**: the page asks the
+  player to sign in with Epic Games (`runtime/web/uew_epic.js`). The sign-in happens on epicgames.com, with every
+  option Epic has there (email, Google, Apple, consoles, Steam...); the player pastes back the short page of text Epic
+  shows afterwards. The runtime (`runtime/hle_epic.c`) turns that code into the one-time exchange code the Epic
+  launcher gives a game, over TLS it does itself through WISP (so devices that can't reach Epic still sign in, and the
+  WISP server only relays ciphertext), and passes it as the launcher does (`-AUTH_PASSWORD=<code>
+  -AUTH_TYPE=exchangecode`, the account's name and id). The game's EOS SDK signs in with it. Only Epic's refresh token
+  is kept, in that browser, with "Remember me" (`?epiclogout=1` forgets it). "Play without Epic" starts the game
+  signed out; some games (Rocket League) wait at their title screen without an account.
 
 Signing in to real servers from a recompiled client may go against a game's terms, and games with server-side
 anti-cheat (Easy Anti-Cheat, BattlEye) won't accept it; builds have to match the live game version.
@@ -336,7 +349,10 @@ so there is no separate mode to pick. What differs:
 - **64-bit games** (e.g. Rocket League) use the Direct3D 11 path like UE4 games. Games that unpack large shader caches
   at start need more than the 3.5 GB a normal build holds: give them `--mem-mb 7168` (this turns on `--mem64`, 64-bit
   WebAssembly memory, which needs current Chrome, Edge or Brave). A running copy then takes about 10 GB of RAM, so
-  run one at a time.
+  run one at a time. With the game's own EOS SDK (`--eos real`), Rocket League also needs `--threads real`: the SDK's
+  threads wait on each other in ways the cooperative mode can't run, and the page freezes at start-up.
+- **Epic launcher installs**: builds of a game the Epic launcher installed start it with what the launcher passes
+  (`-EpicPortal -epicapp=<app> -epicenv=Prod`), so games whose EOS SDK checks for the launcher don't quit at start.
 - **Steam**: with a WebWorks server the classic interfaces (`SteamUser()`, `SteamFriends()`…) get lobbies and P2P like
   newer games (their versions are read from the game's own `steam_api.dll`). Without one they answer as an offline
   Steam session, so games that insist on Steam still start.

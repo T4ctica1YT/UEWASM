@@ -6,6 +6,11 @@
 
 int _strnicmp_portable(const char* a, const char* b, size_t n);
 static uint64_t cmd_w, cmd_a, env_w, env_a;
+static char env_buf[16384];
+static size_t env_len;
+static void env_publish(void);
+static int env_dbg = -1;
+#define EL(...) do { if (env_dbg < 0) env_dbg = host_query_flag("envdebug"); if (env_dbg) host_log("[env] " __VA_ARGS__); } while (0)
 char g_cmdline[4096];
 
 static int skip_arg(const char* a) { return !strcmp(a, "--image") || !strcmp(a, "--root") || !strcmp(a, "--exe") || !strcmp(a, "--save"); }
@@ -32,14 +37,69 @@ void process_init(int argc, char** argv)
     cmd_w = g_alloc(2 * strlen(g_cmdline) + 2);
     utf8_to_wstr(g_cmdline, cmd_w, strlen(g_cmdline) + 1);
     static const char env[] = "SystemRoot=C:\\Windows\0USERPROFILE=C:\\Users\\Player\0LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local\0APPDATA=C:\\Users\\Player\\AppData\\Roaming\0TEMP=C:\\Temp\0TMP=C:\\Temp\0USERNAME=Player\0COMPUTERNAME=WEB\0NUMBER_OF_PROCESSORS=4\0\0";
-    env_a = g_alloc(sizeof env);
-    memcpy(G2H(env_a), env, sizeof env);
-    env_w = g_alloc(2 * sizeof env);
-    for (size_t i = 0; i < sizeof env; i++) ST16(env_w + 2 * i, (uint8_t)env[i]);
+    memcpy(env_buf, env, sizeof env);
+    env_len = sizeof env - 2;
+    env_publish();
 }
 
-HLE(GetCommandLineW) { RET(cmd_w); }
-HLE(GetCommandLineA) { RET(cmd_a); }
+/* the guest's copies (GetEnvironmentStrings) are rebuilt on every change; old ones stay valid for callers holding them */
+static void env_publish(void)
+{
+    env_a = g_alloc(env_len + 1);
+    memcpy(G2H(env_a), env_buf, env_len + 1);
+    env_w = g_alloc(2 * (env_len + 1));
+    uint64_t w = env_w;
+    for (const char* e = env_buf; *e; e += strlen(e) + 1) {
+        size_t l = strlen(e) + 1;
+        w += 2 * utf8_to_wstr(e, w, l);
+        ST16(w, 0);
+        w += 2;
+    }
+    ST16(w, 0);
+}
+
+static void env_set(const char* name, const char* value)
+{
+    size_t n = strlen(name);
+    EL("set %s=%s", name, value ? value : "(deleted)");
+    if (!n || strchr(name, '=')) return;
+    char* e = env_buf;
+    while (*e) {
+        size_t l = strlen(e) + 1;
+        if (!_strnicmp_portable(e, name, n) && e[n] == '=') {
+            memmove(e, e + l, (size_t)(env_buf + env_len + 1 - (e + l)));
+            env_len -= l;
+            break;
+        }
+        e += l;
+    }
+    if (value) {
+        size_t add = n + 1 + strlen(value) + 1;
+        if (env_len + add + 1 > sizeof env_buf) return;
+        snprintf(env_buf + env_len, add, "%s=%s", name, value);
+        env_len += add;
+        env_buf[env_len] = 0;
+    }
+    env_publish();
+}
+
+/* arguments added before the game first reads its command line (the Epic sign-in's, as the launcher passes them) */
+void process_cmdline_append(const char* s)
+{
+    size_t o = strlen(g_cmdline);
+    snprintf(g_cmdline + o, sizeof g_cmdline - o, " %s", s);
+    cmd_a = g_strdup(g_cmdline);
+    cmd_w = g_alloc(2 * strlen(g_cmdline) + 2);
+    utf8_to_wstr(g_cmdline, cmd_w, strlen(g_cmdline) + 1);
+}
+void epic_signin(CPU* c);
+static void cmdline_ready(CPU* c)
+{
+    static int done;
+    if (!done) { done = 1; epic_signin(c); }
+}
+HLE(GetCommandLineW) { cmdline_ready(c); RET(cmd_w); }
+HLE(GetCommandLineA) { cmdline_ready(c); RET(cmd_a); }
 HLE(GetEnvironmentStringsW) { RET(env_w); }
 HLE(GetEnvironmentStrings) { RET(env_a); }
 HLE(GetEnvironmentStringsA) { RET(env_a); }
@@ -48,12 +108,13 @@ HLE(FreeEnvironmentStringsA) { RET(1); }
 
 static const char* env_lookup(const char* name)
 {
-    const char* e = GSTR(env_a);
+    const char* e = env_buf;
     size_t n = strlen(name);
     while (*e) {
-        if (!_strnicmp_portable(e, name, n) && e[n] == '=') return e + n + 1;
+        if (!_strnicmp_portable(e, name, n) && e[n] == '=') { EL("get %s: %s", name, e + n + 1); return e + n + 1; }
         e += strlen(e) + 1;
     }
+    EL("get %s: not set", name);
     return NULL;
 }
 
@@ -85,8 +146,15 @@ HLE(GetEnvironmentVariableA)
     memcpy(G2H(A2), v, n + 1);
     RET(n);
 }
-HLE(SetEnvironmentVariableW) { RET(1); }
-HLE(SetEnvironmentVariableA) { RET(1); }
+HLE(SetEnvironmentVariableW)
+{
+    char name[256], value[4096];
+    wstr_to_utf8(A1, name, sizeof name);
+    if (A2) wstr_to_utf8(A2, value, sizeof value);
+    env_set(name, A2 ? value : NULL);
+    RET(1);
+}
+HLE(SetEnvironmentVariableA) { env_set(GSTR(A1), A2 ? GSTR(A2) : NULL); RET(1); }
 HLE(ExpandEnvironmentStringsW) { uint64_t n = 0; while (LD16(A1 + 2 * n)) n++; if (A3 > n) memcpy(G2H(A2), G2H(A1), 2 * (n + 1)); RET(n + 1); }
 
 HLE(GetStartupInfoW) { uint32_t n = RT_G32 ? 68 : 104; memset(G2H(A1), 0, n); ST32(A1, n); RET(0); }

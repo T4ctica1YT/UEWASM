@@ -36,6 +36,9 @@ void user32_di_mouse(int* dx, int* dy, int* dz) { *dx = di_dx; *dy = di_dy; *dz 
 #define WM_SIZE 0x0005
 #define WM_CHAR 0x0102
 #define WM_INPUT 0x00FF
+static int in_dbg = -1;
+#define IL(...) do { if (in_dbg < 0) in_dbg = host_query_flag("inputdebug"); if (in_dbg) host_log("[input] " __VA_ARGS__); } while (0)
+#define IS_KEY(m) ((m) >= 0x100 && (m) <= 0x109)
 
 static Wnd* wnd(uint64_t h)
 {
@@ -92,13 +95,23 @@ static uint64_t focus_hwnd;
 void user32_post(uint64_t hwnd, uint32_t msg, uint64_t wp, uint64_t lp);
 static uint64_t main_hwnd(void) { return focus_hwnd ? focus_hwnd : nwins ? wins[0].hwnd : 0; }
 
+static const uint8_t vk_to_sc[256];
+/* a key message's scan code (bits 16-23) and extended-key bit (24): some engines map keys from these, not the vk */
+static uint64_t key_lparam(int vk)
+{
+    vk &= 255;
+    int ext = (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C || vk == 0x6F || vk == 0x90 || vk == 0xA3 || vk == 0xA5;
+    return ((uint64_t)vk_to_sc[vk] << 16) | ((uint64_t)ext << 24);
+}
+
 void user32_event(int type, int a, int b, int d1, int d2)
 {
     uint64_t h = main_hwnd();
     if (!h) return;
     switch (type) {
-    case HOST_EV_KEY_DOWN: keys[a & 255] = 0x80; post(h, a == 0x12 ? 0x104 : 0x100, (uint64_t)a, 1 | ((uint64_t)b << 16)); break;
-    case HOST_EV_KEY_UP: keys[a & 255] = 0; post(h, a == 0x12 ? 0x105 : 0x101, (uint64_t)a, 0xC0000001ull | ((uint64_t)b << 16)); break;
+    case HOST_EV_KEY_DOWN: IL("key %02x down -> window %llx (thread %u), %d queued", a & 255, (unsigned long long)h, wnd_exact(h) ? wnd_exact(h)->tid : 0, qn);
+                           keys[a & 255] = 0x80; post(h, a == 0x12 ? 0x104 : 0x100, (uint64_t)a, 1 | key_lparam(a)); break;
+    case HOST_EV_KEY_UP: keys[a & 255] = 0; post(h, a == 0x12 ? 0x105 : 0x101, (uint64_t)a, 0xC0000001ull | key_lparam(a)); break;
     case HOST_EV_CHAR: post(h, WM_CHAR, (uint64_t)a, 1); break;
     case HOST_EV_MOUSE_MOVE:
         mouse_x = a; mouse_y = b;
@@ -226,6 +239,7 @@ HLE(CreateWindowExW)
     if (cw > 0 && cw != (int)0x80000000 && !w->w) { w->w = cw; w->h = ch; }
     w->x = x == (int)0x80000000 ? 0 : x;
     w->y = y == (int)0x80000000 ? 0 : y;
+    IL("window %llx class \"%s\" style %llx ex %llx made by thread %u", (unsigned long long)w->hwnd, cls, (unsigned long long)A4, (unsigned long long)A1, w->tid);
     nwins++;
     /* CREATESTRUCTW: params, instance, menu, parent (pointer-sized), cy, cx, y, x, style, name, class, ex style */
     uint64_t cs = g_calloc(80);
@@ -289,6 +303,7 @@ HLE(PeekMessageW)
     }
     int i = pump(c, A2, (uint32_t)A3, (uint32_t)A4);
     if (i < 0) { RET(0); return; }
+    if (IS_KEY(queue[i].msg)) IL("PeekMessage (thread %u, filter %llx) gets %x %llx%s", sched_current_id(), (unsigned long long)A2, queue[i].msg, (unsigned long long)queue[i].wparam, ARG(5) & 1 ? "" : " (left queued)");
     write_msg(A1, &queue[i]);
     if (ARG(5) & 1) take_msg(i);
     RET(1);
@@ -303,6 +318,7 @@ HLE(GetMessageW)
         sched_wait_frame(c);
     }
     if (i < 0) { RET(0); return; }
+    if (IS_KEY(queue[i].msg)) IL("GetMessage (thread %u) gets %x %llx", sched_current_id(), queue[i].msg, (unsigned long long)queue[i].wparam);
     write_msg(out, &queue[i]);
     take_msg(i);
     RET(1);
@@ -311,6 +327,7 @@ HLE(TranslateMessage) { RET(0); }
 HLE(DispatchMessageW)
 {
     Wnd* w = wnd_exact(LDP(A1));
+    if (IS_KEY(LD32(A1 + GP))) IL("DispatchMessage %x to %llx (%s)", LD32(A1 + GP), (unsigned long long)LDP(A1), w && w->proc ? "has a window procedure" : "no window procedure");
     RET(w ? call_wndproc(c, w, (uint32_t)LD32(A1 + GP), LDP(A1 + 2 * GP), LDP(A1 + 3 * GP)) : 0);
 }
 HLE(DispatchMessageA) { hle_DispatchMessageW(c); }
@@ -551,7 +568,41 @@ HLE(ToAscii)
 }
 HLE(VkKeyScanW) { RET(A1 >= 'a' && A1 <= 'z' ? A1 - 32 : A1); }
 
-STUB(RegisterRawInputDevices, 1)
+/* RAWINPUTDEVICE: usage page, usage (16-bit each), flags, target window; registrations are kept so a game that checks
+   them (and registers again when missing) sees its own */
+void hle_set_error(uint32_t e);
+typedef struct { uint16_t page, usage; uint32_t flags; uint64_t hwnd; } RawDev;
+static RawDev rawdevs[16];
+static int nrawdevs;
+HLE(RegisterRawInputDevices)
+{
+    uint32_t each = (uint32_t)A3 ? (uint32_t)A3 : 8 + GP;
+    for (uint32_t i = 0; i < (uint32_t)A2; i++) {
+        uint64_t d = A1 + (uint64_t)each * i;
+        RawDev r = { LD16(d), LD16(d + 2), LD32(d + 4), LDP(d + 8) };
+        int k = 0;
+        while (k < nrawdevs && (rawdevs[k].page != r.page || rawdevs[k].usage != r.usage)) k++;
+        if (r.flags & 1) { if (k < nrawdevs) rawdevs[k] = rawdevs[--nrawdevs]; IL("raw input removed: page %x usage %x", r.page, r.usage); continue; }
+        if (k == nrawdevs && nrawdevs < 16) { nrawdevs++; IL("raw input registered: page %x usage %x flags %x window %llx", r.page, r.usage, r.flags, (unsigned long long)r.hwnd); }
+        if (k < 16) rawdevs[k] = r;
+    }
+    RET(1);
+}
+HLE(GetRegisteredRawInputDevices)
+{
+    uint32_t each = (uint32_t)ARG(3) ? (uint32_t)ARG(3) : 8 + GP;
+    if (!A1 || LD32(A2) < (uint32_t)nrawdevs) {
+        ST32(A2, (uint32_t)nrawdevs);
+        if (A1) { hle_set_error(122); RET((uint64_t)(int64_t)-1); return; }
+        RET(0);
+        return;
+    }
+    for (int i = 0; i < nrawdevs; i++) {
+        uint64_t d = A1 + (uint64_t)each * i;
+        ST16(d, rawdevs[i].page); ST16(d + 2, rawdevs[i].usage); ST32(d + 4, rawdevs[i].flags); STP(d + 8, rawdevs[i].hwnd);
+    }
+    RET((uint64_t)nrawdevs);
+}
 HLE(GetRawInputData)
 {
     uint64_t data = A3, size_p = A4;
@@ -572,9 +623,27 @@ HLE(GetRawInputDeviceInfoW) { if (A3) ST32(A4, 0); RET(0); }
 HLE(GetForegroundWindow) { RET(main_hwnd()); }
 HLE(GetActiveWindow) { RET(main_hwnd()); }
 HLE(GetFocus) { RET(main_hwnd()); }
-HLE(SetFocus) { uint64_t old = main_hwnd(); if (A1) focus_hwnd = A1; RET(old); }
-HLE(SetActiveWindow) { uint64_t old = main_hwnd(); if (A1) focus_hwnd = A1; RET(old); }
-HLE(SetForegroundWindow) { if (A1) focus_hwnd = A1; RET(1); }
+/* making a window the active one sends what Windows sends (engines keep their own "focused" flag from these and
+   ignore the keyboard without it); the browser's focus changes later come as posted WM_ACTIVATE */
+static uint64_t active_hwnd;
+static void activate(CPU* c, uint64_t h)
+{
+    Wnd* w = wnd_exact(h);
+    focus_hwnd = h;
+    if (!w || h == active_hwnd) return;
+    uint64_t old = active_hwnd;
+    Wnd* o = wnd_exact(old);
+    if (o) { call_wndproc(c, o, 0x0006, 0, h); call_wndproc(c, o, 0x0008, h, 0); }
+    else call_wndproc(c, w, 0x001C, 1, 0);
+    active_hwnd = h;
+    IL("window %llx activated", (unsigned long long)h);
+    call_wndproc(c, w, 0x0086, 1, 0);
+    call_wndproc(c, w, 0x0006, 1, old);
+    call_wndproc(c, w, 0x0007, old, 0);
+}
+HLE(SetFocus) { uint64_t old = main_hwnd(); if (A1) activate(c, A1); RET(old); }
+HLE(SetActiveWindow) { uint64_t old = main_hwnd(); if (A1) activate(c, A1); RET(old); }
+HLE(SetForegroundWindow) { if (A1) activate(c, A1); RET(1); }
 HLE(GetDesktopWindow) { RET(0x10010); }
 HLE(GetTopWindow) { RET(main_hwnd()); }
 HLE(WindowFromPoint) { RET(main_hwnd()); }
@@ -587,7 +656,7 @@ STUB(IsWindowEnabled, 1)
 STUB(EnableWindow, 0)
 STUB(IsIconic, 0)
 STUB(IsZoomed, 0)
-HLE(ShowWindow) { Wnd* w = wnd(A1); if (w) w->visible = A2 != 0; if (A2 && A2 != 7 && A2 != 8 && A2 != 4) focus_hwnd = A1; RET(1); }
+HLE(ShowWindow) { IL("ShowWindow %llx %d", (unsigned long long)A1, (int)A2); Wnd* w = wnd(A1); if (w) w->visible = A2 != 0; if (A2 && A2 != 7 && A2 != 8 && A2 != 4 && A2 != 6) activate(c, A1); RET(1); }
 STUB(UpdateWindow, 1)
 STUB(SetWindowTextW, 1)
 STUB(SetWindowTextA, 1)
