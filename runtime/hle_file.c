@@ -598,6 +598,7 @@ static uint64_t find_first(const char* guest, uint64_t out, int wide)
 }
 
 HLE(FindFirstFileExW) { char g[1200]; wstr_to_utf8(A1, g, sizeof g); RET(find_first(g, A3, 1)); }
+HLE(FindFirstFileExA) { RET(find_first(GSTR(A1), A3, 0)); }
 HLE(FindFirstFileW) { char g[1200]; wstr_to_utf8(A1, g, sizeof g); RET(find_first(g, A2, 1)); }
 HLE(FindFirstFileA) { RET(find_first(GSTR(A1), A2, 0)); }
 static void find_next(CPU* c, int wide)

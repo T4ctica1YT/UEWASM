@@ -394,6 +394,7 @@
 "FillRect": 12,
 "FindClose": 4,
 "FindFirstFileA": 8,
+"FindFirstFileExA": 24,
 "FindFirstFileExW": 24,
 "FindFirstFileW": 8,
 "FindNextFileA": 8,
