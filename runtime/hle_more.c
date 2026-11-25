@@ -791,3 +791,38 @@ HLE(joyGetDevCapsA) { RET(167); }
 HLE(joySetCapture) { RET(167); }
 HLE(joyReleaseCapture) { RET(0); }
 HLE(SetHandleCount) { RET(A1); }   /* obsolete: the count asked for */
+
+/* ---- ANSI twins of wide-only APIs: a game may import either spelling, and a missing one is an
+ * "unsupported" stub that fails forever (FindFirstFileExA made Stray spin). Same behaviour as the W versions. ---- */
+HLE(CopyFileW); HLE(CopyFileA); HLE(CreateDirectoryA); HLE(CreateMutexExW); HLE(CreateSemaphoreExW);
+HLE(OpenMutexW); HLE(OpenEventW); HLE(OpenSemaphoreW); HLE(GetDiskFreeSpaceExW); HLE(CreateDialogParamW);
+HLE(CopyFileExA) { R(8) = (uint32_t)ARG(6) & 1; hle_CopyFileA(c); }
+HLE(CreateDirectoryExA) { R(1) = A2; R(2) = A3; hle_CreateDirectoryA(c); }
+HLE(CreateMutexExA) { hle_CreateMutexExW(c); }
+HLE(CreateSemaphoreExA) { hle_CreateSemaphoreExW(c); }
+HLE(OpenMutexA) { hle_OpenMutexW(c); }
+HLE(OpenEventA) { hle_OpenEventW(c); }
+HLE(OpenSemaphoreA) { hle_OpenSemaphoreW(c); }
+HLE(GetDiskFreeSpaceExA) { hle_GetDiskFreeSpaceExW(c); }
+HLE(CreateDialogParamA) { hle_CreateDialogParamW(c); }
+HLE(CreateWaitableTimerExA) { hle_set_error(50); RET(0); }
+HLE(GetVolumeInformationA) { if (A2 && A3) ST8(A2, 0); if (ARG(5)) ST32(ARG(5), 0x1234); RET(1); }
+HLE(GetLongPathNameA)
+{
+    size_t n = strlen(GSTR(A1));
+    if (A3 > n) memcpy(G2H(A2), G2H(A1), n + 1);
+    RET(A3 > n ? n : n + 1);
+}
+HLE(GetDllDirectoryA) { if (A1 && A2) ST8(A2, 0); RET(0); }
+HLE(SetDllDirectoryA) { RET(1); }
+HLE(GetSystemWindowsDirectoryA)
+{
+    static const char dir[] = "C:\Windows";
+    if (A2 < sizeof dir) { RET(sizeof dir); return; }
+    memcpy(G2H(A1), dir, sizeof dir);
+    RET(sizeof dir - 1);
+}
+HLE(LoadStringA) { if (A3 && A4) ST8(A3, 0); RET(0); }
+STUB(RegDeleteKeyA, 0)
+STUB(CreateSymbolicLinkA, 0)
+STUB(CreateHardLinkA, 0)
