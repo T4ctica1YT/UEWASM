@@ -39,6 +39,23 @@ static uint64_t arena_cur, arena_end;
 #define SETB(m, i) ((m)[(i) >> 6] |= 1ull << ((i) & 63))
 #define CLRB(m, i) ((m)[(i) >> 6] &= ~(1ull << ((i) & 63)))
 
+/* the heap and the unit map have their own lock, so malloc/free/HeapAlloc can skip the global one (see nolock_init).
+   Order: rt_lock, then mem_lock; nothing under mem_lock takes rt_lock. Recursive, as g_alloc calls g_pages and the
+   out-of-memory report may allocate. Held only for bookkeeping and the zeroing of reused units, so a spin is fine */
+#ifdef UEW_THREADS
+static volatile int mem_lk;
+static _Thread_local int mem_depth;
+static void mem_lock(void)
+{
+    if (mem_depth++) return;
+    while (__atomic_exchange_n(&mem_lk, 1, __ATOMIC_ACQUIRE)) while (__atomic_load_n(&mem_lk, __ATOMIC_RELAXED)) {}
+}
+static void mem_unlock(void) { if (!--mem_depth) __atomic_store_n(&mem_lk, 0, __ATOMIC_RELEASE); }
+#else
+#define mem_lock() ((void)0)
+#define mem_unlock() ((void)0)
+#endif
+
 static void units_init(uint64_t lo)
 {
     unit_lo = (lo + UNIT - 1) & ~(UNIT - 1);
@@ -114,7 +131,7 @@ static uint64_t units_scan_down(uint64_t n)
 /* small blocks first-fit from the bottom, big ones (4 MB and up) from the top: the small long-lived ones stay packed
    low instead of being strewn across the space, so a big contiguous block can still be found when most is in use
    (Dead as Disco ran out of room for a 48 MB block with 400 MB free) */
-uint64_t g_pages(uint64_t size)
+static uint64_t g_pages_nl(uint64_t size)
 {
     uint64_t n = (size + UNIT - 1) / UNIT;
     if (!n) n = 1;
@@ -151,7 +168,7 @@ uint64_t g_pages(uint64_t size)
     return unit_lo + i * UNIT;
 }
 
-uint64_t g_pages_at(uint64_t a, uint64_t size)
+static uint64_t g_pages_at_nl(uint64_t a, uint64_t size)
 {
     if (a < unit_lo || (a - unit_lo) % UNIT) return 0;
     uint64_t i = (a - unit_lo) / UNIT, n = (size + UNIT - 1) / UNIT;
@@ -163,7 +180,7 @@ uint64_t g_pages_at(uint64_t a, uint64_t size)
 }
 
 /* region holding a: returns its base and length, or 0 when a is not allocated */
-uint64_t g_pages_query(uint64_t a, uint64_t* len)
+static uint64_t g_pages_query_nl(uint64_t a, uint64_t* len)
 {
     if (a < unit_lo) return 0;
     uint64_t i = (a - unit_lo) / UNIT;
@@ -183,7 +200,7 @@ uint64_t g_pages_query(uint64_t a, uint64_t* len)
    halves. Rocket League frees 2.6 GB of shader-cache buffers after loading: zeroing them took ~0.2 s, and a trimmed
    page then held 1.25 GB less in Windows' compression store. ?nozerofree=1 zeroes at reuse instead */
 static int zero_free;
-void g_pages_free(uint64_t a)
+static void g_pages_free_nl(uint64_t a)
 {
     uint64_t len, base = g_pages_query(a, &len);
     if (!base || base != a) return;
@@ -212,9 +229,9 @@ static int size_class(uint64_t n)
 
 /* heap bookkeeping for the [mem] log line: bytes asked for and held by live blocks, bytes sitting in the free lists */
 static uint64_t heap_req, heap_held, heap_binned, heap_big;
-void g_heap_stats(uint64_t* req, uint64_t* held, uint64_t* binned, uint64_t* big) { *req = heap_req; *held = heap_held; *binned = heap_binned; *big = heap_big; }
+void g_heap_stats(uint64_t* req, uint64_t* held, uint64_t* binned, uint64_t* big) { mem_lock(); *req = heap_req; *held = heap_held; *binned = heap_binned; *big = heap_big; mem_unlock(); }
 
-uint64_t g_alloc(uint64_t n)
+static uint64_t g_alloc_nl(uint64_t n)
 {
     if (n == 0) n = 1;
     int k = size_class(n + 16);
@@ -258,7 +275,7 @@ static uint64_t block_cap(uint64_t p)
     return len - 16;
 }
 
-void g_free(uint64_t p)
+static void g_free_nl(uint64_t p)
 {
     if (!p) return;
     int k = (int)LD64(p - 8);
@@ -278,7 +295,7 @@ uint64_t g_calloc(uint64_t n)
     return p;
 }
 
-uint64_t g_realloc(uint64_t p, uint64_t n)
+static uint64_t g_realloc_nl(uint64_t p, uint64_t n)
 {
     if (!p) return g_alloc(n);
     if (!n) { g_free(p); return 0; }
@@ -289,6 +306,15 @@ uint64_t g_realloc(uint64_t p, uint64_t n)
     g_free(p);
     return q;
 }
+
+/* the locked entry points (the _nl bodies above call these, and the lock is recursive) */
+uint64_t g_pages_at(uint64_t a, uint64_t size) { mem_lock(); uint64_t r = g_pages_at_nl(a, size); mem_unlock(); return r; }
+uint64_t g_pages_query(uint64_t a, uint64_t* len) { mem_lock(); uint64_t r = g_pages_query_nl(a, len); mem_unlock(); return r; }
+void g_pages_free(uint64_t a) { mem_lock(); g_pages_free_nl(a); mem_unlock(); }
+uint64_t g_pages(uint64_t size) { mem_lock(); uint64_t r = g_pages_nl(size); mem_unlock(); return r; }
+uint64_t g_alloc(uint64_t n) { mem_lock(); uint64_t r = g_alloc_nl(n); mem_unlock(); return r; }
+void g_free(uint64_t p) { mem_lock(); g_free_nl(p); mem_unlock(); }
+uint64_t g_realloc(uint64_t p, uint64_t n) { mem_lock(); uint64_t r = g_realloc_nl(p, n); mem_unlock(); return r; }
 
 uint64_t g_strdup(const char* s)
 {
@@ -566,7 +592,11 @@ static void nolock_init(void)
         "GetCurrentProcessorNumber", "GetCurrentProcessorNumberEx", "EnterCriticalSection", "LeaveCriticalSection",
         "TryEnterCriticalSection", "SwitchToThread", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "AcquireSRWLockShared",
         "ReleaseSRWLockShared", "TryAcquireSRWLockExclusive", "TryAcquireSRWLockShared", "timeGetTime", "QueryUnbiasedInterruptTime",
-        "GetSystemMetrics", "IsIconic", "GetForegroundWindow", "GetActiveWindow", "GetFocus", "GetDesktopWindow" };
+        "GetSystemMetrics", "IsIconic", "GetForegroundWindow", "GetActiveWindow", "GetFocus", "GetDesktopWindow",
+        /* the heap has its own lock (mem_lock); the initialisers only write the object they're given */
+        "malloc", "calloc", "realloc", "free", "_msize", "_aligned_malloc", "_aligned_free", "GetProcessHeap", "HeapAlloc",
+        "HeapFree", "HeapReAlloc", "HeapSize", "IsDebuggerPresent", "InitializeCriticalSection",
+        "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx", "InitializeSRWLock", "InitializeConditionVariable" };
     uint8_t* m = calloc(rt_thunk_count + 1, 1);
     for (size_t k = 0; k < rt_thunk_count; k++) {
         if (!rt_thunks[k].fn) continue;
