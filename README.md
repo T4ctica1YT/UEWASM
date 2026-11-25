@@ -311,6 +311,26 @@ A build can talk to a game's real servers, with nothing to install for the playe
 Signing in to real servers from a recompiled client may go against a game's terms, and games with server-side
 anti-cheat (Easy Anti-Cheat, BattlEye) won't accept it; builds have to match the live game version.
 
+## Online settings in the desktop app
+
+The app's *Online* tab sets the same options as the flags above. *Online services* picks what the page does for a
+game's online services:
+
+| Choice | What the build gets |
+|---|---|
+| None | No backend script; online services are left to the game and the runtime. |
+| Epic online services, offline | `--backend epic`: answers Epic account, entitlement and content requests in the page, with the EOS stand-in, so a game that needs a login can start. |
+| Epic online services, real SDK (recompiles EOS) | `--eos real` without `--backend epic`: the game's own EOS SDK is recompiled and signs in to Epic through WISP, and the offline Epic script and its offline auth arguments are left out. The app also passes `--game-dlls auto`, because the game's EOS SDK DLL has to be recompiled. |
+
+The *Epic Online Services* choice below picks the EOS stand-in or the real SDK when *Online services* does not. With
+the real-SDK entry above selected, it shows "Real SDK, set by Online services above" instead of a second, conflicting
+choice. *Epic sign-in* is `--epic` (Automatic, account, off).
+
+*Real connections* is `--wisp` / `--wisp-url`; `--eos real` turns WISP on by itself, and *Play in browser* or
+`uewasm-cli serve` provides the WISP server. With *Steam* set to the player's account and WISP on, *Steam sign-in*
+chooses `--steam-wisp` / `--no-steam-wisp`. Real EOS with Rocket League also needs real threads and about 8 GB of
+guest memory, as on the command line.
+
 ## Testing
 
 The tests are one Rust tool, `uewtest` (`rustlift/src/bin/uewtest/`, built with the others). Each builds a small

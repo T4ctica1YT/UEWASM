@@ -1,8 +1,8 @@
 # Online services: how they fit together
 
 This page covers the internals behind the README's [Steam](../README.md#steam-multiplayer-webworks),
-[EOS](../README.md#epic-online-services) and [official servers](../README.md#official-servers) sections, for people
-changing them.
+[EOS](../README.md#epic-online-services) and [official servers](../README.md#official-servers) sections, and the
+[desktop app's online settings](../README.md#online-settings-in-the-desktop-app), for people changing them.
 
 ## Layers
 
@@ -56,6 +56,16 @@ connections yet, so a game that waits for it starts up.
     which is why the lifter's handling of hand-written assembly matters here (see [LIFTER.md](LIFTER.md)).
   - The SDK caches downloaded files under the game's `Saved/PersistentDownloadDir/EOSCache`. A cache written by a
     broken build stays broken; `?clearsave=<path>` removes it.
+  - A game that still fails its own launcher check was likely started without what the Epic launcher passes. The
+    build adds `-EpicPortal` / `-epicapp=<app>` only when it finds the Epic launcher's install record (see
+    [DEBUGGING.md](DEBUGGING.md)).
+
+`?eosdebug=1` logs each EOS SDK function the game calls.
+
+The desktop app's *Online services* choice **Epic online services, real SDK (recompiles EOS)** selects this path
+without `--backend epic`, so the offline page script and its offline auth arguments stay out, and it passes
+`--game-dlls auto` so the game's EOS SDK DLL is recompiled. While it is selected, the separate *Epic Online Services*
+dropdown shows that the choice is set there instead of offering a possibly conflicting stand-in value.
 
 ## WISP and sockets
 
