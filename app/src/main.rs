@@ -23,7 +23,8 @@ const EPICS: &[(&str, &str)] = &[("Automatic (Epic launcher installs with the re
 const STEAMS: &[(&str, &str)] = &[("WebWorks server (sign-in, lobbies, multiplayer)", "webworks"),
                                    ("Player's Steam account (real sign-in and tickets)", "account"), ("Offline (no Steam server)", "offline")];
 const PRIORITIES: &[(&str, &str)] = &[("High (fastest, tuned to this PC)", "high"), ("Low (keeps the PC usable while it builds)", "low")];
-const BACKENDS: &[(&str, &str)] = &[("None (games play offline as usual)", ""), ("Epic online services, offline (sign-in, profiles, menus)", "epic")];
+const BACKENDS: &[(&str, &str)] = &[("None (games play offline as usual)", ""), ("Epic online services, offline (sign-in, profiles, menus)", "epic"),
+    ("Epic online services, real SDK (recompiles EOS)", "epic-real")];
 /// video choice: (label, height (0 keep, -1 render height), mode)
 const VIDEOS: &[(&str, i32, &str)] = &[("Keep original videos", 0, "fast"), ("Shrink to render height, fast encode", -1, "fast"),
     ("Shrink to render height, smallest files (slow)", -1, "small"), ("Shrink to 1080p, fast encode", 1080, "fast")];
@@ -71,6 +72,11 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) {
 
 fn pick<'a>(table: &'a [(&'a str, &'a str)], label: &str) -> &'a str {
     table.iter().find(|x| x.0 == label).unwrap_or(&table[0]).1
+}
+
+/// Online services is set to Epic's real SDK (which needs the game's own EOS SDK DLLs recompiled)
+fn real_eos_backend(s: &Settings) -> bool {
+    pick(BACKENDS, &s.backend) == "epic-real"
 }
 
 fn fmt_time(s: f64) -> String {
@@ -223,12 +229,15 @@ impl App {
             "--renderer".into(), pick(RENDERERS, &self.s.renderer).into(), "--threads".into(), threads.into(), "--opt".into(), pick(OPTS, &self.s.opt).into(),
             "--steam".into(), pick(STEAMS, &self.s.steam).into(), "--priority".into(), pick(PRIORITIES, &self.s.priority).into(), "--quality".into(), pick(QUALITY, &self.s.quality).into(),
             "--mem-mb".into(), self.s.mem.to_string(), "--mem-limit-gb".into(), self.s.mem_limit.to_string(), "--resolution".into(), res_arg,
-            "--part-mb".into(), self.s.part.to_string(), "--game-dlls".into(), if self.s.game_dlls { "auto".into() } else { "none".into() }];
+            "--part-mb".into(), self.s.part.to_string(), "--game-dlls".into(), if self.s.game_dlls || real_eos_backend(&self.s) { "auto".into() } else { "none".into() }];
         let video_h = if video.1 < 0 { h as i32 } else { video.1 };
         if video_h > 0 {
             args.extend(["--video-height".into(), video_h.to_string(), "--video-mode".into(), video.2.into()]);
         }
-        args.extend(["--eos".into(), pick(EOS, &self.s.eos).into()]);
+        // the real EOS option in Online services picks the real SDK too: its own sign-in doesn't use the offline stand-in
+        let backend = pick(BACKENDS, &self.s.backend);
+        let real_eos = real_eos_backend(&self.s);
+        args.extend(["--eos".into(), if real_eos { "real".to_string() } else { pick(EOS, &self.s.eos).to_string() }]);
         args.extend(["--epic".into(), pick(EPICS, &self.s.epic).into()]);
         if self.s.wisp && !self.s.wisp_url.trim().is_empty() {
             args.extend(["--wisp-url".into(), self.s.wisp_url.trim().to_string()]);
@@ -236,8 +245,7 @@ impl App {
         if self.s.wisp && pick(STEAMS, &self.s.steam) == "account" {
             args.push(if self.s.steam_wisp { "--steam-wisp" } else { "--no-steam-wisp" }.into());
         }
-        let backend = pick(BACKENDS, &self.s.backend);
-        if !backend.is_empty() {
+        if !backend.is_empty() && !real_eos {
             args.extend(["--backend".into(), backend.into()]);
             if self.s.placeholders { args.push("--placeholders".into()); }
         }
@@ -433,7 +441,12 @@ impl eframe::App for App {
                         ui.label(""); ui.label("");
                         ui.end_row();
                     }
-                    ui.label("Epic Online Services"); combo(ui, "eos", &mut self.s.eos, &labels(EOS));
+                    ui.label("Epic Online Services");
+                    if real_eos_backend(&self.s) {
+                        ui.label(egui::RichText::new("Real SDK, set by Online services above").weak());
+                    } else {
+                        combo(ui, "eos", &mut self.s.eos, &labels(EOS));
+                    }
                     ui.label(""); ui.label("");
                     ui.end_row();
                     ui.label("Epic sign-in"); combo(ui, "epic", &mut self.s.epic, &labels(EPICS));
