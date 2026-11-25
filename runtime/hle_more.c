@@ -806,19 +806,33 @@ HLE(OpenSemaphoreA) { hle_OpenSemaphoreW(c); }
 HLE(GetDiskFreeSpaceExA) { hle_GetDiskFreeSpaceExW(c); }
 HLE(CreateDialogParamA) { hle_CreateDialogParamW(c); }
 HLE(CreateWaitableTimerExA) { hle_set_error(50); RET(0); }
-HLE(GetVolumeInformationA) { if (A2 && A3) ST8(A2, 0); if (ARG(5)) ST32(ARG(5), 0x1234); RET(1); }
+/* same layout as the W one in hle_file.c: serial is A4, ARG(5) the max component length, sizes only written within */
+HLE(GetVolumeInformationA)
+{
+    if (A2 && (uint32_t)A3) ST8(A2, 0);
+    if (A4) ST32(A4, 0x1234);
+    if (ARG(5)) ST32(ARG(5), 255);
+    if (ARG(6)) ST32(ARG(6), 7);
+    uint64_t fs = ARG(7); uint32_t fsn = (uint32_t)ARG(8);
+    if (fs && fsn) { if (fsn >= 5) memcpy(G2H(fs), "NTFS", 5); else ST8(fs, 0); }
+    RET(1);
+}
+/* length without the terminator on success, the size needed (with it) when cch is short; src and buf may be the same */
 HLE(GetLongPathNameA)
 {
+    if (!A1) { hle_set_error(87); RET(0); return; }
     size_t n = strlen(GSTR(A1));
-    if (A3 > n) memcpy(G2H(A2), G2H(A1), n + 1);
-    RET(A3 > n ? n : n + 1);
+    uint32_t cch = (uint32_t)A3;
+    if (cch <= n || !A2) { RET(n + 1); return; }
+    memmove(G2H(A2), G2H(A1), n + 1);
+    RET(n);
 }
-HLE(GetDllDirectoryA) { if (A1 && A2) ST8(A2, 0); RET(0); }
+HLE(GetDllDirectoryA) { if ((uint32_t)A1 && A2) ST8(A2, 0); RET(0); }
 HLE(SetDllDirectoryA) { RET(1); }
 HLE(GetSystemWindowsDirectoryA)
 {
-    static const char dir[] = "C:\Windows";
-    if (A2 < sizeof dir) { RET(sizeof dir); return; }
+    static const char dir[] = "C:\\Windows";
+    if ((uint32_t)A2 < sizeof dir) { RET(sizeof dir); return; }
     memcpy(G2H(A1), dir, sizeof dir);
     RET(sizeof dir - 1);
 }

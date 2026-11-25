@@ -452,7 +452,15 @@ HLE(lstrlenW) { uint64_t n = 0; while (A1 && LD16(A1 + 2 * n)) n++; RET(n); }
 HLE(GetSystemDirectoryW) { RET(utf8_to_wstr("C:\\Windows\\System32", A1, (size_t)A2)); }
 HLE(GetSystemDirectoryA) { snprintf((char*)G2H(A1), (size_t)A2, "C:\\Windows\\System32"); RET(19); }
 HLE(GetWindowsDirectoryW) { RET(utf8_to_wstr("C:\\Windows", A1, (size_t)A2)); }
-HLE(GetLongPathNameW) { uint64_t n = 0; while (LD16(A1 + 2 * n)) n++; if (A3 > n) memcpy(G2H(A2), G2H(A1), 2 * (n + 1)); RET(n); }
+/* length without the terminator on success, the size needed (with it) when cch is short; src and buf may be the same */
+HLE(GetLongPathNameW)
+{
+    if (!A1) { hle_set_error(87); RET(0); return; }
+    uint64_t n = 0; while (LD16(A1 + 2 * n)) n++;
+    if ((uint32_t)A3 <= n || !A2) { RET(n + 1); return; }
+    memmove(G2H(A2), G2H(A1), 2 * (n + 1));
+    RET(n);
+}
 HLE(ExpandEnvironmentStringsA) { size_t n = strlen(GSTR(A1)); if (A3 > n) memcpy(G2H(A2), G2H(A1), n + 1); RET(n + 1); }
 HLE(GetFinalPathNameByHandleW) { RET(utf8_to_wstr("C:\\file", A2, (size_t)A3)); }
 HLE(GetCurrencyFormatW) { uint64_t n = 0; while (LD16(A3 + 2 * n)) n++; if ((int32_t)ARG(6) > (int64_t)n) memcpy(G2H(ARG(5)), G2H(A3), 2 * (n + 1)); RET(n + 1); }
@@ -476,7 +484,7 @@ STUB(AreFileApisANSI, 1)
 STUB(SetFileInformationByHandle, 1)
 STUB(DisableThreadLibraryCalls, 1)
 STUB(SetDllDirectoryW, 1)
-HLE(GetDllDirectoryW) { if (A1) ST16(A2, 0); RET(0); }
+HLE(GetDllDirectoryW) { if ((uint32_t)A1 && A2) ST16(A2, 0); RET(0); }
 STUB(AttachConsole, 0)
 STUB(SetConsoleScreenBufferSize, 1)
 STUB(SetConsoleWindowInfo, 1)
@@ -604,7 +612,7 @@ STUB(XInputEnable, 0)
 
 /* calls older (32-bit, UE3-era) games make */
 HLE(GetWindowsDirectoryA) { const char* w = "C:\\Windows"; size_t n = strlen(w); if (A1 && A2 > n) memcpy(G2H(A1), w, n + 1); RET(A2 > n ? n : n + 1); }
-HLE(GetSystemWindowsDirectoryW) { RET(utf8_to_wstr("C:\\Windows", A1, (size_t)A2)); }
+HLE(GetSystemWindowsDirectoryW) { if ((uint32_t)A2 < 11) { RET(11); return; } RET(utf8_to_wstr("C:\\Windows", A1, (size_t)A2)); }   /* short: size with the terminator */
 HLE(GetDiskFreeSpaceA) { if (A2) ST32(A2, 8); if (A3) ST32(A3, 512); if (A4) ST32(A4, 0x1000000); if (ARG(5)) ST32(ARG(5), 0x2000000); RET(1); }
 STUB(GetCursorInfo, 0)
 STUB(LoadKeyboardLayoutW, 0x04090409)

@@ -27,7 +27,8 @@ typedef struct Packet { uint32_t bytes; uint64_t key, ov; } Packet;
 typedef struct Port { Packet* q; uint32_t n, cap, head; } Port;
 
 typedef struct FindEntry { char name[260]; int is_dir; uint64_t size, mtime; } FindEntry;
-typedef struct FindList { FindEntry* e; size_t n, cap, pos; char pat[260]; } FindList;
+/* ht: open-addressing set of entry index+1 (0 = empty), only alive while listing (dedupe) */
+typedef struct FindList { FindEntry* e; size_t n, cap, pos; char pat[260]; uint32_t* ht; size_t hcap; } FindList;
 
 #define MAX_HANDLES 4096
 static Handle handles[MAX_HANDLES];
@@ -440,7 +441,7 @@ HLE(CloseHandle)
     Handle* x = hget(A1);
     if (!x) { RET(std_of(A1) >= 0); return; }
     if (x->f) fclose(x->f);
-    if (x->find) { free(x->find->e); free(x->find); }
+    if (x->find) { free(x->find->e); free(x->find->ht); free(x->find); }
     if (x->kind == H_PORT) { free(((Port*)x->obj)->q); free(x->obj); }
     x->kind = H_FREE;
     RET(1);
@@ -522,35 +523,63 @@ HLE(CopyFileW)
     RET(1);
 }
 
+/* FindFirstFile matching (FsRtlIsNameInExpression with kernel32's DOS translation):
+   '?' is DOS_QM, '*' before '.' is DOS_STAR, '.' before '?'/'*'/end is DOS_DOT. */
+static int wlc(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 static int wild(const char* p, const char* s)
 {
-    for (; *p; p++, s++) {
-        if (*p == '*') {
+    for (;; p++) {
+        switch (*p) {
+        case 0: return !*s;
+        case '*':
             while (p[1] == '*') p++;
-            if (!p[1]) return 1;
-            for (; *s; s++) if (wild(p + 1, s)) return 1;
-            return 0;
+            if (p[1] == '.') { /* DOS_STAR: anything up to, not past, the name's last '.' */
+                const char* d = strrchr(s, '.'), *e = d ? d : s + strlen(s);
+                for (; s <= e; s++) if (wild(p + 1, s)) return 1;
+                return 0;
+            }
+            for (;; s++) { if (wild(p + 1, s)) return 1; if (!*s) return 0; }
+        case '?': /* DOS_QM: one char, or zero at '.'/end (skipping the whole ? run) */
+            if (!*s || *s == '.') { while (p[1] == '?') p++; continue; }
+            s++; continue;
+        case '.': /* DOS_DOT: a '.' or nothing past the end of the name */
+            if (!*s && (!p[1] || p[1] == '?' || p[1] == '*')) continue;
+            /* fall through */
+        default:
+            if (wlc(*p) != wlc(*s)) return 0;
+            s++;
         }
-        if (!*s) return 0;
-        char a = *p >= 'A' && *p <= 'Z' ? *p + 32 : *p, b = *s >= 'A' && *s <= 'Z' ? *s + 32 : *s;
-        if (*p != '?' && a != b) return 0;
     }
-    return !*s || !strcmp(s, ".");
+}
+
+static size_t find_hash(const char* s)
+{
+    uint32_t h = 2166136261u;     /* FNV-1a over the exact bytes: dedupe stays a plain strcmp */
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) h = (h ^ *p) * 16777619u;
+    return h;
 }
 
 static void find_cb(void* ctx, const char* name, int is_dir, uint64_t size, uint64_t mtime)
 {
     FindList* l = ctx;
-    size_t pl = strlen(l->pat);
-    int ok = wild(l->pat, name);
-    if (!ok && pl >= 2 && !strcmp(l->pat + pl - 2, ".*")) {
-        char p[260];
-        snprintf(p, sizeof p, "%.*s", (int)(pl - 2), l->pat);
-        ok = wild(p, name);
+    if (!wild(l->pat, name)) return;
+    /* keep load <= 1/2 so the probe always ends on a free slot we can insert into */
+    if ((l->n + 1) * 2 > l->hcap) {
+        size_t nc = l->hcap ? l->hcap * 2 : 64;
+        uint32_t* nt = calloc(nc, sizeof *nt);
+        for (size_t i = 0; i < l->n; i++) {
+            size_t j = find_hash(l->e[i].name) & (nc - 1);
+            while (nt[j]) j = (j + 1) & (nc - 1);
+            nt[j] = (uint32_t)i + 1;
+        }
+        free(l->ht);
+        l->ht = nt;
+        l->hcap = nc;
     }
-    if (!ok) return;
-    for (size_t i = 0; i < l->n; i++)
-        if (!strcmp(l->e[i].name, name)) return;
+    size_t j = find_hash(name) & (l->hcap - 1);
+    for (; l->ht[j]; j = (j + 1) & (l->hcap - 1))
+        if (!strcmp(l->e[l->ht[j] - 1].name, name)) return;    /* save dir listed first wins */
+    l->ht[j] = (uint32_t)l->n + 1;
     if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 32; l->e = realloc(l->e, l->cap * sizeof *l->e); }
     FindEntry* e = &l->e[l->n++];
     snprintf(e->name, sizeof e->name, "%s", name);
@@ -582,6 +611,9 @@ static uint64_t find_first(const char* guest, uint64_t out, int wide)
     if (g_save[0]) { join_root(g_save, abs, host, sizeof host); listed |= host_list_dir(host, find_cb, l); }
     join_root(g_root, abs, host, sizeof host);
     listed |= host_list_dir(host, find_cb, l);
+    free(l->ht);                /* dedupe set is done once both roots are merged */
+    l->ht = NULL;
+    l->hcap = 0;
     if (file_trace < 0) file_trace = getenv("UEW_FILES") != NULL || host_query_flag("filetrace");
     if (!listed || !l->n) {
         if (file_trace > 0) host_log("[file] find %s -> none", guest);
@@ -644,7 +676,18 @@ HLE(GetDriveTypeA) { RET(3); }
 HLE(GetLogicalDrives) { RET(4); }
 HLE(GetDiskFreeSpaceW) { if (A2) ST32(A2, 8); if (A3) ST32(A3, 512); if (A4) ST32(A4, 0x1000000); if (ARG(5)) ST32(ARG(5), 0x2000000); RET(1); }
 HLE(GetDiskFreeSpaceExW) { if (A2) ST64(A2, 64ull << 30); if (A3) ST64(A3, 128ull << 30); if (A4) ST64(A4, 64ull << 30); RET(1); }
-HLE(GetVolumeInformationW) { if (A2) ST16(A2, 0); if (ARG(5)) ST32(ARG(5), 0x1234); RET(1); }
+/* (root, name, nameSize, serial*, maxComponent*, flags*, fsName, fsNameSize): ARG(n) counts from 1 like A1-A4, so the
+   serial is A4 and ARG(5) the max component length; sizes are DWORD character counts that are only written within */
+HLE(GetVolumeInformationW)
+{
+    if (A2 && (uint32_t)A3) ST16(A2, 0);
+    if (A4) ST32(A4, 0x1234);
+    if (ARG(5)) ST32(ARG(5), 255);
+    if (ARG(6)) ST32(ARG(6), 7);   /* case-sensitive search | case-preserved names | unicode on disk */
+    uint64_t fs = ARG(7); uint32_t fsn = (uint32_t)ARG(8);
+    if (fs && fsn) utf8_to_wstr(fsn >= 5 ? "NTFS" : "", fs, fsn);
+    RET(1);
+}
 
 void file_init(void)
 {

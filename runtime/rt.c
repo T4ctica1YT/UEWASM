@@ -682,6 +682,7 @@ void rt_call(CPU* c, uint64_t t)
             else hle_missing(c, e);
             R(4) += 8;
         }
+        /* the budget is per thread (_Thread_local with UEW_THREADS), so it needs no lock; only the tick does */
         if (locks) {
             if (--rt_hle_budget < 0) rt_hle_tick(c);
             rt_unlock();
