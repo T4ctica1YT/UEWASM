@@ -123,7 +123,13 @@ uewasm-cli recomp "…\MyGame.exe" -o builds/MyGame -y --names --threads real
 
 - **Cooperative builds (the default) freezing with no output**: a guest thread is spinning on something another
   thread must change, without making a system call, so no other thread gets to run. A failed `lock cmpxchg` and `pause`
-  already yield. Try `--threads real`: if the game gets further, the hang was such a spin.
+  already yield, and give the browser its turn (every 250 ms, or every 2 ms while a thread waits on a download), so a
+  spin waiting on another thread's file read can't hold the download up. Plain loops do the same about every 64k
+  iterations: the lifter counts every backward jump (`BACKEDGE`, `runtime/rt.h`), which is what lets UE3's
+  `ULinkerLoad::Tick` poll its async package read. Try `--threads real`: if the game gets further, the hang was such
+  a spin. To see where a hung page is, pause it from DevTools (a `--names` build names the guest functions).
+- **A crash that comes and goes** in a cooperative build: `?loopbudget=256` switches threads every 256 loop back edges
+  instead of every 4 ms, so a race between game threads shows up far more often.
 - A spin also blocks the page, so page-side tools (the debug panel's thread dump) don't respond; use `?tracering=1`
   to see the last system calls before it. With real threads the thread dump still works, and with `?tracering=1` it
   prints those last calls too.

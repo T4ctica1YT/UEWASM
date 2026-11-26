@@ -8,10 +8,32 @@ static unsigned fnv(const unsigned char* p, size_t n, unsigned h)
     return h;
 }
 
+/* a thread spinning with pause and no system calls while another reads the game files: in the browser that read waits
+   for a download, which lands only if the spin lets the page's event loop run */
+static volatile LONG spin_done;
+static unsigned char spin_byte;
+static DWORD WINAPI spin_reader(void* arg)
+{
+    (void)arg;
+    HANDLE h = CreateFileW(L"Content\\big.bin", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    LARGE_INTEGER o = { .QuadPart = 2900000 };
+    DWORD n = 0;
+    SetFilePointerEx(h, o, NULL, FILE_BEGIN);
+    ReadFile(h, &spin_byte, 1, &n, NULL);
+    CloseHandle(h);
+    spin_done = 1;
+    return 0;
+}
+
 int main(void)
 {
     static unsigned char buf[3 << 20];
     char prev[64] = "none";
+    HANDLE st = CreateThread(NULL, 0, spin_reader, NULL, 0, NULL);
+    while (!spin_done) YieldProcessor();
+    WaitForSingleObject(st, INFINITE);
+    CloseHandle(st);
+    printf("spin wait read %02x\n", spin_byte);
     FILE* pf = fopen("Saved\\slot.sav", "rb");
     if (pf) { prev[fread(prev, 1, sizeof prev - 1, pf)] = 0; fclose(pf); }
     printf("previous save: %s\n", prev);

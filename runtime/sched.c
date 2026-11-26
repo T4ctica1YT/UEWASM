@@ -363,17 +363,38 @@ void sched_exit_current(CPU* c, uint32_t code)
     for (;;) switch_to(&main_thread);
 }
 
+/* a spin makes no system call, so sched_tick never gives the browser its turn for it. What it waits on may need the
+   browser (a thread blocked on a file download, a timer): without the turn the download never lands and the page
+   hangs with no output. host_browser_turn is throttled, so a short spin pays one clock read */
 void rt_pause(CPU* c)
 {
     static unsigned n;
-    if ((++n & 63) == 0) sched_yield(c);
+    if ((++n & 63) == 0) { host_browser_turn(); sched_yield(c); }
 }
 /* a failed lock cmpxchg: with one thread running at a time the value can only be held by a thread that isn't running,
-   so a spin on it (games that poll a lock without pause) must let that thread run */
+   so a spin on it (games that poll a lock without pause) must let that thread run. Not every miss is a spin (UE4 reads
+   atomics with cmpxchg(p, 0, 0)), so it never waits, only takes the browser turn when one is due */
 void rt_cas_miss(CPU* c)
 {
     static unsigned n;
-    if ((++n & 3) == 0) sched_yield(c);
+    if ((++n & 3) == 0) { host_browser_turn(); sched_yield(c); }
+}
+/* lifted loops' back edges (BACKEDGE in rt.h): about every 64k iterations, what a system call does (sched_tick).
+   ?loopbudget=N switches threads every N back edges instead, ignoring the time slice: small values bring out timing
+   bugs (races) that the usual 4 ms slices rarely hit */
+int rt_loop_budget = 1 << 16;
+void rt_backedge(CPU* c)
+{
+    static int every;
+    if (!every) { every = host_query_int("loopbudget"); if (every <= 0) every = -1; }
+    if (every > 0) {
+        rt_loop_budget = every;
+        host_browser_turn();
+        sched_yield(c);
+        return;
+    }
+    rt_loop_budget = 1 << 16;
+    sched_tick(c);
 }
 CPU* sched_current_cpu(void) { return current->cpu; }
 void sched_set_prio(void) { if (!current->prio) { current->prio = 1; nprio++; } }

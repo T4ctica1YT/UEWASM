@@ -247,6 +247,10 @@ impl<'a> Func<'a> {
 
     pub fn target(&mut self, t: u64) -> String {
         if self.labels.contains(&t) {
+            // a backward jump closes a loop: count it, so a loop with no system call still yields (BACKEDGE, rt.h)
+            if t <= self.ins.ip() {
+                return format!("BACKEDGE(); goto L_{:x};", t);
+            }
             return format!("goto L_{:x};", t);
         }
         let fl = if self.c.p.func_start(t) || !self.flags_live(t) { "SPILL(); " } else { "rt_xfl = rt_flags(&F); SPILL(); " };

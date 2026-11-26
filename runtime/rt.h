@@ -388,6 +388,16 @@ void rt_fxsave(CPU* c, uint64_t a);
 void rt_fxrstor(CPU* c, uint64_t a);
 void rt_pause(CPU* c);
 void rt_cas_miss(CPU* c);
+/* every backward jump inside a lifted function counts down: with cooperative threads a loop that makes no system call
+   and polls memory another thread writes (UE3's ULinkerLoad::Tick waiting on its async read) would never let that
+   thread or the browser run. Registers stay in the function's locals across the switch; real threads need none of it */
+#ifdef UEW_THREADS
+#define BACKEDGE() ((void)0)
+#else
+extern int rt_loop_budget;
+void rt_backedge(CPU* c);
+#define BACKEDGE() (--rt_loop_budget < 0 ? rt_backedge(c) : (void)0)
+#endif
 void rt_xgetbv(CPU* c);
 uint64_t rt_crc32(uint64_t crc, uint64_t v, int bytes);
 uint64_t rt_pcmpstr(Flags* f, XMM* x0, XMM a, XMM b, int imm, int64_t la, int64_t lb, int expl, int mask);
