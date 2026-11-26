@@ -1420,7 +1420,8 @@ void rt_backtrace_n(CPU* c, const char* tag, int max)
     char line[2048];
     int k = snprintf(line, sizeof line, "[%s] stack:", tag);
     for (int i = 0; i < 8192 && n < max && k < (int)sizeof line - 24; i++) {
-        uint64_t v = LD64(sp + 8ull * i);
+        /* 32-bit games push 4-byte return addresses: 8-byte slots would pair them up and match none */
+        uint64_t v = RT_G32 ? LD32(sp + 4ull * i) : LD64(sp + 8ull * i);
         if (v >= IMAGE_LO && v < IMAGE_HI && rt_module_at(v)) { k += snprintf(line + k, sizeof line - (size_t)k, " %llx", (unsigned long long)v); n++; }
     }
     host_log("%s", line);

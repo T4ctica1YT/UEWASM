@@ -370,29 +370,34 @@ fn png_pixels(data: &[u8]) -> impl Fn(usize, usize) -> (u8, u8, u8) {
 /// headless browser and its pixels are checked
 pub fn gfx(args: &[String]) -> bool {
     let has = |k: &str| args.iter().any(|a| a == k);
-    let (d3d9, volume, mem64, srgb, debug) = (has("d3d9"), has("volume"), has("mem64"), has("srgb"), has("debug"));
-    let kits = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
-    let mut fxcs: Vec<_> = std::fs::read_dir(kits).map(|r| r.flatten().map(|e| e.path().join("x64/fxc.exe")).filter(|p| p.exists()).collect()).unwrap_or_default();
-    fxcs.sort();
-    let fxc = fxcs.into_iter().next().unwrap_or_else(|| die("fxc.exe not found (Windows SDK)"));
-    let out_dir = bin_dir(if d3d9 { "gfx9" } else if volume { "gfxvol" } else { "gfx" });
-    let name = if d3d9 { "triangle9" } else if volume { "volume" } else { "triangle" };
-    let env = msvc(if d3d9 { "x86" } else { "x64" });
-    let sm = if d3d9 { "3_0" } else { "5_0" };
-    let mut entries = vec![("VSMain", format!("vs_{sm}"), format!("{name}_vs.h")), ("PSMain", format!("ps_{sm}"), format!("{name}_ps.h"))];
-    if volume {
-        entries.extend([("GSMain", s("gs_5_0"), s("volume_gs.h")), ("VSShow", s("vs_5_0"), s("volume_showvs.h")), ("PSShow", s("ps_5_0"), s("volume_showps.h"))]);
+    let (d3d8, d3d9, volume, mem64, srgb, debug) = (has("d3d8"), has("d3d9"), has("volume"), has("mem64"), has("srgb"), has("debug"));
+    if d3d8 && (d3d9 || volume) {
+        die("gfx: d3d8 cannot be combined with d3d9 or volume");
     }
-    let hlsl = tests_dir().join(format!("gfx/{name}.hlsl"));
-    for (entry, prof, h) in &entries {
-        let o = run(Command::new(&fxc).args(["/nologo", &format!("/T{prof}"), &format!("/E{entry}"), "/Vn", &format!("g_{entry}")])
-            .arg(format!("/Fh{}", out_dir.join(h).display())).arg(&hlsl), T600);
-        if o.code != 0 {
-            die(format!("fxc failed:\n{}{}", o.stdout, o.stderr));
+    let out_dir = bin_dir(if d3d8 { "gfx8" } else if d3d9 { "gfx9" } else if volume { "gfxvol" } else { "gfx" });
+    let name = if d3d8 { "triangle8" } else if d3d9 { "triangle9" } else if volume { "volume" } else { "triangle" };
+    let env = msvc(if d3d8 || d3d9 { "x86" } else { "x64" });
+    let sm = if d3d9 { "3_0" } else { "5_0" };
+    if !d3d8 {
+        let kits = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+        let mut fxcs: Vec<_> = std::fs::read_dir(kits).map(|r| r.flatten().map(|e| e.path().join("x64/fxc.exe")).filter(|p| p.exists()).collect()).unwrap_or_default();
+        fxcs.sort();
+        let fxc = fxcs.into_iter().next().unwrap_or_else(|| die("fxc.exe not found (Windows SDK)"));
+        let mut entries = vec![("VSMain", format!("vs_{sm}"), format!("{name}_vs.h")), ("PSMain", format!("ps_{sm}"), format!("{name}_ps.h"))];
+        if volume {
+            entries.extend([("GSMain", s("gs_5_0"), s("volume_gs.h")), ("VSShow", s("vs_5_0"), s("volume_showvs.h")), ("PSShow", s("ps_5_0"), s("volume_showps.h"))]);
+        }
+        let hlsl = tests_dir().join(format!("gfx/{name}.hlsl"));
+        for (entry, prof, h) in &entries {
+            let o = run(Command::new(&fxc).args(["/nologo", &format!("/T{prof}"), &format!("/E{entry}"), "/Vn", &format!("g_{entry}")])
+                .arg(format!("/Fh{}", out_dir.join(h).display())).arg(&hlsl), T600);
+            if o.code != 0 {
+                die(format!("fxc failed:\n{}{}", o.stdout, o.stderr));
+            }
         }
     }
     let exe = out_dir.join(format!("{name}.exe"));
-    cl(&env, &[s("/nologo"), s("/O2"), s(if d3d9 { "/MT" } else { "/MD" }), s("/EHsc"), format!("/I{}", out_dir.display()), format!("/Fe:{}", exe.display()),
+    cl(&env, &[s("/nologo"), s("/O2"), s(if d3d8 || d3d9 { "/MT" } else { "/MD" }), s("/EHsc"), format!("/I{}", out_dir.display()), format!("/Fe:{}", exe.display()),
                format!("/Fo:{}\\", out_dir.display()), util::ps(&tests_dir().join(format!("gfx/{name}.cpp")))], &out_dir);
     // srgb: the same scene on an sRGB back buffer, which must reach the screen gamma-encoded like on Windows
     let extra: Vec<&str> = if srgb { vec!["srgb"] } else { vec![] };

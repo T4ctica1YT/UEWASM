@@ -1,6 +1,7 @@
 //! The build steps: recompile (uewrecomp/uewlift), the web build (uewbuild, then game files through uewpack), and
 //! the native verification build (MSVC).
 use crate::util::*;
+use uewlift::ue2::{is_ue2_system, ue2_compat_files, ue2_profile};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,20 +125,24 @@ pub fn backend(name: &str) -> Option<(&'static str, fn(&str) -> Vec<String>)> {
 /// which Unreal Engine generation an installed game is, from its folder layout
 pub fn engine_of(exe: &Path) -> Option<&'static str> {
     for top in exe.ancestors().skip(1).take(5) {
-        if !top.join("Engine").is_dir() {
-            continue;
-        }
-        if let Ok(rd) = std::fs::read_dir(top) {
-            let kids: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|d| d.is_dir() && !d.file_name().unwrap_or_default().eq_ignore_ascii_case("engine")).collect();
-            let cooked = kids.iter().any(|d| std::fs::read_dir(d).map_or(false, |r| r.flatten().any(|c| c.path().is_dir() && c.file_name().to_string_lossy().to_lowercase().starts_with("cooked"))));
-            if cooked {
-                return Some("Unreal Engine 3");
+        if top.join("Engine").is_dir() {
+            if let Ok(rd) = std::fs::read_dir(top) {
+                let kids: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|d| d.is_dir() && !d.file_name().unwrap_or_default().eq_ignore_ascii_case("engine")).collect();
+                let cooked = kids.iter().any(|d| std::fs::read_dir(d).map_or(false, |r| r.flatten().any(|c| c.path().is_dir() && c.file_name().to_string_lossy().to_lowercase().starts_with("cooked"))));
+                if cooked {
+                    return Some("Unreal Engine 3");
+                }
+                if top.join("Engine/Binaries").is_dir() || kids.iter().any(|d| d.join("Content/Paks").is_dir()) {
+                    return Some("Unreal Engine 4/5");
+                }
             }
-            if top.join("Engine/Binaries").is_dir() || kids.iter().any(|d| d.join("Content/Paks").is_dir()) {
-                return Some("Unreal Engine 4/5");
-            }
+            return Some("Unreal Engine");
         }
-        return Some("Unreal Engine");
+        // Unreal Engine 1 and 2 installs both use System/Maps/Textures; a UE2 package or renderer tells them apart
+        if top.join("System").is_dir() && (top.join("Maps").is_dir() || top.join("Textures").is_dir()
+            || top.join("System/D3DDrv.u").is_file() || top.join("System/D3D9Drv.u").is_file()) && is_ue2_system(&top.join("System")) {
+            return Some("Unreal Engine 2");
+        }
     }
     None
 }
@@ -349,14 +354,13 @@ pub fn build_wasm(out: &Path, o: &Wasm, log: Log, progress: Progress) -> Res<Pat
                 replace.push((k, v));
             }
         }
-        let mut args = vec![ps(root), ps(&web), s("--part-mb"), o.part_mb.to_string(), s("--workers"), plan.package_workers.to_string()];
-        if compress {
-            args.push(s("--compress"));
+        if let Some(profile) = ue2_profile(&root.join(exe_rel)) {
+            let bits = if profile.bits == 0 { "unknown".to_string() } else { format!("{}-bit", profile.bits) };
+            let version = profile.version.map_or_else(|| "UE2".to_string(), |v| format!("UE2 package {v}"));
+            log(&format!("[ue2] {version}, {bits}: {} renderer, {} config file(s)", profile.renderer.label(), profile.configs.len()));
+            replace.extend(ue2_compat_files(root, out, &profile, log)?);
         }
-        args.extend([s("--extra"), format!("/image.bin={}", out.join("image.bin").display())]);
-        for (rel, p) in &replace {
-            args.extend([s("--replace"), format!("{rel}={}", p.display())]);
-        }
+        let args = uewlift::pack::game_files_args(root, &web, o.part_mb, plan.package_workers, compress, &out.join("image.bin"), &replace);
         run_tool("uewpack", &args, log, progress)?;
         let stem = Path::new(exe_rel).file_stem().unwrap_or_default().to_string_lossy().to_string();
         let save = format!("/save/{}", stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect::<String>());

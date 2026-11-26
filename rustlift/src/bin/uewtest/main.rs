@@ -4,7 +4,7 @@
 //!     uewtest run [names] [--no-wasm] [--x86] [--threads coop|real] [--mem64]
 //!     uewtest isa [--wasm] [--filter X] [--trials N]
 //!     uewtest aes | net | web | sse
-//!     uewtest gfx [webgpu|webgl2] [d3d9] [volume] [srgb] [mem64] [debug]
+//!     uewtest gfx [webgpu|webgl2] [d3d8|d3d9] [volume] [srgb] [mem64] [debug]
 //!     uewtest steam-pair <web dir> [seconds]
 //!     uewtest extract-dxbc <game> <out> | extract-d3d9 <game> <out> | opcode-map <dir> [n]
 //!     uewtest wgsl-check <dir> [n] | webgl-check <dir> [n]

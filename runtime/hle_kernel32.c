@@ -307,7 +307,7 @@ size_t utf8_to_wstr(const char* s, uint64_t out, size_t cap)
 
 static const char* hle_modules[] = { "kernel32.dll", "kernelbase.dll", "ntdll.dll", "user32.dll", "gdi32.dll", "advapi32.dll",
     "ole32.dll", "oleaut32.dll", "shell32.dll", "shlwapi.dll", "ws2_32.dll", "winmm.dll", "xinput1_3.dll", "xinput1_4.dll",
-    "xinput9_1_0.dll", "d3d11.dll", "dxgi.dll", "d3d9.dll", "dsound.dll", "xaudio2_7.dll", "xaudio2_9.dll", "dbghelp.dll",
+    "xinput9_1_0.dll", "d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "dsound.dll", "xaudio2_7.dll", "xaudio2_9.dll", "dbghelp.dll",
     "version.dll", "imm32.dll", "dwmapi.dll", "setupapi.dll", "iphlpapi.dll", "winhttp.dll", "wininet.dll", "crypt32.dll",
     "bcrypt.dll", "d3dcompiler_47.dll", "dinput8.dll", "hid.dll", "psapi.dll", "powrprof.dll", "secur32.dll", "normaliz.dll",
     "steam_api64.dll", "xaudio2_9redist.dll", "x3daudio1_7.dll", "eossdk-win64-shipping.dll", "eossdk-win32-shipping.dll", NULL };

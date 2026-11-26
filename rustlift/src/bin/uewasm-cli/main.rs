@@ -18,7 +18,7 @@ use std::process::Command;
 use util::*;
 
 #[derive(Parser)]
-#[command(name = "uewasm-cli", about = "Windows x64 and x86 game recompiler for the web (Unreal Engine 3, 4 and 5)")]
+#[command(name = "uewasm-cli", about = "Windows x64 and x86 game recompiler for the web (Unreal Engine 2, 3, 4 and 5)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

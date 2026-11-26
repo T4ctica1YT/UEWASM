@@ -174,7 +174,10 @@ impl App {
             }
             Some(exe) => {
                 let mb = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0) as f64 / 1048576.0;
-                let engine = if exe.ancestors().take(5).any(|p| p.join("Engine").is_dir()) { "Unreal Engine" } else { "unknown engine" };
+                let ancestry = || exe.ancestors().take(5);
+                let engine = if ancestry().any(|p| p.join("Engine").is_dir()) { "Unreal Engine" }
+                    else if ancestry().any(|p| p.join("System").is_dir() && (p.join("Maps").is_dir() || p.join("Textures").is_dir())) { "Unreal Engine 2" }
+                    else { "unknown engine" };
                 self.info = format!("{} · {:.0} MB · {}", exe.file_name().unwrap_or_default().to_string_lossy(), mb, engine);
                 if self.s.out.trim().is_empty() {
                     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());

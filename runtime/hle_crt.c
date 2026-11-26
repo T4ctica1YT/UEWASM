@@ -51,7 +51,7 @@ void hle_missing(CPU* c, const Thunk* e)
     /* answer the way a missing feature would: COM-style libraries return an HRESULT (E_NOTIMPL, so callers don't
        mistake 0 for S_OK and use a null object), XInput reports no pad, everything else FALSE/NULL with the error set */
     static const char* com_dlls[] = { "mfplat", "mfreadwrite", "mf.dll", "ole32", "combase", "oleaut32", "d2d1", "dwrite", "windowscodecs",
-                                      "d3d9", "d3d10", "d3d12", "dxgi", "d3dcompiler", "dsound", "xaudio2", "mmdevapi", "propsys",
+                                      "d3d9", "d3d8", "d3d10", "d3d12", "dxgi", "d3dcompiler", "dsound", "xaudio2", "mmdevapi", "propsys",
                                       "uiautomationcore", "api-ms-win-core-winrt", "dcomp", "dxva2", "evr", "dxcore", 0 };
     char dll[64];
     size_t n = 0;

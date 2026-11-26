@@ -17,8 +17,8 @@ problem leaves a line in the log that names its cause.
 
 ## How rendering works here
 
-The game still thinks it talks to Direct3D 11 (or Direct3D 9: 32-bit Unreal Engine 3 games, see
-[Direct3D 9 games](#direct3d-9-games-unreal-engine-3)). UEWASM's runtime takes each D3D11 call and replays it on
+The game still thinks it talks to Direct3D 11 (or Direct3D 9: Unreal Engine 2 and 32-bit Unreal Engine 3 games, see
+[Direct3D 9 games](#direct3d-9-games-unreal-engine-2-and-3)). UEWASM's runtime takes each D3D11 call and replays it on
 **WebGPU** (`runtime/gpu_wgpu.c`, `runtime/web/uew_webgpu.js`), or on **WebGL 2** (`runtime/gpu_web.c`) when
 WebGPU isn't available. The game's shaders are DXBC bytecode, and the runtime translates each one to WGSL
 (`runtime/dxbc_wgsl.c`) the first time it's used. The browser then compiles the WGSL into a pipeline in the background.
@@ -356,6 +356,7 @@ Where things live:
    ```
    uewtest gfx webgpu        # D3D11 triangle, checked per pixel in a headless browser
    uewtest gfx webgpu srgb   # the same on an sRGB swap chain
+   uewtest gfx webgpu d3d8   # D3D8 fixed-function triangle through the compatibility layer
    uewtest gfx webgl2
    ```
 
@@ -376,18 +377,61 @@ belongs in `dxbc_wgsl.c`, not in the game.
 
 ---
 
-## Direct3D 9 games (Unreal Engine 3)
+## Direct3D 9 games (Unreal Engine 2 and 3)
 
 32-bit Unreal Engine 3 games (Dishonored, for one) render through Direct3D 9: `runtime/d3d9.c` maps it onto the same
 WebGPU backend, and `runtime/d3d9_wgsl.c` translates their Shader Model 2/3 shaders. Everything above applies, plus a
 few D3D9 specifics. 64-bit UE3 games such as Rocket League use Direct3D 11 like UE4 games, so only the sections
 above apply to them.
 
+Unreal Engine 2's 64-bit UT2004 Direct3D 9 renderer can run without shaders, so `d3d9.c` also generates a
+fixed-function vertex/pixel pair from `SetTransform`, the FVF code or vertex declaration, the material and the
+`SetTextureStageState` state (up to eight stages). D3D9 supports the generated pair like any game shader, which
+means the same translator and backend diagnostics apply. The first such draw logs
+`[d3d9] fixed-function pipeline: generated vertex/pixel shaders …`. The pipeline covers world/view/projection
+transforms, `XYZRHW` vertices, texture-coordinate selection, the common colour/alpha operations, material diffuse,
+texture factor and stage constants. Fixed-function lighting/vertex normals, hardware skinning, texture-coordinate
+generation/transforms, cube/volume texture stages, point sprites and fog are not emulated.
+
+The build prepares this path automatically for UE2 installs: it detects 32-bit versus 64-bit, chooses the available
+D3D8 or D3D9 renderer, and writes the fixed-function settings into copies of every `System/*.ini` with an
+`[Engine.Engine]` section. Configs are patched as bytes, preserving ANSI/Windows-1252 text and the original line
+endings. The original game files stay untouched. Manual edits are only a fallback for a custom launcher or a config
+the automatic pass cannot identify.
+
+### The Direct3D 8 path (32-bit Unreal Engine 2)
+
+32-bit UT2004, Unreal II and Deus Ex: Invisible War use the Direct3D 8 renderer (`D3DDrv.D3DRenderDevice`,
+`d3d8.dll`). `runtime/d3d8.c` implements `IDirect3D8`, `IDirect3DDevice8`, the resource interfaces and
+`IDirect3DSwapChain8` as wrappers around the D3D9 objects in `d3d9.c`; each method calls the corresponding D3D9
+HLE method with a synthetic CPU frame. The differences that matter are translated there:
+
+- D3D8 `D3DPRESENT_PARAMETERS` (no `MultiSampleQuality`) to D3D9's;
+- D3D8 `D3DCAPS8` (shader versions reported as zero, so the renderer stays on fixed function);
+- D3D8 texture-stage sampler states (13-22 and 25) to D3D9 sampler states, and `COLORARG0`/`ALPHAARG0`/`RESULTARG`
+  (26-28) to their D3D9 stage-state numbers;
+- D3D8 surface/volume descriptors to the D3D9 layouts;
+- `SetRenderTarget(renderTarget, depthStencil)` to D3D9's separate render-target and depth-stencil calls;
+- D3D8 `SetIndices(indexBuffer, baseVertex)` and `DrawIndexedPrimitive` (which has no separate base-vertex
+  argument) to D3D9's indexed path;
+- declaration-only vertex shaders (`CreateVertexShader` with a NULL function) by converting the D3D8 declaration
+  tokens to a D3D9 vertex declaration. Real D3D8 shader bytecode is passed to the D3D9 shader translator; the
+  no-shader caps make the fixed-function path the normal one.
+
+D3D8's fixed-function calls (`SetTransform`, FVF/declarations, `SetMaterial`, `SetTextureStageState`, draws) reach
+the same generated shaders, so the diagnostics above apply. Starting a D3D8 game logs
+`[d3d8] Direct3D 8 compatibility layer ready (D3D9 fixed-function backend)`. D3D8 point sprites, patches,
+state blocks and palettes are accepted but not emulated; the same lighting/skinning/texture-stage limitations as
+the D3D9 fixed-function path apply.
+
 | Symptom | Cause | What to do |
 |---|---|---|
-| `[d3d9] fixed-function draw skipped` in the log | The game drew without a vertex or pixel shader; fixed-function pipelines aren't emulated | Report it; UE3 itself always uses shaders |
+| `[d3d9] fixed-function pipeline: generated vertex/pixel shaders …` | The game drew without shaders, so the fixed-function path is active | Expected for UE2 on its fixed-function path; include the surrounding draw log with UE2 bug reports |
+| `[d3d9] generated fixed-function … shader is invalid: …` | The generated shader failed the D3D9→WGSL translator | A generator bug; report the log line and the game's vertex declaration/texture stage state |
+| `[d3d9] draw skipped: fixed-function and shader stages cannot be mixed` | A draw bound only one of a vertex or pixel shader | UE2 normally binds neither; report the game and the draw |
 | `[d3d9] CreateTexture: format N not supported` | A D3D9 format with no mapping in `FMTS[]` in `d3d9.c` | Add the format there (with a CPU conversion if WebGPU has no equivalent) |
 | `[d3d9] depth buffer WxH doesn't match render target` | D3D9 allows a larger depth buffer than the colour target; WebGPU doesn't | Those draws run without depth. A real fix is to give such passes a matching depth buffer |
+| `[d3d8] Direct3D 8 compatibility layer ready …` | A 32-bit UE2 game created a D3D8 device through the forwarding layer | Expected; the draws then appear as `[d3d9] fixed-function pipeline` diagnostics |
 | Everything offset by half a pixel, blurry UI | The half-pixel offset in the vertex shader (`D3D9_CB_EXTRA`) isn't being updated with the viewport | Check `set_cb_extra()` runs after `SetViewport`/`SetRenderTarget` |
 | Cut-out foliage or text fully missing | Alpha test: D3D9 applies it after the pixel shader; here it's emulated from `D3DRS_ALPHATESTENABLE/ALPHAFUNC/ALPHAREF` | Check those render states reach `set_cb_extra()` |
 | Shadows missing | Depth formats are reported as not usable as textures, so UE3 falls back to colour (R32F) shadow maps | Expected; hardware shadow maps (INTZ/D24 sampling) aren't implemented |
@@ -395,7 +439,8 @@ above apply to them.
 `?d3d9trace=<frame>` logs every draw of that frame (counted in presents) as the game issued it: its textures
 (D3D9 format, size, sampler addressing), blend states, the bound depth-stencil surface with the stencil and colour
 write states, the first pixel and vertex shader constants (`pc0`, `pc6`, `pc7`, `vc0`-`vc3`, `vc6`-`vc13`), and each
-shader once as translated to WGSL. To pick the frame while the game runs (a menu reached by hand), call
+shader once as translated to WGSL. Draws on the fixed-function path have no game shader to dump; the
+`[d3d9] fixed-function pipeline` line shows that path is active. To pick the frame while the game runs (a menu reached by hand), call
 `Module._uew_d3d9_trace()` from the page's console instead: it traces the next frame. Use it when a
 frame capture shows a draw doing something wrong, to tell a translation bug (the game asked for something else) from
 what the game really submitted. With Scaleform UIs, `pc6`/`pc7` are the colour transform (multiply, add) and

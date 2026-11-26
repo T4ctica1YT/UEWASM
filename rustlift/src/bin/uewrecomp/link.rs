@@ -46,7 +46,7 @@ pub fn skip_dlls() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"(?i)(libcef|chrome_elf|libegl|libglesv2|d3dcompiler|gfsdk_aftermath|winpixeventruntime|dxgi|d3d1\d|steam_api|nvtt|embree|tbb|libsndfile|ue4prereq|crashreport|unrealcefsubprocess|steamvr|openvr|oculus|libovr|xaudio2_\d|openimagedenoise|gfnruntimesdk|dbghelp|nvngx|^sl\.|libxess|libxell|amd_fidelityfx|ffx_|directml|crashpad|msquic|nvlowlatency|reflex|^api-ms-win-|^ext-ms-win-|^xinput[0-9]|^x3daudio|beclient|easyanticheat|gfesdk|^dsetup|^d3dx9_|^steamapiupdater|^cudart|^wxmsw|^eossdk-)",
+            r"(?i)(libcef|chrome_elf|libegl|libglesv2|d3dcompiler|gfsdk_aftermath|winpixeventruntime|dxgi|d3d1\d|d3d8|steam_api|nvtt|embree|tbb|libsndfile|ue4prereq|crashreport|unrealcefsubprocess|steamvr|openvr|oculus|libovr|xaudio2_\d|openimagedenoise|gfnruntimesdk|dbghelp|nvngx|^sl\.|libxess|libxell|amd_fidelityfx|ffx_|directml|crashpad|msquic|nvlowlatency|reflex|^api-ms-win-|^ext-ms-win-|^xinput[0-9]|^x3daudio|beclient|easyanticheat|gfesdk|^dsetup|^d3dx9_|^steamapiupdater|^cudart|^wxmsw|^eossdk-)",
         )
         .unwrap()
     })
@@ -109,10 +109,15 @@ pub fn game_dlls(exe: &Path, real_eos: bool) -> (PathBuf, Vec<PathBuf>) {
         b => b,
     };
     let mut root = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut found_engine = false;
+    let mut found_install = false;
     for _ in 0..4 {
-        if root.join("Engine").is_dir() {
-            found_engine = true;
+        // UE3/4/5 keep Engine at the install root; UE1/2 keep System with Maps/Textures beside it. The executable
+        // itself lives in System for UE2, so walking up from its parent is what gets the whole install (not just System).
+        if root.join("Engine").is_dir()
+            || (root.join("System").is_dir() && (root.join("Maps").is_dir() || root.join("Textures").is_dir()
+                || root.join("System/D3DDrv.u").is_file() || root.join("System/D3D9Drv.u").is_file()))
+        {
+            found_install = true;
             break;
         }
         match root.parent() {
@@ -120,7 +125,7 @@ pub fn game_dlls(exe: &Path, real_eos: bool) -> (PathBuf, Vec<PathBuf>) {
             None => break,
         }
     }
-    if !found_engine {
+    if !found_install {
         root = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     }
     let editor = Regex::new(r"(?i)^(UE4|Unreal)Editor").unwrap();
@@ -159,6 +164,28 @@ pub fn game_dlls(exe: &Path, real_eos: bool) -> (PathBuf, Vec<PathBuf>) {
 fn apiset(name: &str) -> String {
     let n = name.to_lowercase();
     if n.starts_with("api-ms-win-crt-") { "ucrtbase.dll".into() } else { n }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ue2_executable_uses_the_install_root_not_system() {
+        let root = std::env::temp_dir().join(format!("uewasm-root-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("System")).unwrap();
+        std::fs::create_dir_all(root.join("Maps")).unwrap();
+        let exe = root.join("System/game.exe");
+        let mut d = vec![0u8; 4096];
+        d[..2].copy_from_slice(b"MZ");
+        d[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x58..0x5a].copy_from_slice(&0x010bu16.to_le_bytes());
+        std::fs::write(&exe, d).unwrap();
+        let (found, _) = game_dlls(&exe, false);
+        assert_eq!(found, root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 pub struct Module {

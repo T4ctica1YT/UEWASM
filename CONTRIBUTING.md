@@ -96,10 +96,11 @@ All of them compare against native Windows. Run the ones that match the change:
 |---|---|
 | lifter (`rustlift/src/`) | `uewtest isa --wasm`, `uewtest run` (also `--threads real`), `uewtest aes` |
 | runtime, kernel32, files, threads | `uewtest run`, `uewtest web` |
-| Direct3D, shaders, WebGPU | `uewtest gfx webgpu` (also `srgb`, `d3d9`, `volume`) |
+| Direct3D, shaders, WebGPU | `uewtest gfx webgpu` (also `srgb`, `d3d9`, `d3d8`, `volume`) |
 | networking, TLS, crypto | `uewtest net`, `uewtest aes` |
 | Steam | `uewtest steam-pair <web build>` |
 | the SteamStub decryptor | `cargo test --release --manifest-path rustlift/Cargo.toml --bin uewrecomp` |
+| UE2 install detection and ANSI/Windows-1252 config patching | `cargo test --release --manifest-path rustlift/Cargo.toml --lib`, `cargo test --release --manifest-path rustlift/Cargo.toml --test ue2_e2e` |
 
 Then check a real game or two still boots and renders as before. For performance changes, measure frame rate before
 and after ([docs/PERFORMANCE.md](docs/PERFORMANCE.md) shows how to simulate a slow laptop). Results vary from run to

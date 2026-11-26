@@ -9,7 +9,7 @@
   <br>
 </h1>
 
-<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 3, 4 and 5 built games into WebAssembly (.wasm)
+<h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 2, 3, 4 and 5 built games into WebAssembly (.wasm)
 </h4>
 
 </p>
@@ -17,8 +17,11 @@
 UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssembly project.
 This tool **doesn't enable piracy on its own**, and any games redistributed with this tool are 
 **responsibility of the distributer, not T4ctica1 or zay, nor anyone afiliated with this project**. As of today this tool supports games made 
-in Unreal Engine 3, 4 and 5. Unreal Engine 3 games run both as 32-bit Direct3D 9 titles (Dishonored) and as 64-bit
-Direct3D 11 titles (Rocket League): see the status table and [Unreal Engine 3 games](#unreal-engine-3-games).
+in Unreal Engine 2, 3, 4 and 5. Unreal Engine 2 support is experimental and covers both UT2004 renderers: the 64-bit
+Direct3D 9 path and the 32-bit Direct3D 8 path (also used by Unreal II and Deus Ex: Invisible War): see
+[Unreal Engine 2 games](#unreal-engine-2-games). Unreal Engine 3 games run both as 32-bit Direct3D 9
+titles (Dishonored) and as 64-bit Direct3D 11 titles (Rocket League): see the status table and
+[Unreal Engine 3 games](#unreal-engine-3-games).
 <br>
 
 > [AI Use Disclosure]
@@ -53,9 +56,14 @@ release ships them.
    - green threads with Windows synchronisation semantics (events, mutexes, critical sections, SRW locks,
      condition variables, WaitOnAddress), scheduled cooperatively on one browser thread via JSPI, or spread over
      several cores with `--threads real`;
-   - Direct3D 9 on the same backend (`d3d9.c`, Unreal Engine 3 era games): D3D9 shader bytecode (Shader Model 2/3) is
+   - Direct3D 9 on the same backend (`d3d9.c`, Unreal Engine 2/3 era games): D3D9 shader bytecode (Shader Model 2/3) is
      translated to WGSL by `d3d9_wgsl.c`, render and sampler state become cached state objects, and the parts of the
-     fixed pipeline shaders rely on (alpha test, half-pixel offset, partial clears, scaled StretchRect) are emulated;
+     fixed pipeline shaders rely on (alpha test, half-pixel offset, partial clears, scaled StretchRect) are emulated.
+     When a game draws without shaders, the fixed-function pipeline is generated as a vs_3_0/ps_3_0 pair from its
+     transforms, vertex declaration and texture stage state (Unreal Engine 2's D3D9 renderer);
+   - Direct3D 8 (`d3d8.c`, the 32-bit Unreal Engine 2 renderers) as a compatibility layer over the D3D9 objects:
+     D3D8 devices, textures, buffers, shader declarations and draws are translated to their D3D9 calls, and the same
+     generated fixed-function pipeline renders them;
    - Direct3D 11/DXGI on WebGPU: DXBC shaders are translated to WGSL (`dxbc_wgsl.c`), including geometry shaders
      (emulated with compute), typed buffers read and written in their real formats, UAV-only passes, background
      pipeline compilation and GPU timestamp queries;
@@ -120,6 +128,9 @@ Here are the games used for Testing and some screenshots of the tool working
 | Rocket League | ✅ Works (menus and offline matches, with readable UI text; needs about 7 GB of game memory, `--mem64`) | - | UE 3 (64-bit, D3D11) | PR 0.1.4 |
 | Meccha Chameleon | ✅ Works (menus, cloud save, hosting a lobby and playing in it; EOS and Steam stand-ins) | ~35 FPS | UE 5 | Unreleased (after 0.1.4) |
 | Dishonored | ➖ Reaches the title screen and main menu with keyboard input (`--threads real`, offline Steam); gameplay not reached yet | - | UE 3 (32-bit, D3D9) | PR 0.1.4 |
+
+Unreal Engine 2 is not in this table yet: the 64-bit UT2004 D3D9 path and the 32-bit D3D8 path are implemented
+but have not been verified against a retail build. See [Unreal Engine 2 games](#unreal-engine-2-games).
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -343,6 +354,7 @@ uewtest run --mem64          # the same with 64-bit memory and 5 GB of guest mem
 uewtest gfx webgpu           # D3D11 triangle rendered in a headless browser, checked per pixel (or webgl2)
 uewtest gfx webgpu srgb      # the same on an sRGB swap chain (must not come out darker)
 uewtest gfx webgpu d3d9      # the Direct3D 9 version (32-bit, Shader Model 3)
+uewtest gfx webgpu d3d8      # the Direct3D 8 version (32-bit fixed function: texture, buffers, declaration, draw)
 uewtest isa --wasm           # ~1200 instruction forms on random inputs: real CPU vs recompiled, bit-exact
 uewtest web                  # game files over HTTP (raw and deflated, with and without Range) and saved progress
 uewtest net                  # real TCP, UDP, HTTPS (Schannel, libcurl-style checks, a full download) and hashing through WISP vs native
@@ -351,10 +363,83 @@ uewtest sse                  # SIMD versions of the SSE helpers against their sc
 uewtest steam-pair <web build of tests/steam/steamtest.cpp>   # two players: lobby, chat, P2P (WebWorks server, or the relay with --relay)
 uewtest extract-d3d9 "C:/Games/SomeUE3Game" tests/bin/shaders9   # a UE3 game's D3D9 shaders, for wgsl_dump/wgsl-check
 cargo test --release --manifest-path rustlift/Cargo.toml --bin uewrecomp   # the SteamStub AES against FIPS-197
+cargo test --release --manifest-path rustlift/Cargo.toml --lib              # UE2 detection and ANSI/Windows-1252 INI patching
+cargo test --release --manifest-path rustlift/Cargo.toml --test ue2_e2e     # synthetic UE2 install through root discovery, patching and packaging
 ```
 
 `uewtest` is in `rustlift/target/release/`. The browser tests drive an installed Edge or Chrome headless over the
 DevTools protocol (`UEWASM_BROWSER` points at another Chromium browser), muted.
+
+## Unreal Engine 2 games
+
+Unreal Engine 2 support is **experimental** and covers both retail renderer paths:
+
+- **64-bit UT2004** uses Direct3D 9 (`D3D9Drv.D3D9RenderDevice`) and the D3D9 HLE in `runtime/d3d9.c`;
+- **32-bit UT2004, Unreal II and Deus Ex: Invisible War** use Direct3D 8 (`D3DDrv.D3DRenderDevice`, `d3d8.dll`).
+  `runtime/d3d8.c` implements the D3D8 COM interfaces as a forwarding layer over the D3D9 objects, translating the
+  D3D8 presentation parameters, descriptors, sampler states, render states, and the D3D8 draw/stream calling
+  conventions. The same D3D9 fixed-function shaders render the draws.
+
+Build the install folder like any other game; the tool recognises the `System`/`Maps`/`Textures` layout and shows
+**Unreal Engine 2** in the app. It also reads the executable's PE bitness and the renderer packages under `System`
+(UE1 installs also ship a `D3DDrv.u`, so `Engine.u`'s package version, 90 and up for UE2, decides whether an install
+counts as UE2):
+
+- 32-bit installs use the D3D8 compatibility layer when they ship `D3DDrv.u`, or D3D9 when that is the only renderer;
+- 64-bit installs use the D3D9 renderer;
+- every `System/*.ini` with an `[Engine.Engine]` section is copied into the build with `RenderDevice` set to that
+  renderer and the renderer section forced to `UseHardwareTL=True`, `UseHardwareVS=False` and
+  `MaxPixelShaderVersion=0`. The config is patched as bytes, so ANSI/Windows-1252 text and the original line endings
+  are preserved.
+
+The original game folder is never changed. This means the manual INI edits below are no longer needed for a normal
+build; they remain useful only when a game has a custom launcher or a config the automatic pass cannot identify.
+
+`runtime/d3d9.c` emulates fixed-function vertex and pixel processing when the game binds no shaders, then sends
+the generated `vs_3_0`/`ps_3_0` pair through the same D3D9→WGSL translator as game shaders. It covers:
+
+- `SetTransform`, `GetTransform` and `MultiplyTransform` for view, projection and world matrices (texture matrices are stored, but texture-coordinate transforms are not applied yet);
+- FVF codes and vertex declarations, including `XYZRHW` screen-space vertices, colour and up to eight texture
+  coordinates;
+- up to eight texture stages with the common colour and alpha operations (select, modulate, add, subtract,
+  add-signed, multiply-add, lerp, `dp3`), texture-coordinate selection, material diffuse, texture factor and
+  per-stage constants;
+- the existing alpha test, render state, sampler state, blending, depth/stencil and scissor handling.
+
+The automatic pass replaces these values. If a custom launcher bypasses `System/*.ini`, force the 64-bit UT2004
+client onto the fixed-function path in `System/ut2004-win64.ini`:
+
+```ini
+[Engine.Engine]
+RenderDevice=D3D9Drv.D3D9RenderDevice
+
+[D3D9Drv.D3D9RenderDevice]
+UseHardwareTL=True
+UseHardwareVS=False
+MaxPixelShaderVersion=0
+```
+
+For 32-bit UT2004 (and the other D3D8 UE2 titles) do the same in `System/UT2004.ini`:
+
+```ini
+[Engine.Engine]
+RenderDevice=D3DDrv.D3DRenderDevice
+
+[D3DDrv.D3DRenderDevice]
+UseHardwareTL=True
+UseHardwareVS=False
+MaxPixelShaderVersion=0
+```
+
+The D3D8 layer advertises no vertex or pixel shader versions in `D3DCAPS8`, so the renderer stays on its
+fixed-function path even if the ini still asks for shaders. The first fixed-function draw logs
+`[d3d9] fixed-function pipeline: generated vertex/pixel shaders …`; starting a 32-bit game also logs
+`[d3d8] Direct3D 8 compatibility layer ready`. If neither line appears, the game did not create a D3D8/D3D9 device.
+
+Not implemented yet: fixed-function lighting and vertex normals, hardware skinning (`XYZB` blend weights),
+texture-coordinate generation and texture transforms, cube/volume texture stages, point sprites, and fog. Those
+effects can look wrong or be skipped, but they should not crash. No retail UE2 build has been used to verify
+these paths yet, so include a saved log with any UE2 bug report.
 
 ## Unreal Engine 3 games
 
@@ -389,10 +474,13 @@ so there is no separate mode to pick. What differs:
 - Shaders compile the first time an effect appears, which can cause short stutters on a first run; browsers cache
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
-- Unreal Engine 3 support is the newest: Rocket League plays offline matches and Dishonored reaches its main menu.
-  Other UE3 games haven't been tried and may stop at a call nothing tested has needed yet. The Direct3D 9 layer has no
-  fixed-function pipeline (shader-based engines like UE3 don't need it) and no hardware shadow maps, so UE3 falls back
-  to its colour shadow maps.
+- Unreal Engine 2 support is experimental: the 64-bit Direct3D 9 fixed-function path and the 32-bit Direct3D 8
+  compatibility layer are implemented but have not been verified against a retail build. Fixed-function lighting
+  and vertex normals, hardware skinning, texture-coordinate generation/transforms, cube/volume texture stages,
+  point sprites and fog are not supported yet.
+- Unreal Engine 3 support: Rocket League plays offline matches and Dishonored reaches its main menu. Other UE3 games
+  haven't been tried and may stop at a call nothing tested has needed yet. The Direct3D 9 layer has no hardware shadow
+  maps, so UE3 falls back to its colour shadow maps.
 - Unreal Engine 5 support is newer than UE4: tested UE5 games reach their menus and gameplay, but they run slower
   than UE4 titles and the first visit to each area stutters while shaders compile.
 - Executables encrypted or packed by anti-tamper protection can't be recompiled.

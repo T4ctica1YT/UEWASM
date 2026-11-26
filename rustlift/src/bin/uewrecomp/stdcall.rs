@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 const FALLBACK: &[&str] = &[
     "kernelbase.dll", "kernel32.dll", "ntdll.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "sechost.dll", "combase.dll", "ole32.dll",
     "oleaut32.dll", "shell32.dll", "shlwapi.dll", "ws2_32.dll", "winmm.dll", "wininet.dll", "version.dll", "dbghelp.dll", "comdlg32.dll",
-    "comctl32.dll", "gdiplus.dll", "imm32.dll", "setupapi.dll", "dsound.dll", "dinput8.dll", "xinput1_4.dll", "d3d9.dll", "dwmapi.dll",
+    "comctl32.dll", "gdiplus.dll", "imm32.dll", "setupapi.dll", "dsound.dll", "dinput8.dll", "xinput1_4.dll", "d3d9.dll", "d3d8.dll", "dwmapi.dll",
     "winhttp.dll", "iphlpapi.dll", "crypt32.dll", "bcrypt.dll", "uxtheme.dll", "shcore.dll", "powrprof.dll", "psapi.dll", "dxgi.dll",
     "d3d11.dll", "hid.dll", "cfgmgr32.dll", "msacm32.dll", "avrt.dll", "mmdevapi.dll", "propsys.dll", "userenv.dll", "secur32.dll",
     "wtsapi32.dll", "ucrtbase.dll",
@@ -29,7 +29,7 @@ const CDECL_FUNCS: &[&str] = &[
 /// filled in at run time, noreturn calls, DLLs that aren't in SysWOW64 (CUDA, XAudio2 2.8+, Media Foundation on N
 /// editions), and cdecl libraries that don't look like one by name
 const KNOWN: &[(&str, u32)] = &[
-    ("DefWindowProcA", 16), ("DefWindowProcW", 16), ("DebugBreak", 0), ("ExitThread", 4), ("FreeLibraryAndExitThread", 8),
+    ("DefWindowProcA", 16), ("DefWindowProcW", 16), ("DebugBreak", 0), ("DebugSetMute", 0), ("Direct3DCreate8", 4), ("D3D8GetSWInfo", 0), ("ValidateVertexShader", 20), ("ValidatePixelShader", 16), ("ExitThread", 4), ("FreeLibraryAndExitThread", 8),
     ("GetWindowLongPtrA", 8), ("GetWindowLongPtrW", 8), ("SetWindowLongPtrA", 12), ("SetWindowLongPtrW", 12), ("GetClassLongPtrA", 8),
     ("GetClassLongPtrW", 8), ("SetClassLongPtrA", 12), ("SetClassLongPtrW", 12), ("AlphaBlend", 44), ("TransparentBlt", 44),
     ("RpcStringFreeA", 4), ("RpcStringFreeW", 4), ("UuidCreate", 4), ("UuidCreateNil", 4), ("UuidCreateSequential", 4), ("UuidToStringA", 8),
