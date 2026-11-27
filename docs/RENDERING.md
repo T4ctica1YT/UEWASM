@@ -388,10 +388,20 @@ Unreal Engine 2's 64-bit UT2004 Direct3D 9 renderer can run without shaders, so 
 fixed-function vertex/pixel pair from `SetTransform`, the FVF code or vertex declaration, the material and the
 `SetTextureStageState` state (up to eight stages). D3D9 supports the generated pair like any game shader, which
 means the same translator and backend diagnostics apply. The first such draw logs
-`[d3d9] fixed-function pipeline: generated vertex/pixel shaders …`. The pipeline covers world/view/projection
-transforms, `XYZRHW` vertices, texture-coordinate selection, the common colour/alpha operations, material diffuse,
-texture factor and stage constants. Fixed-function lighting/vertex normals, hardware skinning, texture-coordinate
-generation/transforms, cube/volume texture stages, point sprites and fog are not emulated.
+`[d3d9] fixed-function pipeline: generated vertex/pixel shaders …`. The generator lives in `d3d9_ffp.c` and its
+constants are laid out in `d3d9_ffp.h`; the device keeps separate fixed-function constant buffers, so its state never
+overwrites a game shader's constants. The pipeline covers world/view/projection transforms and the
+`D3DTS_WORLDMATRIX` palette, `XYZRHW` vertices, `XYZB1`-`XYZB5` blend weights, hardware vertex blending of positions
+and normals (96 matrices), up to eight directional/point/spot lights with material sources, local viewer, specular
+and attenuation, texture-coordinate generation (camera-space normal, position, reflection, sphere map) and transforms
+(including projected), 2D/cube/volume texture stages, the common colour/alpha operations, material diffuse, texture
+factor, stage constants, vertex fog (linear, exponential, exponential squared, range and radial), six user clip
+planes, and point sprites. WebGPU has no point-list topology, so a point-sprite draw is transformed and expanded on
+the CPU into screen-aligned quads; those quads keep the point's colour and texture coordinates but have no per-pixel
+lighting. Clip planes are tested per pixel with `texkill` against the world position rather than clipping geometry.
+Shaders are cached by the shape of the declaration and state, so changing a light's position or a matrix only updates
+constants. RT patches (`D3DRS_PATCHEDGES`), paletted textures, state blocks and software vertex processing are not
+emulated.
 
 The build prepares this path automatically for UE2 installs: it detects 32-bit versus 64-bit, chooses the available
 D3D8 or D3D9 renderer, and writes the fixed-function settings into copies of every `System/*.ini` with an
@@ -420,15 +430,16 @@ HLE method with a synthetic CPU frame. The differences that matter are translate
 
 D3D8's fixed-function calls (`SetTransform`, FVF/declarations, `SetMaterial`, `SetTextureStageState`, draws) reach
 the same generated shaders, so the diagnostics above apply. Starting a D3D8 game logs
-`[d3d8] Direct3D 8 compatibility layer ready (D3D9 fixed-function backend)`. D3D8 point sprites, patches,
-state blocks and palettes are accepted but not emulated; the same lighting/skinning/texture-stage limitations as
-the D3D9 fixed-function path apply.
+`[d3d8] Direct3D 8 compatibility layer ready (D3D9 fixed-function backend)`. D3D8 lights, clip planes, blend
+weights and point sprites reach the same D3D9 fixed-function pipeline, so its diagnostics apply; D3D8 patches,
+palettes and state blocks are accepted but not emulated.
 
 | Symptom | Cause | What to do |
 |---|---|---|
 | `[d3d9] fixed-function pipeline: generated vertex/pixel shaders …` | The game drew without shaders, so the fixed-function path is active | Expected for UE2 on its fixed-function path; include the surrounding draw log with UE2 bug reports |
 | `[d3d9] generated fixed-function … shader is invalid: …` | The generated shader failed the D3D9→WGSL translator | A generator bug; report the log line and the game's vertex declaration/texture stage state |
 | `[d3d9] draw skipped: fixed-function and shader stages cannot be mixed` | A draw bound only one of a vertex or pixel shader | UE2 normally binds neither; report the game and the draw |
+| `[d3d9] point-list draw skipped: D3DRS_POINTSPRITEENABLE is off` | A D3D9 point-list draw without point sprites; WebGPU has no point-list topology | Expected; point sprites are expanded into quads, plain points cannot be drawn |
 | `[d3d9] CreateTexture: format N not supported` | A D3D9 format with no mapping in `FMTS[]` in `d3d9.c` | Add the format there (with a CPU conversion if WebGPU has no equivalent) |
 | `[d3d9] depth buffer WxH doesn't match render target` | D3D9 allows a larger depth buffer than the colour target; WebGPU doesn't | Those draws run without depth. A real fix is to give such passes a matching depth buffer |
 | `[d3d8] Direct3D 8 compatibility layer ready …` | A 32-bit UE2 game created a D3D8 device through the forwarding layer | Expected; the draws then appear as `[d3d9] fixed-function pipeline` diagnostics |

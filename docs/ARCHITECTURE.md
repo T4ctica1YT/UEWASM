@@ -62,7 +62,7 @@ in `runtime/*.c` by scanning the source, so adding one is enough to bind it. Arg
 | `hle_kernel32.c`, `hle_file.c`, `hle_sync.c`, `hle_process.c`, `hle_misc.c`, `hle_more.c`, `hle_extra.c`, `hle_compat.c` | kernel32 and friends: memory, files, mappings, synchronisation, processes |
 | `hle_user32.c`, `hle_win32.c` | windows, messages, input |
 | `hle_crt.c` | C runtime functions the runtime serves directly |
-| `d3d11.c`, `d3d9.c`, `d3d8.c`, `gpu_wgpu.c`, `dxbc*.c`, `d3d9_wgsl.c` | Direct3D 11/9 on WebGPU, with DXBC and D3D9 shaders translated to WGSL; `d3d9.c` generates fixed-function vertex/pixel shaders for Unreal Engine 2 draws that bind none, and `d3d8.c` forwards 32-bit UE2's Direct3D 8 calls to those D3D9 objects |
+| `d3d11.c`, `d3d9.c`, `d3d8.c`, `d3d9_ffp.c`, `gpu_wgpu.c`, `dxbc*.c`, `d3d9_wgsl.c` | Direct3D 11/9 on WebGPU, with DXBC and D3D9 shaders translated to WGSL; for Unreal Engine 2 draws that bind no shaders, `d3d9_ffp.c` generates the fixed-function vertex/pixel pair (transforms, lighting, skinning, texture-coordinate generation, fog, clip planes) that `d3d9.c` feeds with constants, and `d3d8.c` forwards 32-bit UE2's Direct3D 8 calls to those D3D9 objects |
 | `hle_xaudio.c`, `hle_dsound.c`, `hle_vorbis.c`, `hle_vpx.c` | audio and video |
 | `hle_net.c`, `hle_inet.c`, `hle_schannel.c`, `hle_certstore.c`, `hle_crypto.c` | Winsock, WinINet, TLS, certificates, CryptoAPI and CNG |
 | `hle_steam.c`, `hle_eos.c`, `hle_platform.c` | Steam, Epic Online Services, platform glue (see [ONLINE.md](ONLINE.md)) |

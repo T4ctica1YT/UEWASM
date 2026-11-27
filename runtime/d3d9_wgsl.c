@@ -796,7 +796,7 @@ int d3d9_to_wgsl(const uint8_t* code, size_t size, const DxWgslOpts* opt, DxWgsl
                 for (int j = 0; j < 4; j++) lit(x[j], sizeof x[j], t->cval[k][j]);
                 sp(&w, "        case %d: { return vec4<f32>(%s, %s, %s, %s); }\n", k, x[0], x[1], x[2], x[3]);
             }
-        sp(&w, "        default: { return cb0[clamp(i, 0, 255)]; }\n    }\n}\n");
+        sp(&w, "        default: { return cb0[clamp(i, 0, %d)]; }\n    }\n}\n", D3D9_CB_VEC4S - 1);
     }
     for (int k = 0; k < (t->ntemp > 0 ? t->ntemp : 1); k++) sp(&w, "var<private> r%d: vec4<f32>;\n", k);
     sp(&w, "var<private> v: array<vec4<f32>, 16>;\n");

@@ -5,15 +5,17 @@
      cached by content;
    - shaders stay D3D9 bytecode: the backend's shader translator hands them to d3d9_wgsl.c, and their constants live
      in one uniform buffer per stage (layout in d3d9_wgsl.h);
-   - fixed-function vertex/pixel processing is emulated by generating D3D9 shaders from the FVF/declaration and texture
-     stage state (world/view/projection transform, up to eight texture stages, alpha test, texture factor). This is what
-     Unreal Engine 2's D3D9 renderer needs when its hardware-vertex-shader path is disabled;
+   - fixed-function vertex/pixel processing is emulated by generating D3D9 shaders from the FVF/declaration and
+     texture stage state (see d3d9_ffp.c: transforms, the world-matrix palette, lighting, vertex blending,
+     texture-coordinate generation and transforms, up to eight texture stages, fog, clip planes, point sprites). This
+     is what Unreal Engine 2's D3D9 renderer needs when its hardware-vertex-shader path is disabled;
    - the fixed-function pieces D3D9 shaders still rely on are emulated: alpha test in the pixel shader, the half-pixel
      offset in the vertex shader, partial clears and scaled StretchRect with built-in shaders.
 
    COM methods are written for both 32-bit (stdcall, arguments widened by rt_hle32) and 64-bit guests: pointers in guest
    structures go through LDP/STP and their offsets depend on GP. */
 #include "com.h"
+#include "d3d9_ffp.h"
 #include "d3d9_wgsl.h"
 #include "gpu.h"
 #include "sched.h"
@@ -32,6 +34,8 @@
 #define S_FALSE 1
 
 static float f32of(uint64_t v) { uint32_t u = (uint32_t)v; float f; memcpy(&f, &u, 4); return f; }
+static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static void argb(uint32_t c, float* f);
 
 /* ---------------------------------------------------------------- formats */
 
@@ -298,12 +302,19 @@ static struct {
     Decl* decl;
     Sh *vs, *ps;
     uint32_t fvf;
-    float xf[260][16];              /* SetTransform: view=2, projection=3, texture0-7=16-23, world=256-259 */
+    float xf[512][16];              /* SetTransform: view=2, projection=3, texture0-7=16-23, world=256-511 */
     int xf_dirty;
-    float material[17];             /* D3DMATERIAL9; only the diffuse colour is used by the fixed-function path */
+    float material[17];             /* D3DMATERIAL9, used by the fixed-function path */
+    FfpLight light[FFP_MAX_LIGHTS]; /* SetLight, D3DLIGHT9 */
+    int light_on[FFP_MAX_LIGHTS];   /* LightEnable */
+    float clip_plane[6][4];         /* SetClipPlane, world space */
     uint64_t vcb, pcb;              /* constants in guest memory, D3D9_CB_VEC4S vec4s each */
     GpuRes *vcb_r, *pcb_r;
     int vcb_dirty, pcb_dirty;
+    /* the fixed-function path keeps its own constant buffers, so its state never overwrites a game shader's constants */
+    uint64_t fvcb, fpcb;
+    GpuRes *fvcb_r, *fpcb_r;
+    int fvcb_dirty, fpcb_dirty, ffp_dirty;
     int in_scene;
     GpuCtx ctx;
     /* ring for DrawPrimitiveUP and the built-in draws */
@@ -365,6 +376,122 @@ static void set_cb_extra(void)
     xf[4] = -1.0f; xf[5] = 1.0f; xf[6] = -2.0f * z0 / (z1 - z0) - 1.0f; xf[7] = 1.0f;
     S.pcb_dirty = 1;
     S.vcb_dirty = 1;
+    S.ffp_dirty = 1;
+}
+
+/* 3x3 inverse-transpose of the world matrix's rotation: the transform D3D9 uses for normals */
+static void mat_inv_transpose(const float* m, float* out)
+{
+    float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    float A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+    float det = a * A + b * B + c * C;
+    memset(out, 0, 16 * sizeof *out);
+    out[15] = 1.0f;
+    if (fabsf(det) < 1e-12f) {
+        out[0] = m[0]; out[1] = m[4]; out[2] = m[8];
+        out[4] = m[1]; out[5] = m[5]; out[6] = m[9];
+        out[8] = m[2]; out[9] = m[6]; out[10] = m[10];
+        return;
+    }
+    float id = 1.0f / det;
+    out[0] = A * id; out[1] = B * id; out[2] = C * id;
+    out[4] = (c * h - b * i) * id; out[5] = (a * i - c * g) * id; out[6] = (b * g - a * h) * id;
+    out[8] = (b * f - c * e) * id; out[9] = (c * d - a * f) * id; out[10] = (a * e - b * d) * id;
+}
+
+/* the constants the generated fixed-function shaders read (see d3d9_ffp.h) */
+static void update_ffp(void)
+{
+    if (!S.ffp_dirty) return;
+    float* v = (float*)G2H(S.fvcb);
+    float* p = (float*)G2H(S.fpcb);
+    float vp[16], mvp[16], it[16];
+    mat_mul(S.xf[2], S.xf[3], vp);
+    mat_mul(S.xf[256], vp, mvp);
+    memcpy(v + 4 * FFP_VS_VIEWPROJ, vp, 64);
+    memcpy(v + 4 * FFP_VS_MVP, mvp, 64);
+    for (int k = 0; k < 3; k++) memcpy(v + 4 * (FFP_VS_WORLD + k), S.xf[256] + 4 * k, 16);
+    for (int k = 0; k < 3; k++) memcpy(v + 4 * (FFP_VS_VIEW + k), S.xf[2] + 4 * k, 16);
+    mat_inv_transpose(S.xf[256], it);
+    for (int k = 0; k < 3; k++) memcpy(v + 4 * (FFP_VS_WORLD_IT + k), it + 4 * k, 12);
+    /* the camera in world space: the view matrix is orthonormal, so its rotation transposed undoes it */
+    const float* V = S.xf[2];
+    for (int j = 0; j < 3; j++) v[4 * FFP_VS_EYE + j] = -(V[12] * V[j] + V[13] * V[4 + j] + V[14] * V[8 + j]);
+    v[4 * FFP_VS_EYE + 3] = 0.0f;
+    v[4 * FFP_VS_VIEW_FWD + 0] = -V[8];
+    v[4 * FFP_VS_VIEW_FWD + 1] = -V[9];
+    v[4 * FFP_VS_VIEW_FWD + 2] = -V[10];
+    v[4 * FFP_VS_VIEW_FWD + 3] = 0.0f;
+    /* material: diffuse rgb and power, ambient rgb with the diffuse alpha, specular and emissive */
+    memcpy(v + 4 * FFP_VS_MAT_DIFFUSE, S.material, 16);
+    v[4 * FFP_VS_MAT_DIFFUSE + 3] = S.material[16];
+    memcpy(v + 4 * FFP_VS_MAT_AMBIENT, S.material + 4, 16);
+    v[4 * FFP_VS_MAT_AMBIENT + 3] = S.material[3];
+    memcpy(v + 4 * FFP_VS_MAT_SPECULAR, S.material + 8, 16);
+    memcpy(v + 4 * FFP_VS_MAT_EMISSIVE, S.material + 12, 16);
+    /* fog, tween factor and the global ambient */
+    v[4 * FFP_VS_FOG + 0] = f32of(S.rs[36]);
+    v[4 * FFP_VS_FOG + 1] = f32of(S.rs[37]);
+    v[4 * FFP_VS_FOG + 2] = f32of(S.rs[38]);
+    v[4 * FFP_VS_FOG + 3] = 0.0f;
+    v[4 * FFP_VS_TWEEN + 0] = f32of(S.rs[170]);
+    float amb[4];
+    argb(S.rs[139], amb);
+    memcpy(v + 4 * FFP_VS_AMBIENT, amb, 12);
+    v[4 * FFP_VS_AMBIENT + 3] = S.rs[137] ? 1.0f : 0.0f;
+    /* lights */
+    for (int i = 0; i < FFP_MAX_LIGHTS; i++) {
+        float* c = v + 4 * (FFP_VS_LIGHTS + FFP_VS_LIGHT_STRIDE * i);
+        const FfpLight* L = &S.light[i];
+        memset(c, 0, FFP_VS_LIGHT_STRIDE * 16);
+        if (!S.light_on[i]) continue;
+        for (int k = 0; k < 3; k++) {
+            c[k] = L->diffuse[k]; c[4 + k] = L->specular[k]; c[8 + k] = L->ambient[k];
+            c[12 + k] = L->position[k]; c[16 + k] = L->direction[k];
+        }
+        float len = sqrtf(c[16] * c[16] + c[17] * c[17] + c[18] * c[18]);
+        if (len > 1e-9f) { c[16] /= len; c[17] /= len; c[18] /= len; }
+        c[3] = (float)L->type;
+        c[7] = L->range;
+        c[11] = L->atten[0];
+        c[15] = L->atten[1];
+        c[19] = L->atten[2];
+        c[20] = cosf(L->theta * 0.5f);
+        c[21] = cosf(L->phi * 0.5f);
+        float span = c[20] - c[21];
+        c[22] = span > 1e-6f ? 1.0f / span : 1.0f;
+        c[23] = L->range > 0.0f ? 1.0f : 0.0f;
+        c[24] = L->falloff;
+    }
+    /* the vertex-blending palette: world matrices 0-95, three rows each */
+    for (int i = 0; i < FFP_VS_PALETTE_MATRICES; i++)
+        for (int k = 0; k < 3; k++) memcpy(v + 4 * (FFP_VS_PALETTE + 3 * i + k), S.xf[256 + i] + 4 * k, 16);
+    /* screen-space transform for XYZRHW vertices (c254-c255) */
+    float w = f32of(S.vp[2]), h = f32of(S.vp[3]);
+    float z0 = f32of(S.vp[4]), z1 = f32of(S.vp[5]);
+    if (!(w > 0)) w = 1.0f;
+    if (!(h > 0)) h = 1.0f;
+    if (!(z1 > z0)) z1 = z0 + 1.0f;
+    v[4 * FFP_VS_SCREEN + 0] = 2.0f / w; v[4 * FFP_VS_SCREEN + 1] = -2.0f / h;
+    v[4 * FFP_VS_SCREEN + 2] = 2.0f / (z1 - z0); v[4 * FFP_VS_SCREEN + 3] = 0.0f;
+    v[4 * FFP_VS_SCREEN + 4] = -1.0f; v[4 * FFP_VS_SCREEN + 5] = 1.0f;
+    v[4 * FFP_VS_SCREEN + 6] = -2.0f * z0 / (z1 - z0) - 1.0f; v[4 * FFP_VS_SCREEN + 7] = 1.0f;
+    /* pixel shader: stage constants, material, fog colour, alpha test and texture factor */
+    for (int s = 0; s < 8; s++) argb(S.tss[s][32], p + 4 * (FFP_PS_STAGE + s));
+    memcpy(p + 4 * FFP_PS_MATERIAL, S.material, 16);
+    argb(S.rs[34], p + 4 * FFP_PS_FOG);
+    p[4 * FFP_PS_FOG + 3] = S.rs[28] ? 1.0f : 0.0f;
+    /* user clip planes: a world-space plane per register, tested against the world position in the pixel shader */
+    for (int i = 0; i < 6; i++) memcpy(p + 4 * (FFP_PS_CLIP + i), S.clip_plane[i], 16);
+    p[4 * D3D9_CB_EXTRA + 0] = S.rs[15] ? (float)(S.rs[25] & 15) : 8.0f;
+    p[4 * D3D9_CB_EXTRA + 1] = (float)(S.rs[24] & 0xFF) / 255.0f;
+    uint32_t tf = S.rs[60];
+    p[4 * 289 + 0] = ((tf >> 16) & 0xFF) / 255.0f;
+    p[4 * 289 + 1] = ((tf >> 8) & 0xFF) / 255.0f;
+    p[4 * 289 + 2] = (tf & 0xFF) / 255.0f;
+    p[4 * 289 + 3] = (tf >> 24) / 255.0f;
+    S.fvcb_dirty = S.fpcb_dirty = 1;
+    S.ffp_dirty = 0;
 }
 
 static void default_state(void)
@@ -384,9 +511,31 @@ static void default_state(void)
     S.rs[56] = 8;
     S.rs[58] = S.rs[59] = 0xFFFFFFFF;
     S.rs[60] = 0xFFFFFFFF;
+    S.rs[29] = 0;               /* SPECULARENABLE */
+    S.rs[35] = 0;               /* FOGTABLEMODE */
+    S.rs[36] = f32of(0.0f);     /* FOGSTART */
+    S.rs[37] = f32of(1.0f);     /* FOGEND */
+    S.rs[38] = f32of(1.0f);     /* FOGDENSITY */
     S.rs[136] = 1;              /* CLIPPING */
     S.rs[137] = 1;              /* LIGHTING */
+    S.rs[140] = 0;              /* FOGVERTEXMODE */
+    S.rs[141] = 1;              /* COLORVERTEX */
+    S.rs[142] = 0;              /* LOCALVIEWER */
+    S.rs[143] = 0;              /* NORMALIZENORMALS */
+    S.rs[145] = 1;              /* DIFFUSEMATERIALSOURCE COLOR1 */
+    S.rs[146] = 2;              /* SPECULARMATERIALSOURCE COLOR2 */
+    S.rs[147] = 1;              /* AMBIENTMATERIALSOURCE COLOR1 */
+    S.rs[148] = 0;              /* EMISSIVEMATERIALSOURCE MATERIAL */
+    S.rs[151] = 0;              /* VERTEXBLEND */
     S.rs[154] = 0x3F800000;     /* POINTSIZE 1.0 */
+    S.rs[155] = f32of(0.0f);    /* POINTSIZE_MIN */
+    S.rs[156] = 0;              /* POINTSPRITEENABLE */
+    S.rs[157] = 0;              /* POINTSCALEENABLE */
+    S.rs[158] = f32of(1.0f);    /* POINTSCALE_A */
+    S.rs[159] = f32of(0.0f);    /* POINTSCALE_B */
+    S.rs[160] = f32of(0.0f);    /* POINTSCALE_C */
+    S.rs[166] = f32of(64.0f);   /* POINTSIZE_MAX */
+    S.rs[170] = f32of(0.0f);    /* TWEENFACTOR */
     S.rs[162] = 0xFFFFFFFF;     /* MULTISAMPLEMASK */
     S.rs[168] = S.rs[190] = S.rs[191] = S.rs[192] = 0xF;
     S.rs[171] = 1;              /* BLENDOP add */
@@ -411,8 +560,13 @@ static void default_state(void)
         S.tss[s][11] = (uint32_t)s;         /* TEXCOORDINDEX */
         S.tss[s][32] = 0xFFFFFFFF;          /* CONSTANT */
     }
-    for (int i = 0; i < 260; i++) mat_identity(S.xf[i]);
+    memset(S.light, 0, sizeof S.light);
+    for (int i = 0; i < FFP_MAX_LIGHTS; i++) S.light[i].falloff = 1.0f;
+    memset(S.light_on, 0, sizeof S.light_on);
+    memset(S.clip_plane, 0, sizeof S.clip_plane);
+    for (int i = 0; i < 512; i++) mat_identity(S.xf[i]);
     S.xf_dirty = 1;
+    S.ffp_dirty = 1;
     for (int i = 0; i < 16; i++) S.vb_freq[i] = 1;
     set_cb_extra();
 }
@@ -903,8 +1057,8 @@ static void fill_caps(uint64_t p)
     k[39] = 0x17B;
     k[40] = 8;
     k[41] = 6;
-    k[42] = 4;
-    k[43] = 0;
+    k[42] = 4;                  /* MaxVertexBlendMatrices */
+    k[43] = FFP_VS_PALETTE_MATRICES - 1;   /* MaxVertexBlendMatrixIndex */
     fv = 256.0f; memcpy(&k[44], &fv, 4);
     k[45] = 0xFFFFFF;
     k[46] = 0xFFFFFF;
@@ -1118,8 +1272,11 @@ static int draw_setup(uint32_t* instances)
     GpuCtx* x = &S.ctx;
     if (!S.decl) return 0;
     Sh* vs = S.vs, *ps = S.ps;
+    int ffp = 0;
     if (!vs && !ps) {
         if (!ffp_shaders(S.decl, &vs, &ps)) return 0;
+        ffp = 1;
+        update_ffp();
     } else if (!vs || !ps) {
         static int said;
         if (said++ < 4) host_log("[d3d9] draw skipped: fixed-function and shader stages cannot be mixed here (vertex shader %s, pixel shader %s)", vs ? "set" : "none", ps ? "set" : "none");
@@ -1163,8 +1320,8 @@ static int draw_setup(uint32_t* instances)
     x->layout = decl_layout(S.decl, vs, inst, &um, &sm);
     x->sh[SH_VS] = vs_variant(vs, um, sm);
     x->sh[SH_PS] = ps->base;
-    x->cb[SH_VS][0] = S.vcb_r;
-    x->cb[SH_PS][0] = S.pcb_r;
+    x->cb[SH_VS][0] = ffp ? S.fvcb_r : S.vcb_r;
+    x->cb[SH_PS][0] = ffp ? S.fpcb_r : S.pcb_r;
     for (int i = 0; i < 16; i++) {
         D9* b = D(S.vb[i]);
         x->vb[i] = b ? b->r : NULL;
@@ -1176,6 +1333,10 @@ static int draw_setup(uint32_t* instances)
     x->ib_format = ib && ib->fmt == 102 ? 42 : 57;
     x->ib_offset = 0;
     upload_constants();
+    if (ffp) {
+        if (S.fvcb_dirty) { gpu->res_upload(S.fvcb_r, 0, NULL, S.fvcb, D3D9_CB_VEC4S * 16, D3D9_CB_VEC4S * 16); S.fvcb_dirty = 0; }
+        if (S.fpcb_dirty) { gpu->res_upload(S.fpcb_r, 0, NULL, S.fpcb, D3D9_CB_VEC4S * 16, D3D9_CB_VEC4S * 16); S.fpcb_dirty = 0; }
+    }
     return 1;
 }
 
@@ -1273,15 +1434,195 @@ static void trace_draw(uint32_t type, uint32_t count, uint32_t first, int32_t ba
 
 static void do_draw(uint32_t type, uint32_t count, uint32_t first, int32_t base, int indexed, uint32_t instances)
 {
+    if (type == 1) {
+        /* WebGPU has no point-list topology; point draws only work as sprites, which pt_draw expands on the CPU */
+        static int said;
+        if (said++ < 4) host_log("[d3d9] point-list draw skipped: D3DRS_POINTSPRITEENABLE is off");
+        return;
+    }
     trace_draw(type, count, first, base, indexed);
     S.ctx.topology = type >= 1 && type <= 5 ? type : 4;
     if (gpu->draw && count) gpu->draw(&S.ctx, count, first, base, instances, 0, indexed);
 }
 
+/* ---------------------------------------------------------------- point sprites */
+
+/* WebGPU has no point-list topology, so a point-sprite draw is expanded into screen-aligned quads on the CPU: each
+   point is transformed with the current world/view/projection matrices, sized from D3DRS_POINTSIZE (or the vertex's
+   PSIZE), and emitted as two triangles carrying the point's texture coordinates and colours. */
+#define PT_STRIDE 84            /* XYZRHW float4, COLOR0 dword, TEXCOORD0-7 float2 */
+#define PT_BATCH 4096
+
+static Decl* new_decl(void);
+static Decl* pt_decl(void)
+{
+    static Decl* d;
+    if (d) return d;
+    d = new_decl();
+    ST32(d->obj + 8, 1000000);
+    uint16_t off = 0;
+    d->e[d->n].stream = 0; d->e[d->n].offset = off; d->e[d->n].type = 3; d->e[d->n].method = 0; d->e[d->n].usage = 9; d->e[d->n].index = 0; d->n++; off += 16;
+    d->e[d->n].stream = 0; d->e[d->n].offset = off; d->e[d->n].type = 4; d->e[d->n].method = 0; d->e[d->n].usage = 10; d->e[d->n].index = 0; d->n++; off += 4;
+    for (int i = 0; i < 8; i++) {
+        d->e[d->n].stream = 0; d->e[d->n].offset = off; d->e[d->n].type = 1; d->e[d->n].method = 0;
+        d->e[d->n].usage = 5; d->e[d->n].index = (uint8_t)i; d->n++; off += 8;
+    }
+    return d;
+}
+
+/* the common declaration types as four floats (0-1 for colours) */
+static void pt_elem(const uint8_t* p, uint8_t ty, float* out)
+{
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (ty <= 3) {
+        for (int k = 0; k <= ty; k++) memcpy(&out[k], p + 4 * k, 4);
+    } else if (ty == 4) {
+        out[0] = p[2] / 255.0f; out[1] = p[1] / 255.0f; out[2] = p[0] / 255.0f; out[3] = p[3] / 255.0f;
+    } else if (ty == 5) {
+        out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; out[3] = p[3];
+    } else if (ty >= 8 && ty <= 12) {
+        const int16_t* s = (const int16_t*)p;
+        if (ty == 8) { for (int k = 0; k < 4; k++) out[k] = p[k] / 255.0f; }
+        else if (ty == 9 || ty == 11) { float sc = ty == 9 ? 32767.0f : 65535.0f; out[0] = s[0] / sc; out[1] = s[1] / sc; }
+        else if (ty == 10 || ty == 12) { float sc = ty == 10 ? 32767.0f : 65535.0f; for (int k = 0; k < 4; k++) out[k] = s[k] / sc; }
+        else { for (int k = 0; k < 4; k++) out[k] = ((const uint16_t*)p)[k] / 65535.0f; }
+    }
+}
+
+static void pt_quad(uint8_t* out, float sx, float sy, float z, float hw, float hh, const float col[4], const float tc[8][4])
+{
+    static const float corner[6][2] = { { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+    static const float uv[6][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+    for (int v = 0; v < 6; v++) {
+        uint8_t* p = out + (size_t)v * PT_STRIDE;
+        float f[4] = { sx + corner[v][0] * hw, sy + corner[v][1] * hh, z, 1.0f };
+        memcpy(p, f, 16);
+        p[16] = (uint8_t)(col[2] * 255.0f + 0.5f);
+        p[17] = (uint8_t)(col[1] * 255.0f + 0.5f);
+        p[18] = (uint8_t)(col[0] * 255.0f + 0.5f);
+        p[19] = (uint8_t)(col[3] * 255.0f + 0.5f);
+        for (int t = 0; t < 8; t++) {
+            float q[2] = { tc[t][0] + (tc[t][2] - tc[t][0]) * uv[v][0], tc[t][1] + (tc[t][3] - tc[t][1]) * uv[v][1] };
+            memcpy(p + 20 + 8 * t, q, 8);
+        }
+    }
+}
+
+/* returns 1 when it handled the draw (whether or not anything was drawn) */
+static int pt_draw(uint32_t type, uint32_t count, uint32_t first, int32_t base, uint64_t idxmem, int idx32,
+                   const uint8_t* up, uint32_t up_stride)
+{
+    if (type != 1 || !count || !S.rs[156]) return 0;
+    if (S.vs || S.ps || !S.decl) return 0;
+    Decl* d = S.decl;
+    int has_pos = 0;
+    for (uint32_t i = 0; i < d->n; i++) {
+        if (d->e[i].usage == 9) return 0;               /* already in screen space */
+        if (d->e[i].usage == 0) has_pos = 1;
+    }
+    if (!has_pos) return 0;
+    float vp[16], mvp[16], wv[16];
+    mat_mul(S.xf[2], S.xf[3], vp);
+    mat_mul(S.xf[256], vp, mvp);
+    mat_mul(S.xf[256], S.xf[2], wv);
+    float vw = (float)(uint32_t)S.vp[2], vh = (float)(uint32_t)S.vp[3];
+    if (!vw) vw = 1.0f;
+    if (!vh) vh = 1.0f;
+    float vx = (float)(int32_t)S.vp[0], vy = (float)(int32_t)S.vp[1];
+    float base_size = f32of(S.rs[154]), min_sz = f32of(S.rs[155]), max_sz = f32of(S.rs[166]);
+    float sa = f32of(S.rs[158]), sb = f32of(S.rs[159]), sc = f32of(S.rs[160]);
+    int scaled = S.rs[157] != 0;
+    uint32_t batch = count < PT_BATCH ? count : PT_BATCH;
+    uint64_t mem = g_alloc((uint64_t)batch * 6 * PT_STRIDE);
+    if (!mem) return 1;
+    uint8_t* buf = (uint8_t*)G2H(mem);
+    for (int i = 0; i < 16; i++) flush_buffer(D(S.vb[i]));
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t chunk = count - done < batch ? count - done : batch, nv = 0;
+        for (uint32_t i = 0; i < chunk; i++) {
+            int64_t vidx = (int64_t)first + done + i;
+            if (idxmem) {
+                int32_t v = idx32 ? (int32_t)LD32(idxmem + 4ull * (done + i)) : (int32_t)(*(const uint16_t*)G2H(idxmem + 2ull * (done + i)));
+                vidx = (int64_t)v + base;
+            }
+            if (vidx < 0) continue;
+            float pos[4] = { 0, 0, 0, 1 }, col[4] = { 1, 1, 1, 1 }, tc[8][4];
+            float psize = 0;
+            int have_size = 0;
+            memset(tc, 0, sizeof tc);
+            for (uint32_t k = 0; k < d->n; k++) {
+                const uint8_t* vp0;
+                if (up) vp0 = up + (uint64_t)vidx * up_stride;
+                else {
+                    uint32_t st = d->e[k].stream & 15;
+                    D9* vb = D(S.vb[st]);
+                    if (!vb || !S.vb_stride[st]) continue;
+                    vp0 = (const uint8_t*)G2H(lock_mem(vb) + S.vb_off[st] + (uint64_t)vidx * S.vb_stride[st]);
+                }
+                const uint8_t* p = vp0 + d->e[k].offset;
+                uint8_t us = d->e[k].usage, ix = d->e[k].index;
+                if (us == 0) pt_elem(p, d->e[k].type, pos);
+                else if (us == 4) { float v[4]; pt_elem(p, d->e[k].type, v); psize = v[0]; have_size = 1; }
+                else if (us == 10 && ix == 0) pt_elem(p, d->e[k].type, col);
+                else if (us == 5 && ix < 8) {
+                    float v[4];
+                    pt_elem(p, d->e[k].type, v);
+                    tc[ix][0] = v[0]; tc[ix][1] = v[1]; tc[ix][2] = v[0] + 1.0f; tc[ix][3] = v[1] + 1.0f;
+                }
+            }
+            float cx = pos[0] * mvp[0] + pos[1] * mvp[4] + pos[2] * mvp[8] + pos[3] * mvp[12];
+            float cy = pos[0] * mvp[1] + pos[1] * mvp[5] + pos[2] * mvp[9] + pos[3] * mvp[13];
+            float cz = pos[0] * mvp[2] + pos[1] * mvp[6] + pos[2] * mvp[10] + pos[3] * mvp[14];
+            float cw = pos[0] * mvp[3] + pos[1] * mvp[7] + pos[2] * mvp[11] + pos[3] * mvp[15];
+            if (cw <= 1e-6f) continue;
+            float sx = (cx / cw * 0.5f + 0.5f) * vw + vx;
+            float sy = (0.5f - cy / cw * 0.5f) * vh + vy;
+            float z = cz / cw * 0.5f + 0.5f;
+            float sz = have_size ? psize : base_size;
+            if (scaled) {
+                /* D3D9: size *= sqrt(1 / (A + B*De + C*De^2)), with De the distance from the eye */
+                float ex = pos[0] * wv[0] + pos[1] * wv[4] + pos[2] * wv[8] + pos[3] * wv[12];
+                float ey = pos[0] * wv[1] + pos[1] * wv[5] + pos[2] * wv[9] + pos[3] * wv[13];
+                float ez = pos[0] * wv[2] + pos[1] * wv[6] + pos[2] * wv[10] + pos[3] * wv[14];
+                float de = sqrtf(ex * ex + ey * ey + ez * ez);
+                float sc2 = sa + sb * de + sc * de * de;
+                if (sc2 > 1e-6f) sz *= 1.0f / sqrtf(sc2);
+                else sz = 0.0f;
+            }
+            if (sz < min_sz) sz = min_sz;
+            if (sz > max_sz) sz = max_sz;
+            if (sz <= 0.0f) continue;
+            pt_quad(buf + (size_t)nv * 6 * PT_STRIDE, sx, sy, z, sz * 0.5f, sz * 0.5f, col, (const float (*)[4])tc);
+            nv += 6;
+        }
+        if (nv) {
+            uint32_t off = ring_put(S.up_vb, &S.up_vb_at, mem, nv * PT_STRIDE, 4);
+            if (off != 0xFFFFFFFF) {
+                Decl* keep = S.decl;
+                S.decl = pt_decl();
+                uint32_t inst;
+                if (draw_setup(&inst)) {
+                    S.ctx.vb[0] = S.up_vb; S.ctx.vb_stride[0] = PT_STRIDE; S.ctx.vb_offset[0] = off;
+                    S.ctx.ib = NULL;
+                    do_draw(4, nv, 0, 0, 0, 1);
+                }
+                S.decl = keep;
+            }
+        }
+        done += chunk;
+    }
+    g_free(mem);
+    return 1;
+}
+
 static void dev_draw(CPU* c)
 {
     uint32_t type = (uint32_t)A2, start = (uint32_t)A3, prims = (uint32_t)A4, inst;
-    if (!prims || !draw_setup(&inst)) { RET(D3D_OK); return; }
+    if (!prims) { RET(D3D_OK); return; }
+    if (pt_draw(type, prims, start, 0, 0, 0, NULL, 0)) { RET(D3D_OK); return; }
+    if (!draw_setup(&inst)) { RET(D3D_OK); return; }
+    if (type == 1) { RET(D3D_OK); return; }
     for (int i = 0; i < 16; i++) flush_buffer(D(S.vb[i]));
     if (type == 6) {
         uint32_t off = fan_indices(start, prims, 0, 0);
@@ -1295,7 +1636,13 @@ static void dev_draw_indexed(CPU* c)
     uint32_t type = (uint32_t)A2;
     int32_t base = (int32_t)A3 + S.ib_base;
     uint32_t start = (uint32_t)ARG(6), prims = (uint32_t)ARG(7), inst;
-    if (!prims || !draw_setup(&inst)) { RET(D3D_OK); return; }
+    if (!prims) { RET(D3D_OK); return; }
+    D9* ib0 = D(S.ib);
+    if (type == 1 && S.rs[156] && ib0) {
+        int i32 = ib0->fmt == 102;
+        if (pt_draw(type, prims, 0, base, lock_mem(ib0) + (uint64_t)start * (i32 ? 4 : 2), i32, NULL, 0)) { RET(D3D_OK); return; }
+    }
+    if (!draw_setup(&inst)) { RET(D3D_OK); return; }
     for (int i = 0; i < 16; i++) flush_buffer(D(S.vb[i]));
     D9* ib = D(S.ib);
     flush_buffer(ib);
@@ -1313,7 +1660,9 @@ static void dev_draw_up(CPU* c)
     uint32_t type = (uint32_t)A2, prims = (uint32_t)A3, stride = (uint32_t)ARG(5), inst;
     uint64_t data = A4;
     uint32_t nv = type == 6 ? prims + 2 : prim_count(type, prims);
-    if (prims && data && stride && draw_setup(&inst)) {
+    if (prims && data && stride && pt_draw(type, prims, 0, 0, 0, 0, (const uint8_t*)G2H(data), stride)) {
+        /* point sprites were expanded on the CPU */
+    } else if (prims && data && stride && draw_setup(&inst)) {
         uint32_t off = ring_put(S.up_vb, &S.up_vb_at, data, nv * stride, stride);
         if (off != 0xFFFFFFFF) {
             S.ctx.vb[0] = S.up_vb; S.ctx.vb_stride[0] = stride; S.ctx.vb_offset[0] = off;
@@ -1334,7 +1683,10 @@ static void dev_draw_indexed_up(CPU* c)
     uint32_t type = (uint32_t)A2, minv = (uint32_t)A3, nverts = (uint32_t)A4, prims = (uint32_t)ARG(5);
     uint64_t idx = ARG(6), vdata = ARG(8);
     uint32_t ifmt = (uint32_t)ARG(7), stride = (uint32_t)ARG(9), inst;
-    if (prims && idx && vdata && stride && draw_setup(&inst)) {
+    if (prims && idx && vdata && stride &&
+        pt_draw(type, prims, 0, 0, idx, ifmt == 102, (const uint8_t*)G2H(vdata), stride)) {
+        /* point sprites were expanded on the CPU */
+    } else if (prims && idx && vdata && stride && draw_setup(&inst)) {
         int i32 = ifmt == 102;
         uint32_t nv = minv + nverts;
         uint32_t voff = ring_put(S.up_vb, &S.up_vb_at, vdata, nv * stride, stride);
@@ -1395,236 +1747,100 @@ static Sh* builtin_ps(int tex)
 
 /* D3D9 shader tokens. The fixed-function path turns SetTransform, the vertex declaration and the texture stage state
    into a vs_3_0/ps_3_0 pair, so it goes through the same translator and backends as game shaders. */
-#define FFP_SRC_TEMP(n)  (0x80E40000u | (uint32_t)(n))
-#define FFP_SRC_INPUT(n) (0x90E40000u | (uint32_t)(n))
-#define FFP_SRC_CONST(n) (0xA0E40000u | (uint32_t)(n))
-#define FFP_DST_TEMP(n)  (0x800F0000u | (uint32_t)(n))
-#define FFP_DST_MASK(n, m) (0x80000000u | ((uint32_t)(m) << 16) | (uint32_t)(n))
-#define FFP_DST_OUT(n)   (0xE00F0000u | (uint32_t)(n))
-
-static void ffp_mov(uint32_t* c, int* n, uint32_t dst, uint32_t src) { c[(*n)++] = 0x02000001; c[(*n)++] = dst; c[(*n)++] = src; }
-static void ffp_op3(uint32_t* c, int* n, uint32_t op, uint32_t dst, uint32_t a, uint32_t b) { c[(*n)++] = 0x03000000u | op; c[(*n)++] = dst; c[(*n)++] = a; c[(*n)++] = b; }
-static void ffp_op4(uint32_t* c, int* n, uint32_t op, uint32_t dst, uint32_t a, uint32_t b, uint32_t d) { c[(*n)++] = 0x04000000u | op; c[(*n)++] = dst; c[(*n)++] = a; c[(*n)++] = b; c[(*n)++] = d; }
-static void ffp_dcl(uint32_t* c, int* n, uint32_t usage, uint32_t index, uint32_t dst)
-{
-    c[(*n)++] = 0x0200001F;
-    c[(*n)++] = 0x80000000u | (usage & 0x1F) | ((index & 0xF) << 16);
-    c[(*n)++] = dst;
-}
-static void ffp_def(uint32_t* c, int* n, uint32_t reg, float x, float y, float z, float w)
-{
-    c[(*n)++] = 0x05000051;
-    c[(*n)++] = 0xA00F0000u | (reg & 0xFF);
-    memcpy(&c[*n], &x, 4); (*n)++;
-    memcpy(&c[*n], &y, 4); (*n)++;
-    memcpy(&c[*n], &z, 4); (*n)++;
-    memcpy(&c[*n], &w, 4); (*n)++;
-}
-
 /* translate once now, so a malformed generated shader is reported and skipped instead of reaching a backend */
-static Sh* ffp_make(uint32_t* c, int n, int ps)
+static Sh* ffp_make(uint32_t* c, uint32_t bytes, int ps)
 {
     DxWgsl w;
-    if (!d3d9_to_wgsl((const uint8_t*)c, (size_t)n * 4, NULL, &w)) {
+    if (!d3d9_to_wgsl((const uint8_t*)c, bytes, NULL, &w)) {
         host_log("[d3d9] generated fixed-function %s shader is invalid: %s", ps ? "pixel" : "vertex", w.error);
         dxbc_wgsl_free(&w);
         return NULL;
     }
     dxbc_wgsl_free(&w);
-    return make_sh(c, (uint32_t)n * 4, ps);
+    return make_sh(c, bytes, ps);
 }
 
-/* a vertex shader for the current declaration: position (or screen-space XYZRHW), texture coordinates and colours */
-static Sh* ffp_vs(Decl* d)
+/* what the fixed-function generator needs from the current device state and declaration */
+static void ffp_state_from(FfpState* f, Decl* d)
 {
-    uint32_t c[512];
-    int n = 0, pos_reg = -1, pos_usage = 0, reg = 0;
-    int tex_in[8], tex_out[8], col_in[2] = { -1, -1 }, col_out[2] = { -1, -1 };
-    for (int i = 0; i < 8; i++) tex_in[i] = -1;
-    for (uint32_t i = 0; i < d->n; i++) {
-        uint32_t us = d->e[i].usage, ix = d->e[i].index;
-        if (us == 0 || us == 9) { if (pos_reg < 0) { pos_reg = reg; pos_usage = us; } }
-        else if (us == 5 && ix < 8 && tex_in[ix] < 0) tex_in[ix] = reg;
-        else if (us == 10 && ix < 2 && col_in[ix] < 0) col_in[ix] = reg;
-        reg++;
+    memset(f, 0, sizeof *f);
+    for (uint32_t i = 0; i < d->n && f->n < 64; i++) {
+        FfpElem* e = &f->e[f->n++];
+        e->stream = (uint16_t)d->e[i].stream; e->offset = (uint16_t)d->e[i].offset;
+        e->type = (uint8_t)d->e[i].type; e->method = (uint8_t)d->e[i].method;
+        e->usage = (uint8_t)d->e[i].usage; e->index = (uint8_t)(d->e[i].index < 16 ? d->e[i].index : 0);
     }
-    if (pos_reg < 0) return NULL;
-    int out = 1;
-    for (int i = 0; i < 8; i++) if (tex_in[i] >= 0) tex_out[i] = out++;
-    for (int i = 0; i < 2; i++) if (col_in[i] >= 0) col_out[i] = out++;
-    c[n++] = 0xFFFE0300;
-    ffp_dcl(c, &n, pos_usage, 0, 0x900F0000u | (uint32_t)pos_reg);
-    for (int i = 0; i < 8; i++) if (tex_in[i] >= 0) ffp_dcl(c, &n, 5, (uint32_t)i, 0x900F0000u | (uint32_t)tex_in[i]);
-    for (int i = 0; i < 2; i++) if (col_in[i] >= 0) ffp_dcl(c, &n, 10, (uint32_t)i, 0x900F0000u | (uint32_t)col_in[i]);
-    ffp_dcl(c, &n, 0, 0, 0xE00F0000);
-    for (int i = 0; i < 8; i++) if (tex_in[i] >= 0) ffp_dcl(c, &n, 5, (uint32_t)i, FFP_DST_OUT(tex_out[i]));
-    for (int i = 0; i < 2; i++) if (col_in[i] >= 0) ffp_dcl(c, &n, 10, (uint32_t)i, FFP_DST_OUT(col_out[i]));
-    if (pos_usage == 9) {
-        ffp_mov(c, &n, FFP_DST_TEMP(0), FFP_SRC_INPUT(pos_reg));
-        ffp_op3(c, &n, 5, FFP_DST_MASK(0, 1), FFP_SRC_TEMP(0), FFP_SRC_CONST(254));
-        ffp_op3(c, &n, 2, FFP_DST_MASK(0, 1), FFP_SRC_TEMP(0), FFP_SRC_CONST(255));
-        ffp_op3(c, &n, 5, FFP_DST_MASK(0, 2), FFP_SRC_TEMP(0), FFP_SRC_CONST(254));
-        ffp_op3(c, &n, 2, FFP_DST_MASK(0, 2), FFP_SRC_TEMP(0), FFP_SRC_CONST(255));
-        ffp_op3(c, &n, 5, FFP_DST_MASK(0, 4), FFP_SRC_TEMP(0), FFP_SRC_CONST(254));
-        ffp_op3(c, &n, 2, FFP_DST_MASK(0, 4), FFP_SRC_TEMP(0), FFP_SRC_CONST(255));
-        ffp_mov(c, &n, FFP_DST_MASK(0, 8), FFP_SRC_CONST(255));
-    } else {
-        ffp_op3(c, &n, 0x14, FFP_DST_TEMP(0), FFP_SRC_INPUT(pos_reg), FFP_SRC_CONST(250));
-    }
-    ffp_mov(c, &n, 0xE00F0000, FFP_SRC_TEMP(0));
-    for (int i = 0; i < 8; i++) if (tex_in[i] >= 0) ffp_mov(c, &n, FFP_DST_OUT(tex_out[i]), FFP_SRC_INPUT(tex_in[i]));
-    for (int i = 0; i < 2; i++) if (col_in[i] >= 0) ffp_mov(c, &n, FFP_DST_OUT(col_out[i]), FFP_SRC_INPUT(col_in[i]));
-    c[n++] = 0x0000FFFF;
-    return ffp_make(c, n, 0);
-}
-
-static uint32_t ffp_arg(uint32_t a, int stage, int tex, int col, int spec)
-{
-    switch (a & 0xF) {
-    case 0: return col >= 0 ? FFP_SRC_INPUT(col) : FFP_SRC_CONST(248);    /* D3DTA_DIFFUSE (material when there is no vertex colour) */
-    case 1: return FFP_SRC_TEMP(0);                                      /* D3DTA_CURRENT */
-    case 2: return tex ? FFP_SRC_TEMP(1) : FFP_SRC_CONST(0);             /* D3DTA_TEXTURE */
-    case 3: return FFP_SRC_CONST(289);                                   /* D3DTA_TFACTOR */
-    case 4: return spec >= 0 ? FFP_SRC_INPUT(spec) : FFP_SRC_CONST(0);   /* D3DTA_SPECULAR */
-    case 5: return FFP_SRC_TEMP(0);                                      /* D3DTA_TEMP */
-    case 6: return FFP_SRC_CONST(240 + stage);                           /* D3DTA_CONSTANT */
-    default: return FFP_SRC_CONST(0);
-    }
-}
-
-static void ffp_color_op(uint32_t* c, int* n, uint32_t op, uint32_t a0, uint32_t a1, uint32_t a2)
-{
-    uint32_t d = FFP_DST_MASK(0, 7);   /* colour only: the alpha op writes .w separately */
-    switch (op) {
-    case 1: break;                                                   /* disable */
-    case 2: ffp_mov(c, n, d, a1); break;                         /* select arg1 */
-    case 3: ffp_mov(c, n, d, a2); break;                         /* select arg2 */
-    case 5: ffp_op3(c, n, 5, d, a1, a2); ffp_op3(c, n, 2, d, d, d); break;   /* modulate 2x */
-    case 6: ffp_op3(c, n, 5, d, a1, a2); ffp_op3(c, n, 2, d, d, d); ffp_op3(c, n, 2, d, d, d); break; /* 4x */
-    case 7: ffp_op3(c, n, 2, d, a1, a2); break;                     /* add */
-    case 8: ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_SRC_CONST(1)); break; /* addsigned */
-    case 9: ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_SRC_CONST(1)); ffp_op3(c, n, 2, d, d, d); break;
-    case 10: ffp_op3(c, n, 3, d, a1, a2); break;                   /* subtract */
-    case 11: ffp_op3(c, n, 5, FFP_DST_TEMP(2), a1, a2); ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_DST_TEMP(2)); break;
-    case 24: ffp_op3(c, n, 8, FFP_DST_TEMP(2), a1, a2); ffp_mov(c, n, d, FFP_DST_TEMP(2)); break; /* dp3 */
-    case 25: ffp_op3(c, n, 5, FFP_DST_TEMP(2), a1, a2); ffp_op3(c, n, 2, d, FFP_DST_TEMP(2), a0); break;
-    case 26: ffp_op4(c, n, 0x12, d, a0, a1, a2); break;            /* lerp */
-    default: ffp_op3(c, n, 5, d, a1, a2); break;                    /* modulate */
-    }
-}
-
-static void ffp_alpha_op(uint32_t* c, int* n, uint32_t op, uint32_t a1, uint32_t a2)
-{
-    uint32_t d = FFP_DST_MASK(0, 8);
-    switch (op) {
-    case 2: ffp_mov(c, n, d, a1); break;
-    case 3: ffp_mov(c, n, d, a2); break;
-    case 4: ffp_op3(c, n, 5, d, a1, a2); break;
-    case 5: ffp_op3(c, n, 5, d, a1, a2); ffp_op3(c, n, 2, d, d, d); break;
-    case 6: ffp_op3(c, n, 5, d, a1, a2); ffp_op3(c, n, 2, d, d, d); ffp_op3(c, n, 2, d, d, d); break;
-    case 7: ffp_op3(c, n, 2, d, a1, a2); break;
-    case 8: ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_SRC_CONST(1)); break;
-    case 9: ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_SRC_CONST(1)); ffp_op3(c, n, 2, d, d, d); break;
-    case 10: ffp_op3(c, n, 3, d, a1, a2); break;
-    case 11: ffp_op3(c, n, 5, FFP_DST_TEMP(2), a1, a2); ffp_op3(c, n, 2, d, a1, a2); ffp_op3(c, n, 3, d, d, FFP_DST_TEMP(2)); break;
-    default: break;
-    }
-}
-
-static Sh* ffp_ps(Decl* d, uint32_t texmask)
-{
-    uint32_t c[2048];
-    int n = 0, have_tc[8] = { 0 }, have_col[2] = { 0 }, first_tc = -1;
-    for (uint32_t i = 0; i < d->n; i++) {
-        uint32_t us = d->e[i].usage, ix = d->e[i].index;
-        if (us == 5 && ix < 8) have_tc[ix] = 1;
-        else if (us == 10 && ix < 2) have_col[ix] = 1;
-    }
-    for (int i = 0; i < 8; i++) if (have_tc[i]) { first_tc = i; break; }
-    int tc_for[8], tex_ok[8], use_tc[8] = { 0 }, tc_reg[8] = { 0 };
+    memcpy(f->tss, S.tss, sizeof f->tss);
     for (int s = 0; s < 8; s++) {
-        int tc = (int)(S.tss[s][11] & 0xF);
-        if (tc >= 8 || !have_tc[tc]) tc = first_tc;
-        tc_for[s] = tc;
-        tex_ok[s] = ((texmask >> s) & 1) && tc >= 0;
-        if (tex_ok[s]) use_tc[tc] = 1;
+        D9* t = D(S.tex[s]);
+        f->texkind[s] = !t ? 0
+            : t->kind == O_CUBE ? 6 : t->kind == O_VOL ? 5
+            : (t->kind == O_TEX || t->kind == O_SURF) ? 3 : 0;
     }
-    /* use the vertex shader's output registers as input registers: ps_3_0 matches varyings by register when no paired
-       vertex shader was supplied to the translator, and ffp_vs puts position at o0, then present texcoords, then colours */
-    int slot = 1;
-    for (int i = 0; i < 8; i++) if (have_tc[i]) tc_reg[i] = slot++;
-    int col_reg = have_col[0] ? slot++ : -1, spec_reg = have_col[1] ? slot++ : -1;
-    c[n++] = 0xFFFF0300;
-    ffp_def(c, &n, 0, 1, 1, 1, 1);
-    ffp_def(c, &n, 1, 0.5f, 0.5f, 0.5f, 0.5f);
-    for (int i = 0; i < 8; i++) if (use_tc[i]) ffp_dcl(c, &n, 5, (uint32_t)i, 0x900F0000u | (uint32_t)tc_reg[i]);
-    if (col_reg >= 0) ffp_dcl(c, &n, 10, 0, 0x900F0000u | (uint32_t)col_reg);
-    if (spec_reg >= 0) ffp_dcl(c, &n, 10, 1, 0x900F0000u | (uint32_t)spec_reg);
-    for (int s = 0; s < 8; s++) if (tex_ok[s]) { c[n++] = 0x0200001F; c[n++] = 0x90000000; c[n++] = 0xA00F0800u | (uint32_t)s; }
-    ffp_mov(c, &n, FFP_DST_TEMP(0), col_reg >= 0 ? FFP_SRC_INPUT(col_reg) : FFP_SRC_CONST(248));
-    for (int s = 0; s < 8; s++) {
-        uint32_t cop = S.tss[s][1];
-        if (cop == 1) break;
-        if (tex_ok[s]) {
-            c[n++] = 0x03000042;
-            c[n++] = FFP_DST_TEMP(1);
-            c[n++] = FFP_SRC_INPUT(tc_reg[tc_for[s]]);
-            c[n++] = 0xA0E40800u | (uint32_t)s;
-        }
-        uint32_t a0 = ffp_arg(S.tss[s][25], s, tex_ok[s], col_reg, spec_reg);
-        uint32_t a1 = ffp_arg(S.tss[s][2], s, tex_ok[s], col_reg, spec_reg);
-        uint32_t a2 = ffp_arg(S.tss[s][3], s, tex_ok[s], col_reg, spec_reg);
-        ffp_color_op(c, &n, cop, a0, a1, a2);
-        uint32_t aop = S.tss[s][4];
-        if (aop != 1) ffp_alpha_op(c, &n, aop, ffp_arg(S.tss[s][5], s, tex_ok[s], col_reg, spec_reg), ffp_arg(S.tss[s][6], s, tex_ok[s], col_reg, spec_reg));
-    }
-    ffp_mov(c, &n, 0x800F0800, FFP_SRC_TEMP(0));
-    c[n++] = 0x0000FFFF;
-    return ffp_make(c, n, 1);
+    f->lighting = S.rs[137] != 0;
+    f->specular = S.rs[29] != 0;
+    f->color_vertex = S.rs[141] != 0;
+    f->local_viewer = S.rs[142] != 0;
+    f->normalize_normals = S.rs[143] != 0;
+    f->diffuse_src = (int)(S.rs[145] & 3);
+    f->specular_src = (int)(S.rs[146] & 3);
+    f->ambient_src = (int)(S.rs[147] & 3);
+    f->emissive_src = (int)(S.rs[148] & 3);
+    /* D3DFOG_NONE/EXP/EXP2/LINEAR are 0-3 in both fog modes; the table mode wins, vertex fog is the fallback */
+    int fogmode = (int)S.rs[35];
+    if (!fogmode) fogmode = (int)S.rs[140];
+    f->fog = S.rs[28] ? fogmode : 0;
+    f->fog_radial = S.rs[48] != 0;
+    f->blend = (int)S.rs[151];
+    f->blend_indexed = S.rs[167] != 0;
+    f->clip_planes = (int)(S.rs[152] & 0x3F);
+    int n = 0;
+    for (int i = 0; i < FFP_MAX_LIGHTS; i++) if (S.light_on[i]) f->light[n++] = S.light[i];
+    f->nlights = n;
 }
 
-typedef struct {
-    uint32_t n, texmask;
-    struct { uint16_t stream, offset; uint8_t type, method, usage, index; } e[64];
-    uint32_t tss[8][33];
-    Sh *vs, *ps;
-} FfpEntry;
-static FfpEntry ffp_cache[256];
+/* the generated code depends on the shape of the light or clip-plane state, never on the values: those are constants */
+static void ffp_key(FfpState* f)
+{
+    for (int i = 0; i < FFP_MAX_LIGHTS; i++) {
+        int type = f->light[i].type;
+        memset(&f->light[i], 0, sizeof f->light[i]);
+        f->light[i].type = type;
+    }
+}
+
+typedef struct { FfpState st; Sh *vs, *ps; } FfpEntry;
+#define FFP_CACHE 64
+static FfpEntry* ffp_cache;
 static int ffp_count, ffp_said;
 
 static int ffp_shaders(Decl* d, Sh** vs, Sh** ps)
 {
-    uint32_t n = d->n < 64 ? d->n : 64, texmask = 0;
-    for (int i = 0; i < 8; i++) {
-        D9* t = D(S.tex[i]);
-        /* the generated stages declare 2D samplers; a cube or volume texture would need different declarations */
-        if (t && (t->kind == O_TEX || t->kind == O_SURF)) texmask |= 1u << i;
-    }
-    for (int k = 0; k < ffp_count; k++) {
-        FfpEntry* e = &ffp_cache[k];
-        if (e->n != n || e->texmask != texmask || memcmp(e->tss, S.tss, sizeof e->tss)) continue;
-        int same = 1;
-        for (uint32_t i = 0; i < n && same; i++)
-            same = e->e[i].stream == d->e[i].stream && e->e[i].offset == d->e[i].offset && e->e[i].type == d->e[i].type &&
-                   e->e[i].method == d->e[i].method && e->e[i].usage == d->e[i].usage && e->e[i].index == d->e[i].index;
-        if (same) { if (!e->vs || !e->ps) return 0; *vs = e->vs; *ps = e->ps; return 1; }
-    }
-    int slot = ffp_count < 256 ? ffp_count++ : 0;
+    FfpState f;
+    ffp_state_from(&f, d);
+    if (!ffp_cache) ffp_cache = calloc(FFP_CACHE, sizeof *ffp_cache);
+    if (!ffp_cache) return 0;
+    FfpState key = f;
+    ffp_key(&key);
+    for (int k = 0; k < ffp_count && k < FFP_CACHE; k++)
+        if (!memcmp(&ffp_cache[k].st, &key, sizeof key)) {
+            if (!ffp_cache[k].vs || !ffp_cache[k].ps) return 0;
+            *vs = ffp_cache[k].vs; *ps = ffp_cache[k].ps;
+            return 1;
+        }
+    int slot = ffp_count < FFP_CACHE ? ffp_count++ : (ffp_count++ % FFP_CACHE);
     FfpEntry* e = &ffp_cache[slot];
-    e->n = n; e->texmask = texmask;
-    for (uint32_t i = 0; i < n; i++) {
-        e->e[i].stream = d->e[i].stream; e->e[i].offset = d->e[i].offset; e->e[i].type = d->e[i].type;
-        e->e[i].method = d->e[i].method; e->e[i].usage = d->e[i].usage; e->e[i].index = d->e[i].index;
-    }
-    memcpy(e->tss, S.tss, sizeof e->tss);
-    e->vs = ffp_vs(d);
-    e->ps = e->vs ? ffp_ps(d, texmask) : NULL;
-    if (!e->vs || !e->ps) { *vs = *ps = NULL; return 0; }
-    if (!ffp_said++) {
-        int stages = 0;
-        while (stages < 8 && S.tss[stages][1] != 1) stages++;
-        host_log("[d3d9] fixed-function pipeline: generated vertex/pixel shaders for %d texture stage(s)", stages);
-    }
+    e->st = key;
+    e->vs = e->ps = NULL;
+    uint32_t vb = 0, pb = 0;
+    uint32_t* vt = ffp_build_vs(&f, &vb);
+    uint32_t* pt = vt ? ffp_build_ps(&f, &pb) : NULL;
+    e->vs = vt ? ffp_make(vt, vb, 0) : NULL;
+    e->ps = pt ? ffp_make(pt, pb, 1) : NULL;
+    free(vt); free(pt);
+    if (!e->vs || !e->ps) { e->vs = e->ps = NULL; return 0; }
+    if (!ffp_said++)
+        host_log("[d3d9] fixed-function pipeline: generated vertex/pixel shaders for %d texture stage(s)", ffp_texture_stages(&f));
     *vs = e->vs; *ps = e->ps;
     return 1;
 }
@@ -2074,29 +2290,110 @@ static void dev_clear(CPU* c)
     RET(D3D_OK);
 }
 
+/* D3DTS_WORLDMATRIX is a range: 256 + i selects world matrix i (0-255) */
 static void dev_set_transform(CPU* c)
 {
     uint32_t st = (uint32_t)A2;
-    if (st >= 260 || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    if (st >= 512 || !A3) { RET(D3DERR_INVALIDCALL); return; }
     memcpy(S.xf[st], G2H(A3), 16 * sizeof(float));
     S.xf_dirty = 1;
+    S.ffp_dirty = 1;
     RET(D3D_OK);
 }
 static void dev_get_transform(CPU* c)
 {
     uint32_t st = (uint32_t)A2;
-    if (st >= 260 || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    if (st >= 512 || !A3) { RET(D3DERR_INVALIDCALL); return; }
     memcpy(G2H(A3), S.xf[st], 16 * sizeof(float));
     RET(D3D_OK);
 }
 static void dev_mult_transform(CPU* c)
 {
     uint32_t st = (uint32_t)A2;
-    if (st >= 260 || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    if (st >= 512 || !A3) { RET(D3DERR_INVALIDCALL); return; }
     float m[16];
     memcpy(m, G2H(A3), sizeof m);
     mat_mul(S.xf[st], m, S.xf[st]);
     S.xf_dirty = 1;
+    S.ffp_dirty = 1;
+    RET(D3D_OK);
+}
+static void dev_set_light(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= FFP_MAX_LIGHTS || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    uint64_t p = A3;
+    FfpLight* L = &S.light[i];
+    memset(L, 0, sizeof *L);
+    L->type = (int)LD32(p + 0);
+    for (int k = 0; k < 4; k++) {
+        L->diffuse[k] = f32of(LD32(p + 4 + 4 * k));
+        L->specular[k] = f32of(LD32(p + 20 + 4 * k));
+        L->ambient[k] = f32of(LD32(p + 36 + 4 * k));
+    }
+    for (int k = 0; k < 3; k++) {
+        L->position[k] = f32of(LD32(p + 52 + 4 * k));
+        L->direction[k] = f32of(LD32(p + 64 + 4 * k));
+    }
+    L->range = f32of(LD32(p + 76));
+    L->falloff = f32of(LD32(p + 80));
+    for (int k = 0; k < 3; k++) L->atten[k] = f32of(LD32(p + 84 + 4 * k));
+    L->theta = f32of(LD32(p + 96));
+    L->phi = f32of(LD32(p + 100));
+    S.ffp_dirty = 1;
+    RET(D3D_OK);
+}
+static void dev_get_light(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= FFP_MAX_LIGHTS || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    uint64_t p = A3;
+    const FfpLight* L = &S.light[i];
+    ST32(p + 0, (uint32_t)L->type);
+    for (int k = 0; k < 4; k++) {
+        ST32(p + 4 + 4 * k, fbits(L->diffuse[k]));
+        ST32(p + 20 + 4 * k, fbits(L->specular[k]));
+        ST32(p + 36 + 4 * k, fbits(L->ambient[k]));
+    }
+    for (int k = 0; k < 3; k++) {
+        ST32(p + 52 + 4 * k, fbits(L->position[k]));
+        ST32(p + 64 + 4 * k, fbits(L->direction[k]));
+    }
+    ST32(p + 76, fbits(L->range));
+    ST32(p + 80, fbits(L->falloff));
+    for (int k = 0; k < 3; k++) ST32(p + 84 + 4 * k, fbits(L->atten[k]));
+    ST32(p + 96, fbits(L->theta));
+    ST32(p + 100, fbits(L->phi));
+    RET(D3D_OK);
+}
+static void dev_light_enable(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= FFP_MAX_LIGHTS) { RET(D3DERR_INVALIDCALL); return; }
+    S.light_on[i] = A3 ? 1 : 0;
+    S.ffp_dirty = 1;
+    RET(D3D_OK);
+}
+static void dev_get_light_enable(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= FFP_MAX_LIGHTS || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    ST32(A3, (uint32_t)S.light_on[i]);
+    RET(D3D_OK);
+}
+static void dev_set_clip_plane(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= 6 || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    memcpy(S.clip_plane[i], G2H(A3), 4 * sizeof(float));
+    S.ffp_dirty = 1;
+    RET(D3D_OK);
+}
+static void dev_get_clip_plane(CPU* c)
+{
+    uint32_t i = (uint32_t)A2;
+    if (i >= 6 || !A3) { RET(D3DERR_INVALIDCALL); return; }
+    memcpy(G2H(A3), S.clip_plane[i], 4 * sizeof(float));
     RET(D3D_OK);
 }
 static void dev_set_material(CPU* c)
@@ -2113,6 +2410,7 @@ static void dev_set_rs(CPU* c)
     if (s < NRS) {
         S.rs[s] = (uint32_t)A3;
         if (s == 15 || s == 24 || s == 25 || s == 60) set_cb_extra();
+        else S.ffp_dirty = 1;
     }
     RET(D3D_OK);
 }
@@ -2128,7 +2426,7 @@ static void dev_state_block(CPU* c)
 static void dev_end_state_block(CPU* c) { STP(A2, com_new(&K_SB, NULL, 0)); RET(D3D_OK); }
 
 static void dev_get_texture(CPU* c) { int s = samp_slot((uint32_t)A2); uint64_t o = s >= 0 ? S.tex[s] : 0; STP(A3, addref(o)); RET(D3D_OK); }
-static void dev_set_texture(CPU* c) { int s = samp_slot((uint32_t)A2); if (s >= 0) S.tex[s] = A3; RET(D3D_OK); }
+static void dev_set_texture(CPU* c) { int s = samp_slot((uint32_t)A2); if (s >= 0) { S.tex[s] = A3; S.ffp_dirty = 1; } RET(D3D_OK); }
 static void dev_get_tss(CPU* c)
 {
     uint32_t s = (uint32_t)A2, ty = (uint32_t)A3;
@@ -2187,12 +2485,13 @@ static void dev_get_decl(CPU* c) { uint64_t o = S.decl ? S.decl->obj : 0; if (o)
 
 static void dev_set_fvf(CPU* c)
 {
-    static struct { uint32_t fvf; Decl* d; } cache[64];
+    static struct { uint32_t fvf, indexed; Decl* d; } cache[64];
     static int n;
     uint32_t f = (uint32_t)A2;
+    uint32_t indexed = (S.rs[167] & 1) || (f & 0x1000);   /* INDEXEDVERTEXBLENDENABLE, or D3DFVF_LASTBETA_UBYTE4 */
     S.fvf = f;
     if (!f) { RET(D3D_OK); return; }
-    for (int i = 0; i < n; i++) if (cache[i].fvf == f) { S.decl = cache[i].d; RET(D3D_OK); return; }
+    for (int i = 0; i < n; i++) if (cache[i].fvf == f && cache[i].indexed == indexed) { S.decl = cache[i].d; RET(D3D_OK); return; }
     Decl* d = new_decl();
     ST32(d->obj + 8, 1000000);
     uint16_t off = 0;
@@ -2200,7 +2499,16 @@ static void dev_set_fvf(CPU* c)
     uint32_t pos = f & 0x400E;
     if (pos == 0x2) EL(2, 0, 0, 12);
     else if (pos == 0x4) EL(3, 9, 0, 16);
-    else if (pos >= 0x6 && pos <= 0xE) { EL(2, 0, 0, 12); off += (uint16_t)(4 * ((pos - 0x4) / 2)); }
+    else if (pos >= 0x6 && pos <= 0xE) {
+        /* XYZB1-XYZB5: one to five blend weights after the position; the last field is a DWORD of indices when
+           D3DRS_INDEXEDVERTEXBLENDENABLE is set, four floats otherwise */
+        EL(2, 0, 0, 12);
+        uint32_t nw = (pos - 0x4) / 2;
+        for (uint32_t k = 0; k < nw; k++) {
+            if (indexed && k + 1 == nw) EL(5, 2, 0, 4);
+            else EL(0, 2, (uint16_t)k, 4);
+        }
+    }
     if (f & 0x10) EL(2, 3, 0, 12);
     if (f & 0x20) EL(0, 4, 0, 4);
     if (f & 0x40) EL(4, 10, 0, 4);
@@ -2212,7 +2520,7 @@ static void dev_set_fvf(CPU* c)
         EL(ty[k], 5, i, sz[k]);
     }
 #undef EL
-    if (n < 64) { cache[n].fvf = f; cache[n].d = d; n++; }
+    if (n < 64) { cache[n].fvf = f; cache[n].indexed = indexed; cache[n].d = d; n++; }
     S.decl = d;
     RET(D3D_OK);
 }
@@ -2516,7 +2824,8 @@ static void setup(void)
     SET(K_Dev, 44, dev_set_transform); SET(K_Dev, 45, dev_get_transform); SET(K_Dev, 46, dev_mult_transform); SET(K_Dev, 47, dev_set_viewport);
     SET(K_Dev, 48, dev_get_viewport);
     SET(K_Dev, 49, dev_set_material); SET(K_Dev, 50, dev_get_material);
-    for (int i = 51; i <= 56; i++) SET(K_Dev, i, dev_ok);   /* lights and clip planes: not used by the fixed-function path */
+    SET(K_Dev, 51, dev_set_light); SET(K_Dev, 52, dev_get_light); SET(K_Dev, 53, dev_light_enable); SET(K_Dev, 54, dev_get_light_enable);
+    SET(K_Dev, 55, dev_set_clip_plane); SET(K_Dev, 56, dev_get_clip_plane);
     SET(K_Dev, 57, dev_set_rs); SET(K_Dev, 58, dev_get_rs); SET(K_Dev, 59, dev_state_block); SET(K_Dev, 60, dev_ok);
     SET(K_Dev, 61, dev_end_state_block); SET(K_Dev, 62, dev_ok); SET(K_Dev, 63, dev_ok); SET(K_Dev, 64, dev_get_texture);
     SET(K_Dev, 65, dev_set_texture); SET(K_Dev, 66, dev_get_tss); SET(K_Dev, 67, dev_set_tss); SET(K_Dev, 68, dev_get_ss);
@@ -2567,6 +2876,11 @@ static void setup(void)
     S.pcb_r = new_buf(D3D9_CB_VEC4S * 16, 0x4);
     S.vcb = S.vcb_r->backing;
     S.pcb = S.pcb_r->backing;
+    S.fvcb_r = new_buf(D3D9_CB_VEC4S * 16, 0x4);
+    S.fpcb_r = new_buf(D3D9_CB_VEC4S * 16, 0x4);
+    S.fvcb = S.fvcb_r->backing;
+    S.fpcb = S.fpcb_r->backing;
+    S.fvcb_dirty = S.fpcb_dirty = S.ffp_dirty = 1;
     S.up_vb = new_buf(UP_SIZE, 0x1);
     S.up_ib = new_buf(1u << 20, 0x2);
     host_log("[d3d9] Direct3D 9 ready (%s backend)", gpu->name);

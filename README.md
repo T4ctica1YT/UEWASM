@@ -129,8 +129,10 @@ Here are the games used for Testing and some screenshots of the tool working
 | Meccha Chameleon | ✅ Works (menus, cloud save, hosting a lobby and playing in it; EOS and Steam stand-ins) | ~35 FPS | UE 5 | Unreleased (after 0.1.4) |
 | Dishonored | ➖ Reaches the title screen and main menu with keyboard input (`--threads real`, offline Steam); gameplay not reached yet | - | UE 3 (32-bit, D3D9) | PR 0.1.4 |
 
-Unreal Engine 2 is not in this table yet: the 64-bit UT2004 D3D9 path and the 32-bit D3D8 path are implemented
-but have not been verified against a retail build. See [Unreal Engine 2 games](#unreal-engine-2-games).
+Unreal Engine 2 is not in this table yet: the 64-bit UT2004 D3D9 path and the 32-bit D3D8 path implement the
+fixed-function pipeline, lights, skinning, texture-coordinate generation/transforms, cube and volume textures, point
+sprites, clip planes and fog, but have not been verified against a retail build. See
+[Unreal Engine 2 games](#unreal-engine-2-games).
 
  <td align="center">
       <strong>Hello Neighbor</strong><br>
@@ -395,16 +397,30 @@ counts as UE2):
 The original game folder is never changed. This means the manual INI edits below are no longer needed for a normal
 build; they remain useful only when a game has a custom launcher or a config the automatic pass cannot identify.
 
-`runtime/d3d9.c` emulates fixed-function vertex and pixel processing when the game binds no shaders, then sends
-the generated `vs_3_0`/`ps_3_0` pair through the same D3D9→WGSL translator as game shaders. It covers:
+`runtime/d3d9.c` emulates fixed-function vertex and pixel processing when the game binds no shaders. It collects
+the draw's declaration and state, `runtime/d3d9_ffp.c` turns that into a `vs_3_0`/`ps_3_0` pair, and both go through
+the same D3D9→WGSL translator as game shaders. It covers:
 
-- `SetTransform`, `GetTransform` and `MultiplyTransform` for view, projection and world matrices (texture matrices are stored, but texture-coordinate transforms are not applied yet);
-- FVF codes and vertex declarations, including `XYZRHW` screen-space vertices, colour and up to eight texture
-  coordinates;
-- up to eight texture stages with the common colour and alpha operations (select, modulate, add, subtract,
-  add-signed, multiply-add, lerp, `dp3`), texture-coordinate selection, material diffuse, texture factor and
-  per-stage constants;
+- `SetTransform`, `GetTransform` and `MultiplyTransform` for view, projection and the `D3DTS_WORLDMATRIX` palette
+  (`256 + i`, 96 matrices usable for blending), plus the eight texture matrices;
+- FVF codes and vertex declarations, including `XYZRHW` screen-space vertices, `XYZB1`-`XYZB5` blend weights
+  (indexed or consecutive), colour and up to eight texture coordinates;
+- fixed-function lighting with up to eight lights (directional, point and spot, with attenuation, range and spot
+  cones), global ambient, per-source material colours, local viewer, normal normalization and specular;
+- hardware vertex blending with one to four matrices per vertex from the 96-matrix world palette; positions and
+  normals are skinned the same way;
+- texture-coordinate generation (camera-space normal, position, reflection vector, sphere map) and texture-coordinate
+  transforms, including projected coordinates;
+- up to eight texture stages with 2D, cube and volume textures and the common colour and alpha operations (select,
+  modulate, add, subtract, add-signed, multiply-add, lerp, `dp3`), texture-coordinate selection, material diffuse,
+  texture factor and per-stage constants;
+- vertex fog (linear, exponential, exponential squared, range-based and radial) blended per pixel with the fog colour;
+- six user clip planes, and point sprites (expanded on the CPU into screen-aligned quads, because WebGPU has no
+  point-list topology);
 - the existing alpha test, render state, sampler state, blending, depth/stencil and scissor handling.
+
+Generated shaders are cached by the shape of the state (declaration, texture stages, light types, blend mode), so
+moving a light or a matrix updates constants instead of rebuilding them.
 
 The automatic pass replaces these values. If a custom launcher bypasses `System/*.ini`, force the 64-bit UT2004
 client onto the fixed-function path in `System/ut2004-win64.ini`:
@@ -436,10 +452,10 @@ fixed-function path even if the ini still asks for shaders. The first fixed-func
 `[d3d9] fixed-function pipeline: generated vertex/pixel shaders …`; starting a 32-bit game also logs
 `[d3d8] Direct3D 8 compatibility layer ready`. If neither line appears, the game did not create a D3D8/D3D9 device.
 
-Not implemented yet: fixed-function lighting and vertex normals, hardware skinning (`XYZB` blend weights),
-texture-coordinate generation and texture transforms, cube/volume texture stages, point sprites, and fog. Those
-effects can look wrong or be skipped, but they should not crash. No retail UE2 build has been used to verify
-these paths yet, so include a saved log with any UE2 bug report.
+Still not implemented: RT patches (`D3DRS_PATCHEDGES`), paletted textures, state blocks and `D3DRS_SOFTWAREVERTEXPROCESSING`.
+User clip planes are tested per pixel against the world position instead of clipping geometry, and point sprites are
+flat screen-space quads, so they get the point's colour and texture coordinates but no per-pixel lighting. No retail
+UE2 build has been used to verify these paths yet, so include a saved log with any UE2 bug report.
 
 ## Unreal Engine 3 games
 
@@ -475,9 +491,9 @@ so there is no separate mode to pick. What differs:
   them afterwards.
 - Hull/domain (tessellation) shaders are not supported; those draws are skipped.
 - Unreal Engine 2 support is experimental: the 64-bit Direct3D 9 fixed-function path and the 32-bit Direct3D 8
-  compatibility layer are implemented but have not been verified against a retail build. Fixed-function lighting
-  and vertex normals, hardware skinning, texture-coordinate generation/transforms, cube/volume texture stages,
-  point sprites and fog are not supported yet.
+  compatibility layer implement lighting, hardware skinning, texture-coordinate generation and transforms,
+  cube/volume texture stages, point sprites, clip planes and fog, but have not been verified against a retail build.
+  RT patches, paletted textures and state blocks are still unimplemented.
 - Unreal Engine 3 support: Rocket League plays offline matches and Dishonored reaches its main menu. Other UE3 games
   haven't been tried and may stop at a call nothing tested has needed yet. The Direct3D 9 layer has no hardware shadow
   maps, so UE3 falls back to its colour shadow maps.

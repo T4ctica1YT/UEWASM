@@ -141,7 +141,8 @@ static void fill_caps8(uint64_t p)
     k[36] = 0x03FFFFFFu;            /* all texture ops through LERP */
     k[37] = 8; k[38] = 8;
     k[39] = 0x7B;                   /* texgen, material source 7, directional, positional, local viewer, tweening */
-    k[40] = 8; k[41] = 6; k[42] = 4; k[43] = 0;
+    k[40] = 8; k[41] = 6; k[42] = 4;
+    k[43] = 95;                 /* MaxVertexBlendMatrixIndex: the D3D9 fixed-function palette holds 96 matrices */
     float ps = 64.0f;
     memcpy(&k[44], &ps, 4);
     k[45] = 0xFFFFF; k[46] = 0xFFFF; k[47] = 16; k[48] = 255;
