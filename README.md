@@ -11,7 +11,9 @@
 
 <h4 align="center">A WIP Static Recompilation tool for Windows x64 and x86 Unreal Engine 2, 3, 4 and 5 built games into WebAssembly (.wasm)
 </h4>
-
+<p align="center">
+ | <img src="assets/discord.png" alt="discord logo" width="12">
+  <a href="https://discord.gg/YMyNreVqU">Join the Discord!</a> |
 </p>
 
 UEWASM is a tool that uses games you own, and turns them into a recompiled WebAssembly project.
@@ -519,7 +521,7 @@ so there is no separate mode to pick. What differs:
 
 - **[zay](https://github.com/squidward5)** - Helped with UE3 support and more.
 
-- **[Stratus Games / Glitch]** - Made WebWorks / Gave permission for its use in this tool
+- **[Stratus Games / Glitch](https://github.com/Stratus-Games)** - Made WebWorks / Gave permission for its use in this tool
 
 - **[IdiotOnline](https://github.com/anIdiotonline)** - Tester
 
